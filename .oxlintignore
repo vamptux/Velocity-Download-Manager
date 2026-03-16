@@ -1,0 +1,6 @@
+dist
+node_modules
+src-tauri
+*.config.js
+*.config.ts
+postcss.config.js

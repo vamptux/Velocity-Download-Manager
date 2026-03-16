@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VDM Catcher</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div id="root">
+    <header class="header">
+      <div class="logo">
+        <span class="logo-icon" aria-hidden="true">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M6 1.5v6M3.2 5.2 6 8.5l2.8-3.3" stroke="white" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M1.5 10.5h9" stroke="white" stroke-width="1.75" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <span class="logo-copy">
+          <span class="logo-text">VDM Catcher</span>
+          <span class="logo-subtitle">Desktop bridge</span>
+        </span>
+      </div>
+      <label class="toggle-wrap" title="Enable / disable interception">
+        <input type="checkbox" id="toggle-enabled" />
+        <span class="toggle-track">
+          <span class="toggle-thumb"></span>
+        </span>
+      </label>
+    </header>
+
+    <section class="status-shell">
+      <div id="status-banner" class="status-banner status-checking">
+        <span id="status-dot" class="status-dot"></span>
+        <span id="status-text">Checking connection…</span>
+      </div>
+      <button id="open-vdm" class="mini-button mini-button-primary" type="button">Open VDM</button>
+    </section>
+
+    <section class="add-row">
+      <input
+        type="text"
+        id="manual-url"
+        class="url-input"
+        placeholder="Paste a URL"
+        spellcheck="false"
+        autocomplete="off"
+      />
+      <button id="btn-add" class="btn-primary" title="Send to VDM" type="button">
+        Send
+      </button>
+    </section>
+
+    <section class="recent-panel">
+      <div class="section-bar">
+        <span class="section-label">Session captures</span>
+      </div>
+      <ul id="recent-list" class="recent-list">
+        <li class="empty-state">No captures yet this session.</li>
+      </ul>
+    </section>
+
+    <footer class="footer">
+      <a id="open-options" href="#" class="footer-link">Extension options</a>
+    </footer>
+  </div>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

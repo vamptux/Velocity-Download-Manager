@@ -1,0 +1,647 @@
+import { useEffect } from "react";
+import * as Label from "@radix-ui/react-label";
+import * as Select from "@radix-ui/react-select";
+import { downloadDir } from "@tauri-apps/api/path";
+import { AlertTriangle, Check, ChevronDown, FolderOpen, Loader2, X } from "lucide-react";
+import { formatBytes } from "@/lib/format";
+import { formatCooldownLabel, hostLockLabel } from "@/lib/downloadPresentation";
+import { cn } from "@/lib/utils";
+import type { DownloadContentCategory, DownloadProbe } from "@/types/download";
+
+export const DOWNLOAD_CAPTURE_CATEGORIES: Array<{
+	value: DownloadContentCategory;
+	label: string;
+}> = [
+	{ value: "compressed", label: "Compressed" },
+	{ value: "programs", label: "Programs" },
+	{ value: "videos", label: "Videos" },
+	{ value: "music", label: "Music" },
+	{ value: "pictures", label: "Pictures" },
+	{ value: "documents", label: "Documents" },
+];
+
+const PROBE_BYTE_FORMAT = { unknownLabel: "Unknown", integerAbove: 100 } as const;
+
+export function getCaptureErrorMessage(error: unknown): string {
+	if (error instanceof Error && error.message) {
+		return error.message;
+	}
+
+	if (typeof error === "string" && error.trim()) {
+		return error;
+	}
+
+	return "The operation failed before VDM could explain why.";
+}
+
+export function guessCaptureCategory(
+	mime: string | null,
+	name: string,
+): DownloadContentCategory {
+	const ext = name.split(".").pop()?.toLowerCase() ?? "";
+	if (["zip", "rar", "7z", "tar", "gz", "bz2", "xz"].includes(ext)) return "compressed";
+	if (["exe", "msi", "dmg", "pkg", "deb", "rpm", "apk"].includes(ext)) return "programs";
+	if (["mp4", "mkv", "mov", "avi", "webm", "m4v"].includes(ext)) return "videos";
+	if (["mp3", "flac", "wav", "ogg", "m4a", "aac"].includes(ext)) return "music";
+	if (["jpg", "jpeg", "png", "gif", "bmp", "webp"].includes(ext)) return "pictures";
+	if (mime?.startsWith("video/")) return "videos";
+	if (mime?.startsWith("audio/")) return "music";
+	if (mime?.startsWith("image/")) return "pictures";
+	return "documents";
+}
+
+export function useDefaultCaptureSavePath(
+	active: boolean,
+	savePath: string,
+	onChange: (path: string) => void,
+) {
+	useEffect(() => {
+		if (!active || savePath.trim()) {
+			return;
+		}
+
+		let cancelled = false;
+		void downloadDir()
+			.then((path) => {
+				if (!cancelled) {
+					onChange(path);
+				}
+			})
+			.catch(() => null);
+
+		return () => {
+			cancelled = true;
+		};
+	}, [active, onChange, savePath]);
+}
+
+export function DialogFormField({
+	label,
+	children,
+	id,
+}: {
+	label: string;
+	children: React.ReactNode;
+	id: string;
+}) {
+	return (
+		<div className="flex flex-col gap-1">
+			<Label.Root htmlFor={id} className="text-[10.5px] font-medium text-muted-foreground/50 uppercase tracking-widest">
+				{label}
+			</Label.Root>
+			{children}
+		</div>
+	);
+}
+
+export function DialogInput({
+	id,
+	...props
+}: React.InputHTMLAttributes<HTMLInputElement> & { id: string }) {
+	return (
+		<input
+			id={id}
+			{...props}
+			className={cn(
+				"w-full rounded-md border border-border bg-[hsl(var(--card))] px-3 h-8 text-[12.5px] text-foreground placeholder:text-muted-foreground/40 outline-none",
+				"focus:border-primary/60 focus:ring-1 focus:ring-primary/30 transition-colors",
+				props.className,
+			)}
+		/>
+	);
+}
+
+export function CompactFieldLabel({
+	htmlFor,
+	children,
+}: {
+	htmlFor?: string;
+	children: React.ReactNode;
+}) {
+	return (
+		<Label.Root
+			htmlFor={htmlFor}
+			className="text-[9.5px] font-semibold text-muted-foreground/40 uppercase tracking-[0.1em]"
+		>
+			{children}
+		</Label.Root>
+	);
+}
+
+export function CompactInput(
+	props: React.InputHTMLAttributes<HTMLInputElement> & { id: string },
+) {
+	const { className, ...rest } = props;
+	return (
+		<input
+			{...rest}
+			className={cn(
+				"h-[26px] w-full rounded-[3px] border border-border bg-[hsl(var(--card))] px-2 text-[11.5px] text-foreground",
+				"placeholder:text-muted-foreground/30 outline-none",
+				"focus:border-primary/50 focus:ring-1 focus:ring-primary/20 transition-colors",
+				className,
+			)}
+		/>
+	);
+}
+
+function DownloadCaptureCategorySelect({
+	value,
+	onChange,
+	variant,
+}: {
+	value: DownloadContentCategory;
+	onChange: (value: DownloadContentCategory) => void;
+	variant: "dialog" | "compact";
+}) {
+	const compact = variant === "compact";
+
+	return (
+		<Select.Root value={value} onValueChange={(next) => onChange(next as DownloadContentCategory)}>
+			<Select.Trigger
+				className={cn(
+					"flex items-center justify-between outline-none w-full transition-colors",
+					compact
+						? "h-[26px] rounded-[3px] border border-border bg-[hsl(var(--card))] px-2 text-[11.5px] text-foreground focus:border-primary/50"
+						: "rounded-md border border-border bg-[hsl(var(--card))] px-3 h-8 text-[12.5px] text-foreground focus:border-primary/60 focus:ring-1 focus:ring-primary/30 data-[placeholder]:text-muted-foreground/40",
+				)}
+			>
+				<Select.Value />
+				<Select.Icon>
+					<ChevronDown size={compact ? 10 : 13} className={compact ? "opacity-35" : "opacity-50"} />
+				</Select.Icon>
+			</Select.Trigger>
+			<Select.Portal>
+				<Select.Content
+					position="popper"
+					sideOffset={compact ? 3 : 4}
+					side={compact ? "top" : undefined}
+					avoidCollisions={compact}
+					className={cn(
+						compact
+							? "z-[200] w-[var(--radix-select-trigger-width)] rounded-[3px] border border-border/80 py-0.5 bg-[hsl(var(--popover))] shadow-[0_8px_28px_rgba(0,0,0,0.55)]"
+							: "z-50 w-[var(--radix-select-trigger-width)] rounded-md border border-border py-1 bg-[hsl(var(--card))] shadow-xl shadow-black/40 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
+					)}
+				>
+					<Select.Viewport>
+						{DOWNLOAD_CAPTURE_CATEGORIES.map((cat) => (
+							<Select.Item
+								key={cat.value}
+								value={cat.value}
+								className={cn(
+									compact
+										? "flex cursor-default select-none items-center gap-2 px-2 py-1 text-[11.5px] text-foreground outline-none data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground"
+										: "flex items-center justify-between px-3 py-[5px] text-[12px] cursor-default outline-none rounded-sm mx-0.5 text-foreground/80 data-[highlighted]:bg-accent data-[highlighted]:text-foreground",
+								)}
+							>
+								<Select.ItemText>{cat.label}</Select.ItemText>
+								<Select.ItemIndicator className={compact ? "ml-auto" : undefined}>
+									<Check size={compact ? 10 : 12} className={compact ? undefined : "text-primary"} />
+								</Select.ItemIndicator>
+							</Select.Item>
+						))}
+					</Select.Viewport>
+				</Select.Content>
+			</Select.Portal>
+		</Select.Root>
+	);
+}
+
+function CapabilityBadge({ probe }: { probe: DownloadProbe }) {
+	const label = probe.segmented
+		? `${probe.plannedConnections}-Way Segmented`
+		: probe.resumable
+			? "Resume Ready"
+			: probe.rangeSupported
+				? "Single Session"
+				: "Single Connection";
+
+	return (
+		<span
+			className={cn(
+				"inline-flex items-center rounded px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-wide",
+				probe.segmented || probe.resumable
+					? "bg-[hsl(var(--status-downloading)/0.14)] text-[hsl(var(--status-downloading))]"
+					: "bg-[hsl(var(--status-queued)/0.12)] text-[hsl(var(--status-queued))]",
+			)}
+		>
+			{label}
+		</span>
+	);
+}
+
+function MetaBadge({
+	label,
+	tone = "neutral",
+}: {
+	label: string;
+	tone?: "neutral" | "good" | "warn";
+}) {
+	return (
+		<span
+			className={cn(
+				"inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium tracking-wide",
+				tone === "good" && "bg-[hsl(var(--status-downloading)/0.12)] text-[hsl(var(--status-downloading))]",
+				tone === "warn" && "bg-[hsl(var(--status-paused)/0.14)] text-[hsl(var(--status-paused))]",
+				tone === "neutral" && "bg-white/[0.05] text-muted-foreground/52",
+			)}
+		>
+			{label}
+		</span>
+	);
+}
+
+type ProbeSource = "live" | "cached" | "fallback" | null;
+
+function detectProbeSource(warnings: string[]): ProbeSource {
+	for (const warning of warnings) {
+		if (warning.includes("Probe metadata source: live network probe.")) {
+			return "live";
+		}
+		if (warning.includes("Probe metadata source: recent probe cache reuse.")) {
+			return "cached";
+		}
+		if (warning.includes("Probe metadata source: planning fallback without fresh metadata.")) {
+			return "fallback";
+		}
+	}
+	return null;
+}
+
+function isGuardedProbeWarning(message: string): boolean {
+	return message.toLowerCase().includes("guarded single-stream mode");
+}
+
+function conciseProbeWarning(message: string): string {
+	if (isGuardedProbeWarning(message)) {
+		return "Guarded mode keeps this transfer single-stream until byte-range support is proven for this exact request replay.";
+	}
+	return message;
+}
+
+function probeMetaBadges(probe: DownloadProbe): Array<{
+	label: string;
+	tone: "neutral" | "good" | "warn";
+}> {
+	const rows: Array<{ label: string; tone: "neutral" | "good" | "warn" }> = [];
+	const probeSource = detectProbeSource(probe.warnings);
+	if (probeSource === "live") {
+		rows.push({ label: "Probe: live", tone: "good" });
+	} else if (probeSource === "cached") {
+		rows.push({ label: "Probe: cached", tone: "neutral" });
+	} else if (probeSource === "fallback") {
+		rows.push({ label: "Probe: fallback", tone: "warn" });
+	}
+	if (probe.warnings.some((warning) => isGuardedProbeWarning(warning))) {
+		rows.push({ label: "Guarded replay", tone: "warn" });
+	}
+	if (probe.compatibility.directUrlRecovered) {
+		rows.push({ label: "Wrapper recovered", tone: "good" });
+	} else if (probe.compatibility.browserInterstitialOnly) {
+		rows.push({ label: "Browser interstitial", tone: "warn" });
+	}
+	if (probe.compatibility.requestReferer) {
+		rows.push({ label: "Wrapper referer", tone: "neutral" });
+	}
+	if (probe.availableSpace !== null) {
+		rows.push({
+			label: `${formatBytes(probe.availableSpace, PROBE_BYTE_FORMAT)} free`,
+			tone: probe.size !== null && probe.availableSpace < probe.size ? "warn" : "neutral",
+		});
+	}
+	if (probe.hostDiagnostics.hardNoRange || !probe.rangeSupported) {
+		rows.push({ label: "No-range host", tone: "warn" });
+	}
+	const cooldown = formatCooldownLabel(probe.hostDiagnostics.cooldownUntil);
+	if (cooldown) {
+		rows.push({ label: cooldown, tone: "warn" });
+	}
+	if (probe.hostDiagnostics.concurrencyLocked) {
+		rows.push({ label: hostLockLabel(probe.hostDiagnostics.lockReason), tone: "warn" });
+	}
+	if (probe.hostDiagnostics.negotiatedProtocol) {
+		rows.push({ label: probe.hostDiagnostics.negotiatedProtocol.toUpperCase(), tone: "neutral" });
+	}
+	if (probe.hostDiagnostics.reuseConnections !== null) {
+		rows.push({
+			label: probe.hostDiagnostics.reuseConnections ? "Keep-alive reuse" : "Fresh sockets",
+			tone: probe.hostDiagnostics.reuseConnections ? "good" : "neutral",
+		});
+	}
+	return rows.slice(0, 5);
+}
+
+function isInternalProbeWarning(message: string): boolean {
+	const lower = message.toLowerCase();
+	return (
+		lower.includes("host capability cache") ||
+		lower.includes("probe failed") ||
+		lower.includes("network probe unavailable") ||
+		lower.includes("probe request failed") ||
+		lower.includes("probe metadata source:") ||
+		lower.includes("planning with local hints") ||
+		lower.includes("planning.")
+	);
+}
+
+export function ProbeSummaryStrip({
+	loading,
+	probe,
+	error,
+}: {
+	loading: boolean;
+	probe: DownloadProbe | null;
+	error: string | null;
+}) {
+	if (!loading && !probe && !error) {
+		return null;
+	}
+
+	const visibleWarnings = (probe?.warnings ?? [])
+		.filter((warning) => !isInternalProbeWarning(warning))
+		.map(conciseProbeWarning)
+		.slice(0, 2);
+	const metaBadges = probe ? probeMetaBadges(probe) : [];
+
+	return (
+		<div
+			className={cn(
+				"rounded-md px-3 py-2 transition-all",
+				error
+					? "bg-[hsl(var(--status-error)/0.07)] border border-[hsl(var(--status-error)/0.22)]"
+					: "border border-border/40 bg-[hsl(0,0%,7%)]",
+			)}
+		>
+			{loading ? (
+				<div className="flex items-center gap-2 text-[11.5px] text-muted-foreground/45">
+					<Loader2 size={11} className="animate-spin text-muted-foreground/35" />
+					<span>Detecting…</span>
+				</div>
+			) : error ? (
+				<div className="flex items-center gap-1.5 text-[11.5px] text-[hsl(var(--status-error))]">
+					<AlertTriangle size={11} className="shrink-0" />
+					<span>{error}</span>
+				</div>
+			) : probe ? (
+				<div className="flex flex-col gap-1.5">
+					<div className="flex items-center justify-between gap-3">
+						<div className="flex items-center gap-2 min-w-0">
+							<CapabilityBadge probe={probe} />
+							{probe.size !== null ? (
+								<span className="text-[11px] text-muted-foreground/50 tabular-nums shrink-0">
+									{formatBytes(probe.size, PROBE_BYTE_FORMAT)}
+								</span>
+							) : null}
+							{probe.host ? (
+								<span className="text-[10.5px] text-muted-foreground/32 max-w-[140px] truncate">
+									{probe.host}
+								</span>
+							) : null}
+						</div>
+						<span
+							className="shrink-0 rounded bg-white/[0.04] px-1.5 py-0.5 text-[10px] text-muted-foreground/38 truncate max-w-[140px]"
+							title={probe.suggestedName}
+						>
+							{probe.suggestedName}
+						</span>
+					</div>
+					{visibleWarnings.length > 0 ? (
+						<div className="flex flex-col gap-1">
+							{visibleWarnings.map((warning, index) => (
+								<div
+									key={`${warning}-${index}`}
+									className="flex items-start gap-1.5 text-[10.5px] text-[hsl(var(--status-paused))]"
+								>
+									<AlertTriangle size={10} className="mt-[1px] shrink-0" />
+									<span className="leading-snug">{warning}</span>
+								</div>
+							))}
+						</div>
+					) : null}
+					{metaBadges.length > 0 ? (
+						<div className="flex flex-wrap gap-1 pt-0.5">
+							{metaBadges.map((badge) => (
+								<MetaBadge key={badge.label} label={badge.label} tone={badge.tone} />
+							))}
+						</div>
+					) : null}
+				</div>
+			) : null}
+		</div>
+	);
+}
+
+interface DuplicateActions {
+	active: boolean;
+	onKeepBoth: () => void;
+	onOverwrite: () => void;
+}
+
+interface DownloadCapturePaneProps {
+	variant: "dialog" | "compact";
+	category: DownloadContentCategory;
+	onCategoryChange: (value: DownloadContentCategory) => void;
+	savePath: string;
+	onSavePathChange: (value: string) => void;
+	onBrowseSavePath: () => void;
+	filename: string;
+	onFilenameChange: (value: string) => void;
+	filenamePlaceholder: string;
+	sizeLabel?: string | null;
+	warningMessage?: string | null;
+	errorMessage?: string | null;
+	duplicateActions?: DuplicateActions;
+	hideWarningWhenDuplicate?: boolean;
+	filenameResetVisible?: boolean;
+	onFilenameReset?: () => void;
+	fieldIds?: {
+		category: string;
+		savePath: string;
+		filename: string;
+	};
+}
+
+export function DownloadCapturePane({
+	variant,
+	category,
+	onCategoryChange,
+	savePath,
+	onSavePathChange,
+	onBrowseSavePath,
+	filename,
+	onFilenameChange,
+	filenamePlaceholder,
+	sizeLabel,
+	warningMessage,
+	errorMessage,
+	duplicateActions,
+	hideWarningWhenDuplicate = false,
+	filenameResetVisible = false,
+	onFilenameReset,
+	fieldIds,
+}: DownloadCapturePaneProps) {
+	const ids = fieldIds ?? {
+		category: variant === "compact" ? "capture-category" : "download-category",
+		savePath: variant === "compact" ? "capture-savepath" : "download-savepath",
+		filename: variant === "compact" ? "capture-filename" : "download-filename",
+	};
+
+	if (variant === "dialog") {
+		return (
+			<>
+				<DialogFormField label="Filename" id={ids.filename}>
+					<div className="relative">
+						<DialogInput
+							id={ids.filename}
+							type="text"
+							placeholder={filenamePlaceholder}
+							value={filename}
+							onChange={(event) => onFilenameChange(event.target.value)}
+							className={cn(filenameResetVisible && "pr-7")}
+						/>
+						{filenameResetVisible && onFilenameReset ? (
+							<button
+								type="button"
+								title="Reset to auto-detected name"
+								className="absolute right-1.5 top-1/2 -translate-y-1/2 flex h-5 w-5 items-center justify-center rounded text-muted-foreground/50 hover:text-foreground hover:bg-accent/60 transition-colors"
+								onClick={onFilenameReset}
+							>
+								<X size={11} strokeWidth={2} />
+							</button>
+						) : null}
+					</div>
+				</DialogFormField>
+
+				<div className="grid grid-cols-2 gap-3">
+					<DialogFormField label="Category" id={ids.category}>
+						<DownloadCaptureCategorySelect
+							value={category}
+							onChange={onCategoryChange}
+							variant="dialog"
+						/>
+					</DialogFormField>
+
+					<DialogFormField label="Save to" id={ids.savePath}>
+						<div className="relative">
+							<DialogInput
+								id={ids.savePath}
+								type="text"
+								value={savePath}
+								onChange={(event) => onSavePathChange(event.target.value)}
+								placeholder="Choose a folder"
+								className="pr-8"
+							/>
+							<button
+								type="button"
+								className="absolute right-1.5 top-1/2 -translate-y-1/2 flex h-5 w-5 items-center justify-center rounded text-muted-foreground/50 hover:text-foreground hover:bg-accent/60 transition-colors"
+								onClick={onBrowseSavePath}
+							>
+								<FolderOpen size={12} strokeWidth={1.8} />
+							</button>
+						</div>
+					</DialogFormField>
+				</div>
+
+				{errorMessage ? (
+					<div className="rounded-md border border-[hsl(var(--status-error)/0.26)] bg-[hsl(var(--status-error)/0.08)] px-3 py-2 text-[11.5px] text-[hsl(var(--status-error))]">
+						{errorMessage}
+					</div>
+				) : null}
+			</>
+		);
+	}
+
+	const duplicateActive = duplicateActions?.active ?? false;
+	const showWarning = Boolean(warningMessage) && !(duplicateActive && hideWarningWhenDuplicate);
+
+	return (
+		<>
+			<div className="flex items-end gap-2">
+				<div className="flex-1 flex flex-col gap-0.5">
+					<CompactFieldLabel htmlFor={ids.category}>Category</CompactFieldLabel>
+					<DownloadCaptureCategorySelect
+						value={category}
+						onChange={onCategoryChange}
+						variant="compact"
+					/>
+				</div>
+
+				{sizeLabel ? (
+					<div className="flex flex-col items-end gap-0.5 shrink-0">
+						<CompactFieldLabel>Size</CompactFieldLabel>
+						<span className="flex h-[26px] items-center text-[11.5px] text-foreground/72 font-mono tabular-nums">
+							{sizeLabel}
+						</span>
+					</div>
+				) : null}
+			</div>
+
+			<div className="flex flex-col gap-0.5">
+				<CompactFieldLabel htmlFor={ids.savePath}>Save to</CompactFieldLabel>
+				<div className="flex items-center gap-1">
+					<CompactInput
+						id={ids.savePath}
+						value={savePath}
+						onChange={(event) => onSavePathChange(event.target.value)}
+						placeholder="Default download folder"
+						className="flex-1"
+					/>
+					<button
+						type="button"
+						onClick={onBrowseSavePath}
+						className="flex h-[26px] w-[26px] items-center justify-center rounded-[3px] border border-border bg-[hsl(var(--card))] text-muted-foreground/45 hover:bg-accent hover:text-foreground transition-colors shrink-0"
+					>
+						<FolderOpen size={12} />
+					</button>
+				</div>
+			</div>
+
+			<div className="flex flex-col gap-0.5">
+				<CompactFieldLabel htmlFor={ids.filename}>File name</CompactFieldLabel>
+				<CompactInput
+					id={ids.filename}
+					value={filename}
+					onChange={(event) => onFilenameChange(event.target.value)}
+					placeholder={filenamePlaceholder}
+				/>
+			</div>
+
+			{showWarning ? (
+				<div className="flex items-start gap-1.5 rounded-[3px] border border-yellow-500/20 bg-yellow-500/5 px-2 py-1.5">
+					<AlertTriangle size={10} className="mt-px shrink-0 text-yellow-500/65" />
+					<span className="text-[10.5px] text-yellow-500/75 leading-relaxed">{warningMessage}</span>
+				</div>
+			) : null}
+
+			{duplicateActive ? (
+				<div className="flex flex-col gap-1">
+					<div className="flex items-center gap-1.5">
+						<AlertTriangle size={10} className="shrink-0 text-[hsl(var(--status-error))]" />
+						<span className="text-[11px] text-[hsl(var(--status-error))]">Download already exists</span>
+					</div>
+					<div className="flex gap-2">
+						<button
+							type="button"
+							onClick={duplicateActions?.onKeepBoth}
+							className="text-[10.5px] text-primary/80 hover:text-primary underline underline-offset-2 transition-colors"
+						>
+							Keep both
+						</button>
+						<span className="text-muted-foreground/30 text-[11px]">·</span>
+						<button
+							type="button"
+							onClick={duplicateActions?.onOverwrite}
+							className="text-[10.5px] text-primary/80 hover:text-primary underline underline-offset-2 transition-colors"
+						>
+							Overwrite
+						</button>
+					</div>
+				</div>
+			) : null}
+
+			{errorMessage && !duplicateActive ? (
+				<div className="text-[10.5px] text-[hsl(var(--status-error))] leading-relaxed">{errorMessage}</div>
+			) : null}
+		</>
+	);
+}

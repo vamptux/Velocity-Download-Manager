@@ -1,0 +1,28 @@
+# Tauri
+/target
+/gen
+/src-tauri/target/
+/src-tauri/target-*/
+/src-tauri/src-tauri/target-buildcheck/
+/target-*/
+
+# Node
+node_modules/
+dist/
+.turbo
+.bun/
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/

@@ -1,0 +1,181 @@
+import { useState } from "react";
+import {
+  LayoutGrid,
+  Archive,
+  Package,
+  Film,
+  Music,
+  Image,
+  FileText,
+  CheckCircle2,
+  Clock,
+  ChevronDown,
+  type LucideIcon,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import type { SidebarCategory, Download } from "@/types/download";
+
+interface SidebarItem {
+  id: SidebarCategory;
+  label: string;
+  icon: LucideIcon;
+}
+
+const TYPE_CATEGORIES: SidebarItem[] = [
+  { id: "all", label: "All", icon: LayoutGrid },
+  { id: "compressed", label: "Compressed", icon: Archive },
+  { id: "programs", label: "Programs", icon: Package },
+  { id: "videos", label: "Videos", icon: Film },
+  { id: "music", label: "Music", icon: Music },
+  { id: "pictures", label: "Pictures", icon: Image },
+  { id: "documents", label: "Documents", icon: FileText },
+];
+
+const STATUS_CATEGORIES: SidebarItem[] = [
+  { id: "finished", label: "Finished", icon: CheckCircle2 },
+  { id: "unfinished", label: "Unfinished", icon: Clock },
+];
+
+interface SidebarProps {
+  activeCategory: SidebarCategory;
+  onCategoryChange: (category: SidebarCategory) => void;
+  downloads: Download[];
+}
+
+function countForCategory(cat: SidebarCategory, downloads: Download[]): number {
+  if (cat === "all") return downloads.length;
+  if (cat === "finished") return downloads.filter((d) => d.status === "finished").length;
+  if (cat === "unfinished") return downloads.filter((d) => d.status !== "finished").length;
+  return downloads.filter((d) => d.category === cat).length;
+}
+
+function SectionHeader({
+  label,
+  open,
+  onToggle,
+}: {
+  label: string;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      onClick={onToggle}
+      className="group flex w-full items-center gap-1.5 px-2.5 pt-3 pb-1 text-left transition-colors"
+    >
+      <ChevronDown
+        size={9}
+        strokeWidth={2.4}
+        className={cn(
+          "shrink-0 text-muted-foreground/30 transition-transform duration-150",
+          !open && "-rotate-90",
+        )}
+      />
+      <span className="text-[9px] font-semibold uppercase tracking-[0.13em] text-muted-foreground/30 group-hover:text-muted-foreground/50 transition-colors">
+        {label}
+      </span>
+    </button>
+  );
+}
+
+function NavItem({
+  item,
+  active,
+  count,
+  onClick,
+}: {
+  item: SidebarItem;
+  active: boolean;
+  count: number;
+  onClick: () => void;
+}) {
+  const Icon = item.icon;
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "relative flex w-full items-center gap-2.5 rounded-md py-[5px] pl-3 pr-2.5 text-[12.5px] transition-colors",
+        active
+          ? "bg-[hsl(var(--sidebar-active))] text-[hsl(var(--sidebar-active-foreground))] font-medium"
+          : "text-[hsl(var(--sidebar-foreground))] hover:bg-[hsl(var(--sidebar-active)/0.65)] hover:text-[hsl(var(--sidebar-active-foreground))]",
+      )}
+    >
+      {active && (
+        <span className="absolute left-0 top-1.5 bottom-1.5 w-[3px] rounded-full bg-primary" />
+      )}
+      <Icon size={14} className={cn("shrink-0", active ? "text-primary" : "opacity-45")} />
+      <span className="flex-1 truncate text-left">{item.label}</span>
+      {count > 0 && (
+        <span
+          className={cn(
+            "shrink-0 min-w-[18px] h-[15px] flex items-center justify-center rounded-full px-1 text-[9px] font-semibold tabular-nums",
+            active
+              ? "bg-primary/22 text-primary"
+              : "bg-[hsl(var(--sidebar-active))] text-[hsl(var(--sidebar-foreground)/0.7)]",
+          )}
+        >
+          {count}
+        </span>
+      )}
+    </button>
+  );
+}
+
+export function Sidebar({ activeCategory, onCategoryChange, downloads }: SidebarProps) {
+  const [catOpen, setCatOpen] = useState(true);
+  const [statusOpen, setStatusOpen] = useState(true);
+
+  return (
+    <aside
+      className="flex w-[182px] shrink-0 flex-col overflow-hidden border-r border-border/50"
+      style={{ background: "hsl(var(--sidebar))" }}
+    >
+      <nav className="flex flex-1 flex-col overflow-y-auto px-1.5 pb-3">
+        <SectionHeader label="Categories" open={catOpen} onToggle={() => setCatOpen((v) => !v)} />
+        {catOpen && (
+          <div className="flex flex-col gap-px">
+            {TYPE_CATEGORIES.map((item) => (
+              <NavItem
+                key={item.id}
+                item={item}
+                active={activeCategory === item.id}
+                count={countForCategory(item.id, downloads)}
+                onClick={() => onCategoryChange(item.id)}
+              />
+            ))}
+          </div>
+        )}
+
+        <SectionHeader label="Status" open={statusOpen} onToggle={() => setStatusOpen((v) => !v)} />
+        {statusOpen && (
+          <div className="flex flex-col gap-px">
+            {STATUS_CATEGORIES.map((item) => (
+              <NavItem
+                key={item.id}
+                item={item}
+                active={activeCategory === item.id}
+                count={countForCategory(item.id, downloads)}
+                onClick={() => onCategoryChange(item.id)}
+              />
+            ))}
+          </div>
+        )}
+      </nav>
+
+      <div className="shrink-0 border-t border-border/30 px-3 py-2.5 flex items-center gap-2">
+        <div
+          className="flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[3px]"
+          style={{ background: "linear-gradient(135deg, hsl(24,62%,54%), hsl(12,52%,34%))" }}
+        >
+          <svg width="8" height="8" viewBox="0 0 12 12" fill="none">
+            <path d="M2 2L7 6L2 10" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
+            <path d="M7 6H11" stroke="white" strokeWidth="2.2" strokeLinecap="round"/>
+          </svg>
+        </div>
+        <span className="text-[9.5px] font-medium tracking-wide text-muted-foreground/28 select-none">
+          Velocity <span className="text-[hsl(var(--primary)/0.5)]">DM</span>
+        </span>
+      </div>
+    </aside>
+  );
+}

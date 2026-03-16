@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "VDM Download Catcher",
+  "short_name": "VDM Catcher",
+  "version": "1.0.0",
+  "description": "Intelligently intercept downloads and send them to VDM Download Manager for maximum speed.",
+  "permissions": [
+    "downloads",
+    "webRequest",
+    "cookies",
+    "tabs",
+    "storage",
+    "contextMenus",
+    "notifications",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:17780/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["shared/download-rules.js", "content/interceptor.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "VDM Download Catcher"
+  },
+  "options_page": "options/options.html",
+  "minimum_chrome_version": "102"
+}

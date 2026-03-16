@@ -1,0 +1,948 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use ts_rs::TS;
+
+use crate::model::{DownloadRequestField, DownloadRequestMethod};
+
+static PENDING_CAPTURE: Mutex<Option<CapturePayload>> = Mutex::new(None);
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub const CAPTURE_PORT: u16 = 17_780;
+
+const CAPTURE_BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const MAX_BODY_LEN: usize = 64 * 1024;
+
+const RECENT_RING_CAP: usize = 50;
+
+const PAIRING_SECRET_BYTES: usize = 20;
+const SESSION_NONCE_BYTES: usize = 16;
+const AUTH_REQUEST_NONCE_TTL_MS: i64 = 5 * 60 * 1000;
+const AUTH_TIMESTAMP_SKEW_MS: i64 = 5 * 60 * 1000;
+const AUTH_STATE_FILENAME: &str = "capture-bridge-auth.json";
+const AUTH_HEADER_CLIENT: &str = "x-vdm-client";
+const AUTH_HEADER_TIMESTAMP: &str = "x-vdm-timestamp";
+const AUTH_HEADER_REQUEST_NONCE: &str = "x-vdm-request-nonce";
+const AUTH_HEADER_SIGNATURE: &str = "x-vdm-auth";
+const CORS_ALLOW_HEADERS: &str =
+    "Content-Type, X-VDM-Client, X-VDM-Timestamp, X-VDM-Request-Nonce, X-VDM-Auth";
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct CapturePayload {
+    pub url: String,
+    pub referrer: Option<String>,
+    pub filename: Option<String>,
+    pub size_hint: Option<u64>,
+    pub mime: Option<String>,
+    #[serde(default)]
+    pub request_cookies: Option<String>,
+    #[serde(default)]
+    pub request_method: DownloadRequestMethod,
+    #[serde(default)]
+    pub request_form_fields: Vec<DownloadRequestField>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureBridgeHealthResponse {
+    status: String,
+    version: String,
+    auth_required: bool,
+    authorized: bool,
+    session_nonce: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureBridgePairingResponse {
+    pairing_code: String,
+    bridge_url: String,
+    rotated_at: i64,
+    session_nonce: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureBridgeOkResponse {
+    ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureBridgeUnauthorizedResponse {
+    error: &'static str,
+    auth_required: bool,
+    session_nonce: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedCaptureBridgeAuth {
+    pairing_secret: String,
+    rotated_at: i64,
+}
+
+#[derive(Debug)]
+struct CaptureBridgeAuthRuntime {
+    pairing_secret: String,
+    session_nonce: String,
+    rotated_at: i64,
+    seen_request_nonces: VecDeque<(String, i64)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaptureBridgeState {
+    inner: Arc<Mutex<CaptureBridgeAuthRuntime>>,
+}
+
+#[derive(Default)]
+struct RecentCaptures(VecDeque<CapturePayload>);
+
+impl RecentCaptures {
+    fn push(&mut self, payload: CapturePayload) {
+        if self.0.len() >= RECENT_RING_CAP {
+            self.0.pop_front();
+        }
+        self.0.push_back(payload);
+    }
+}
+
+struct HttpRequest<'a> {
+    method: &'a str,
+    path: &'a str,
+    headers: BTreeMap<String, String>,
+    body: &'a [u8],
+}
+
+pub fn initialize_capture_bridge_state(app: &AppHandle) -> Result<CaptureBridgeState, String> {
+    let base_path = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("vdm"));
+    let auth_path = base_path.join(AUTH_STATE_FILENAME);
+    let persisted = load_or_create_persisted_auth(&auth_path)?;
+
+    Ok(CaptureBridgeState {
+        inner: Arc::new(Mutex::new(CaptureBridgeAuthRuntime {
+            pairing_secret: persisted.pairing_secret,
+            session_nonce: generate_random_hex(SESSION_NONCE_BYTES)?,
+            rotated_at: persisted.rotated_at,
+            seen_request_nonces: VecDeque::new(),
+        })),
+    })
+}
+
+impl CaptureBridgeState {
+    fn health_response(&self, authorized: bool) -> Result<CaptureBridgeHealthResponse, String> {
+        let auth = self
+            .inner
+            .lock()
+            .map_err(|_| "Capture bridge auth lock was poisoned.".to_string())?;
+        Ok(CaptureBridgeHealthResponse {
+            status: "ready".to_string(),
+            version: CAPTURE_BRIDGE_VERSION.to_string(),
+            auth_required: true,
+            authorized,
+            session_nonce: auth.session_nonce.clone(),
+        })
+    }
+
+    fn extension_pairing_response(&self) -> Result<CaptureBridgePairingResponse, String> {
+        let auth = self
+            .inner
+            .lock()
+            .map_err(|_| "Capture bridge auth lock was poisoned.".to_string())?;
+        Ok(CaptureBridgePairingResponse {
+            pairing_code: auth.pairing_secret.clone(),
+            bridge_url: format!("http://127.0.0.1:{CAPTURE_PORT}"),
+            rotated_at: auth.rotated_at,
+            session_nonce: auth.session_nonce.clone(),
+        })
+    }
+
+    fn unauthorized_response(&self) -> Result<CaptureBridgeUnauthorizedResponse, String> {
+        let auth = self
+            .inner
+            .lock()
+            .map_err(|_| "Capture bridge auth lock was poisoned.".to_string())?;
+        Ok(CaptureBridgeUnauthorizedResponse {
+            error: "capture bridge authentication required",
+            auth_required: true,
+            session_nonce: auth.session_nonce.clone(),
+        })
+    }
+
+    fn authorize_request(&self, request: &HttpRequest<'_>) -> Result<(), &'static str> {
+        let client = request
+            .headers
+            .get(AUTH_HEADER_CLIENT)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .ok_or("missing auth client")?;
+        let timestamp = request
+            .headers
+            .get(AUTH_HEADER_TIMESTAMP)
+            .ok_or("missing auth timestamp")?
+            .parse::<i64>()
+            .map_err(|_| "invalid auth timestamp")?;
+        let request_nonce = request
+            .headers
+            .get(AUTH_HEADER_REQUEST_NONCE)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .ok_or("missing auth request nonce")?;
+        let provided_signature = request
+            .headers
+            .get(AUTH_HEADER_SIGNATURE)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .ok_or("missing auth signature")?;
+
+        let now = current_timestamp_ms();
+        if (now - timestamp).abs() > AUTH_TIMESTAMP_SKEW_MS {
+            return Err("stale auth timestamp");
+        }
+
+        let mut auth = self.inner.lock().map_err(|_| "auth state unavailable")?;
+        prune_seen_request_nonces(&mut auth.seen_request_nonces, now);
+        if auth
+            .seen_request_nonces
+            .iter()
+            .any(|(existing, _)| existing == request_nonce)
+        {
+            return Err("replayed auth nonce");
+        }
+
+        let mut mac = HmacSha256::new_from_slice(auth.pairing_secret.as_bytes())
+            .map_err(|_| "invalid auth secret")?;
+        mac.update(
+            auth_payload(
+                request.method,
+                request.path,
+                &auth.session_nonce,
+                timestamp,
+                request_nonce,
+                client,
+                request.body,
+            )
+            .as_bytes(),
+        );
+
+        let provided_bytes = decode_hex(provided_signature)?;
+        mac.verify_slice(&provided_bytes)
+            .map_err(|_| "invalid auth signature")?;
+        auth.seen_request_nonces
+            .push_back((request_nonce.to_string(), now));
+        Ok(())
+    }
+}
+
+pub fn take_pending_capture() -> Option<CapturePayload> {
+    match PENDING_CAPTURE.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => None,
+    }
+}
+
+fn set_pending_capture(payload: CapturePayload) {
+    if let Ok(mut slot) = PENDING_CAPTURE.lock() {
+        *slot = Some(payload);
+    }
+}
+
+pub fn spawn_capture_server(app: AppHandle, state: CaptureBridgeState) {
+    tauri::async_runtime::spawn(async move {
+        run_capture_server(app, state).await;
+    });
+}
+
+async fn run_capture_server(app: AppHandle, state: CaptureBridgeState) {
+    let addr = SocketAddr::from(([127, 0, 0, 1], CAPTURE_PORT));
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("[VDM] capture bridge: could not bind {addr}: {err}");
+            return;
+        }
+    };
+
+    eprintln!("[VDM] capture bridge: listening on {addr}");
+
+    let recent: Arc<Mutex<RecentCaptures>> = Arc::new(Mutex::new(RecentCaptures::default()));
+
+    loop {
+        let Ok((socket, peer)) = listener.accept().await else {
+            break;
+        };
+        if !peer.ip().is_loopback() {
+            eprintln!("[VDM] capture bridge: non-loopback connection from {peer} rejected");
+            continue;
+        }
+
+        let app = app.clone();
+        let recent = recent.clone();
+        let state = state.clone();
+        tauri::async_runtime::spawn(async move {
+            handle_connection(socket, app, recent, state).await;
+        });
+    }
+}
+
+async fn handle_connection(
+    mut socket: TcpStream,
+    app: AppHandle,
+    recent: Arc<Mutex<RecentCaptures>>,
+    state: CaptureBridgeState,
+) {
+    let mut buf = Vec::with_capacity(4096);
+    if read_request(&mut socket, &mut buf).await.is_err() {
+        return;
+    }
+
+    let Some(request) = parse_http(&buf) else {
+        let _ = write_response(&mut socket, 400, "Bad Request", &b"bad request"[..]).await;
+        return;
+    };
+
+    if request.method == "OPTIONS" {
+        let _ = write_cors_preflight(&mut socket).await;
+        return;
+    }
+
+    let auth_result = state.authorize_request(&request);
+    let authorized = auth_result.is_ok();
+
+    match (request.method, request.path) {
+        ("GET", "/health") => {
+            let health = match state.health_response(authorized) {
+                Ok(health) => health,
+                Err(_) => return,
+            };
+            let body = serde_json::to_vec(&health).unwrap_or_else(|_| b"{}".to_vec());
+            let _ = write_json_response(&mut socket, 200, "OK", &body).await;
+        }
+
+        ("GET", "/pair") => {
+            let Some(allow_origin) = allowed_extension_origin(&request) else {
+                let _ = write_response(&mut socket, 403, "Forbidden", &b"forbidden"[..]).await;
+                return;
+            };
+
+            let pairing = match state.extension_pairing_response() {
+                Ok(pairing) => pairing,
+                Err(_) => return,
+            };
+            let body = serde_json::to_vec(&pairing).unwrap_or_else(|_| b"{}".to_vec());
+            let _ = write_json_response_for_origin(
+                &mut socket,
+                200,
+                "OK",
+                &body,
+                allow_origin.as_str(),
+            )
+            .await;
+        }
+
+        ("GET", "/focus") => {
+            focus_main_window(&app);
+            let body = serde_json::to_vec(&CaptureBridgeOkResponse { ok: true })
+                .unwrap_or_else(|_| b"{}".to_vec());
+            let _ = write_json_response(&mut socket, 200, "OK", &body).await;
+        }
+
+        ("POST", "/capture") => {
+            if !authorized {
+                log_unauthorized_request(&request, auth_result.err());
+                let _ = write_unauthorized_response(&mut socket, &state).await;
+                return;
+            }
+
+            let payload: CapturePayload = match serde_json::from_slice(request.body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    let _ =
+                        write_response(&mut socket, 400, "Bad Request", &b"invalid json"[..]).await;
+                    return;
+                }
+            };
+
+            if !payload.url.starts_with("http://") && !payload.url.starts_with("https://") {
+                let _ = write_response(
+                    &mut socket,
+                    422,
+                    "Unprocessable Entity",
+                    &b"url must be http(s)"[..],
+                )
+                .await;
+                return;
+            }
+
+            if let Ok(mut ring) = recent.lock() {
+                ring.push(payload.clone());
+            }
+            show_capture_window(&app, &payload);
+
+            let body = serde_json::to_vec(&CaptureBridgeOkResponse { ok: true })
+                .unwrap_or_else(|_| b"{}".to_vec());
+            let _ = write_json_response(&mut socket, 200, "OK", &body).await;
+        }
+
+        ("GET", "/recent") => {
+            if !authorized {
+                log_unauthorized_request(&request, auth_result.err());
+                let _ = write_unauthorized_response(&mut socket, &state).await;
+                return;
+            }
+
+            let list: Vec<CapturePayload> = recent
+                .lock()
+                .map(|ring| ring.0.iter().cloned().collect())
+                .unwrap_or_default();
+            let body = serde_json::to_vec(&list).unwrap_or_else(|_| b"[]".to_vec());
+            let _ = write_json_response(&mut socket, 200, "OK", &body).await;
+        }
+
+        _ => {
+            let _ = write_response(&mut socket, 404, "Not Found", &b"not found"[..]).await;
+        }
+    }
+}
+
+fn log_unauthorized_request(request: &HttpRequest<'_>, reason: Option<&'static str>) {
+    if let Some(reason) = reason {
+        eprintln!(
+            "[VDM] capture bridge: unauthorized {} {} ({reason})",
+            request.method, request.path
+        );
+    }
+}
+
+async fn write_unauthorized_response(
+    socket: &mut TcpStream,
+    state: &CaptureBridgeState,
+) -> std::io::Result<()> {
+    let body = match state.unauthorized_response() {
+        Ok(payload) => serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec()),
+        Err(_) => b"{}".to_vec(),
+    };
+    write_json_response(socket, 401, "Unauthorized", body.as_slice()).await
+}
+
+fn show_capture_window(app: &AppHandle, payload: &CapturePayload) {
+    set_pending_capture(payload.clone());
+
+    if let Some(capture_window) = app.get_webview_window("capture") {
+        let _ = capture_window.show();
+        let _ = capture_window.unminimize();
+        let _ = capture_window.set_focus();
+
+        if let Err(err) = capture_window.emit("extension://capture", payload) {
+            eprintln!("[VDM] capture bridge: emit failed: {err}");
+        }
+        return;
+    }
+
+    let url = WebviewUrl::App("index.html?window=capture".into());
+    let capture_window = match WebviewWindowBuilder::new(app, "capture", url)
+        .title("Add Download")
+        .inner_size(460.0, 316.0)
+        .min_inner_size(420.0, 280.0)
+        .decorations(false)
+        .always_on_top(true)
+        .center()
+        .build()
+    {
+        Ok(window) => window,
+        Err(err) => {
+            eprintln!("[VDM] capture bridge: could not create capture window: {err}");
+            return;
+        }
+    };
+
+    let _ = capture_window.show();
+    let _ = capture_window.unminimize();
+    let _ = capture_window.set_focus();
+
+    if let Err(err) = capture_window.emit("extension://capture", payload) {
+        eprintln!("[VDM] capture bridge: emit failed: {err}");
+    }
+}
+
+fn focus_main_window(app: &AppHandle) {
+    if let Some(main_window) = app.get_webview_window("main") {
+        let _ = main_window.show();
+        let _ = main_window.unminimize();
+        let _ = main_window.set_focus();
+    }
+}
+
+fn load_or_create_persisted_auth(path: &Path) -> Result<PersistedCaptureBridgeAuth, String> {
+    if !path.exists() {
+        let persisted = PersistedCaptureBridgeAuth {
+            pairing_secret: generate_random_hex(PAIRING_SECRET_BYTES)?,
+            rotated_at: current_timestamp_ms(),
+        };
+        persist_capture_bridge_auth(path, &persisted)?;
+        return Ok(persisted);
+    }
+
+    let raw = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "Failed reading capture bridge auth state '{}': {error}",
+            path.display()
+        )
+    })?;
+
+    match serde_json::from_str::<PersistedCaptureBridgeAuth>(&raw) {
+        Ok(persisted) if !persisted.pairing_secret.trim().is_empty() => Ok(persisted),
+        Ok(_) | Err(_) => {
+            let backup = corrupt_auth_backup_path(path);
+            let _ = fs::rename(path, &backup);
+            let persisted = PersistedCaptureBridgeAuth {
+                pairing_secret: generate_random_hex(PAIRING_SECRET_BYTES)?,
+                rotated_at: current_timestamp_ms(),
+            };
+            persist_capture_bridge_auth(path, &persisted)?;
+            Ok(persisted)
+        }
+    }
+}
+
+fn persist_capture_bridge_auth(
+    path: &Path,
+    persisted: &PersistedCaptureBridgeAuth,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Invalid capture bridge auth path '{}'.", path.display()))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "Failed creating capture bridge auth directory '{}': {error}",
+            parent.display()
+        )
+    })?;
+
+    let payload = serde_json::to_vec_pretty(persisted)
+        .map_err(|error| format!("Failed serializing capture bridge auth state: {error}"))?;
+    fs::write(path, payload).map_err(|error| {
+        format!(
+            "Failed writing capture bridge auth state '{}': {error}",
+            path.display()
+        )
+    })
+}
+
+fn corrupt_auth_backup_path(path: &Path) -> PathBuf {
+    path.with_extension(format!("auth.corrupt.{}.json", current_timestamp_ms()))
+}
+
+fn allowed_extension_origin(request: &HttpRequest<'_>) -> Option<String> {
+    let client = request
+        .headers
+        .get(AUTH_HEADER_CLIENT)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())?;
+
+    ["origin", "referer"]
+        .into_iter()
+        .filter_map(|header| request.headers.get(header))
+        .find_map(|value| {
+            let (origin, host) = parse_extension_origin(value)?;
+            (host == client).then_some(origin)
+        })
+}
+
+fn parse_extension_origin(value: &str) -> Option<(String, String)> {
+    let remainder = value.trim().strip_prefix("chrome-extension://")?;
+    let host = remainder
+        .split(['/', '?', '#'])
+        .next()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())?;
+    Some((format!("chrome-extension://{host}"), host.to_string()))
+}
+
+fn prune_seen_request_nonces(entries: &mut VecDeque<(String, i64)>, now: i64) {
+    while let Some((_, seen_at)) = entries.front() {
+        if now - *seen_at <= AUTH_REQUEST_NONCE_TTL_MS {
+            break;
+        }
+        entries.pop_front();
+    }
+}
+
+fn auth_payload(
+    method: &str,
+    path: &str,
+    session_nonce: &str,
+    timestamp: i64,
+    request_nonce: &str,
+    client: &str,
+    body: &[u8],
+) -> String {
+    let body_hash = Sha256::digest(body);
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        method.to_ascii_uppercase(),
+        path,
+        session_nonce,
+        timestamp,
+        request_nonce,
+        client,
+        hex_encode(&body_hash),
+    )
+}
+
+fn current_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn generate_random_hex(byte_len: usize) -> Result<String, String> {
+    let mut bytes = vec![0u8; byte_len];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| format!("Failed generating capture bridge secret: {error}"))?;
+    Ok(hex_encode(&bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, &'static str> {
+    if !value.len().is_multiple_of(2) {
+        return Err("invalid signature format");
+    }
+
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let mut chars = value.as_bytes().chunks_exact(2);
+    for pair in &mut chars {
+        let high = decode_hex_nibble(pair[0])?;
+        let low = decode_hex_nibble(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn decode_hex_nibble(value: u8) -> Result<u8, &'static str> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(10 + value - b'a'),
+        b'A'..=b'F' => Ok(10 + value - b'A'),
+        _ => Err("invalid signature format"),
+    }
+}
+
+async fn read_request(socket: &mut TcpStream, buf: &mut Vec<u8>) -> Result<(), ()> {
+    let mut tmp = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    loop {
+        if Instant::now() > deadline {
+            return Err(());
+        }
+        match tokio::time::timeout(Duration::from_secs(5), socket.read(&mut tmp[..])).await {
+            Ok(Ok(0)) => return Ok(()),
+            Ok(Ok(read)) => {
+                buf.extend_from_slice(&tmp[..read]);
+                if buf.len() > MAX_BODY_LEN {
+                    return Err(());
+                }
+                if has_complete_http_request(buf) {
+                    return Ok(());
+                }
+            }
+            _ => return Err(()),
+        }
+    }
+}
+
+fn has_complete_http_request(buf: &[u8]) -> bool {
+    if let Some(header_end) = find_double_crlf(buf) {
+        let header_section = std::str::from_utf8(&buf[..header_end + 4]).unwrap_or("");
+        let content_length = extract_content_length(header_section).unwrap_or(0);
+        let body_start = header_end + 4;
+        buf.len() >= body_start + content_length
+    } else {
+        false
+    }
+}
+
+fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn extract_content_length(headers: &str) -> Option<usize> {
+    for line in headers.lines() {
+        if line.to_ascii_lowercase().starts_with("content-length:") {
+            return line.split(':').nth(1)?.trim().parse().ok();
+        }
+    }
+    None
+}
+
+fn parse_http(buf: &[u8]) -> Option<HttpRequest<'_>> {
+    let header_end = find_double_crlf(buf)?;
+    let header_str = std::str::from_utf8(&buf[..header_end + 4]).ok()?;
+
+    let mut lines = header_str.split("\r\n");
+    let first_line = lines.next()?;
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next()?;
+    let raw_path = parts.next()?;
+    let path = raw_path.split('?').next().unwrap_or(raw_path);
+
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':')?;
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+
+    Some(HttpRequest {
+        method,
+        path,
+        headers,
+        body: &buf[header_end + 4..],
+    })
+}
+
+async fn write_response(
+    socket: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: {CORS_ALLOW_HEADERS}\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(response.as_bytes()).await?;
+    socket.write_all(body).await?;
+    socket.flush().await
+}
+
+async fn write_json_response(
+    socket: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: {CORS_ALLOW_HEADERS}\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(response.as_bytes()).await?;
+    socket.write_all(body).await?;
+    socket.flush().await
+}
+
+async fn write_json_response_for_origin(
+    socket: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+    allow_origin: &str,
+) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: {allow_origin}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: {CORS_ALLOW_HEADERS}\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(response.as_bytes()).await?;
+    socket.write_all(body).await?;
+    socket.flush().await
+}
+
+async fn write_cors_preflight(socket: &mut TcpStream) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: {CORS_ALLOW_HEADERS}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    socket.write_all(response.as_bytes()).await?;
+    socket.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> CaptureBridgeState {
+        CaptureBridgeState {
+            inner: Arc::new(Mutex::new(CaptureBridgeAuthRuntime {
+                pairing_secret: "pairing-secret-123".to_string(),
+                session_nonce: "session-nonce-123".to_string(),
+                rotated_at: 0,
+                seen_request_nonces: VecDeque::new(),
+            })),
+        }
+    }
+
+    fn signed_request<'a>(
+        state: &CaptureBridgeState,
+        method: &'a str,
+        path: &'a str,
+        body: &'a [u8],
+        request_nonce: &'a str,
+    ) -> HttpRequest<'a> {
+        let timestamp = current_timestamp_ms();
+        let auth = state.inner.lock().unwrap();
+        let payload = auth_payload(
+            method,
+            path,
+            &auth.session_nonce,
+            timestamp,
+            request_nonce,
+            "test-extension",
+            body,
+        );
+        let mut mac = HmacSha256::new_from_slice(auth.pairing_secret.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        let signature = hex_encode(&mac.finalize().into_bytes());
+        drop(auth);
+
+        HttpRequest {
+            method,
+            path,
+            headers: BTreeMap::from([
+                (AUTH_HEADER_CLIENT.to_string(), "test-extension".to_string()),
+                (AUTH_HEADER_TIMESTAMP.to_string(), timestamp.to_string()),
+                (
+                    AUTH_HEADER_REQUEST_NONCE.to_string(),
+                    request_nonce.to_string(),
+                ),
+                (AUTH_HEADER_SIGNATURE.to_string(), signature),
+            ]),
+            body,
+        }
+    }
+
+    #[test]
+    fn authorize_request_accepts_valid_signature() {
+        let state = test_state();
+        let body = br#"{"url":"https://example.com/file.zip"}"#;
+        let request = signed_request(&state, "POST", "/capture", &body[..], "nonce-1");
+
+        assert!(state.authorize_request(&request).is_ok());
+    }
+
+    #[test]
+    fn authorize_request_rejects_replayed_nonce() {
+        let state = test_state();
+        let body = br#"{"url":"https://example.com/file.zip"}"#;
+        let request = signed_request(&state, "POST", "/capture", &body[..], "nonce-1");
+
+        assert!(state.authorize_request(&request).is_ok());
+        assert_eq!(
+            state.authorize_request(&request).unwrap_err(),
+            "replayed auth nonce"
+        );
+    }
+
+    #[test]
+    fn parse_http_extracts_lowercased_headers_and_body() {
+        let raw = b"POST /capture HTTP/1.1\r\nContent-Type: application/json\r\nX-VDM-Client: ext\r\nContent-Length: 15\r\n\r\n{\"ok\":true}\n";
+        let request = parse_http(&raw[..]).unwrap();
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/capture");
+        assert_eq!(
+            request.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            request.headers.get("x-vdm-client").map(String::as_str),
+            Some("ext")
+        );
+        assert_eq!(request.body, b"{\"ok\":true}\n");
+    }
+
+    #[test]
+    fn allows_extension_origin_when_client_matches() {
+        let request = HttpRequest {
+            method: "GET",
+            path: "/pair",
+            headers: BTreeMap::from([
+                (
+                    AUTH_HEADER_CLIENT.to_string(),
+                    "abcdefghijklmnop".to_string(),
+                ),
+                (
+                    "origin".to_string(),
+                    "chrome-extension://abcdefghijklmnop".to_string(),
+                ),
+            ]),
+            body: &[][..],
+        };
+
+        assert_eq!(
+            allowed_extension_origin(&request).as_deref(),
+            Some("chrome-extension://abcdefghijklmnop")
+        );
+    }
+
+    #[test]
+    fn allows_extension_referer_when_origin_is_absent() {
+        let request = HttpRequest {
+            method: "GET",
+            path: "/pair",
+            headers: BTreeMap::from([
+                (
+                    AUTH_HEADER_CLIENT.to_string(),
+                    "abcdefghijklmnop".to_string(),
+                ),
+                (
+                    "referer".to_string(),
+                    "chrome-extension://abcdefghijklmnop/options/options.html".to_string(),
+                ),
+            ]),
+            body: &[][..],
+        };
+
+        assert_eq!(
+            allowed_extension_origin(&request).as_deref(),
+            Some("chrome-extension://abcdefghijklmnop")
+        );
+    }
+
+    #[test]
+    fn rejects_non_extension_origin_for_pairing_bootstrap() {
+        let request = HttpRequest {
+            method: "GET",
+            path: "/pair",
+            headers: BTreeMap::from([
+                (
+                    AUTH_HEADER_CLIENT.to_string(),
+                    "abcdefghijklmnop".to_string(),
+                ),
+                ("origin".to_string(), "https://example.com".to_string()),
+            ]),
+            body: &[][..],
+        };
+
+        assert!(allowed_extension_origin(&request).is_none());
+    }
+}
