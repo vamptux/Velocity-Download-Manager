@@ -2,18 +2,20 @@ use crate::engine::segmentation::{pending_segment, split_segment};
 use crate::model::{DownloadSegment, DownloadSegmentStatus};
 use std::collections::BTreeMap;
 
-const STEAL_TAIL_DIVISOR: u64 = 3;
+const STEAL_MIN_DONOR_AGE_MS_FLOOR: u64 = 250;
+const STEAL_MIN_DONOR_AGE_MS_CEILING: u64 = 1_500;
+const STEAL_MIN_ETA_GAIN_PERCENT: u64 = 10;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct WorkStealScan {
     downloaded: u64,
     active_workers: u64,
-    largest_active: Option<(usize, u64)>,
 }
 
 pub struct SegmentScheduler {
     min_segment_size_bytes: u64,
     late_segment_ratio_percent: u32,
+    target_chunk_time_seconds: u32,
 }
 
 fn segment_current_offset(segment: &DownloadSegment) -> u64 {
@@ -31,10 +33,15 @@ fn segment_remaining_bytes(segment: &DownloadSegment) -> u64 {
 }
 
 impl SegmentScheduler {
-    pub fn new(min_segment_size_bytes: u64, late_segment_ratio_percent: u32) -> Self {
+    pub fn new(
+        min_segment_size_bytes: u64,
+        late_segment_ratio_percent: u32,
+        target_chunk_time_seconds: u32,
+    ) -> Self {
         Self {
             min_segment_size_bytes,
             late_segment_ratio_percent,
+            target_chunk_time_seconds,
         }
     }
 
@@ -45,28 +52,72 @@ impl SegmentScheduler {
     ) -> WorkStealScan {
         let mut downloaded = 0_u64;
         let mut active_workers = 0_u64;
-        let mut largest_active = None;
-        let mut largest_remaining = 0_u64;
 
         for (idx, seg) in segments.iter().enumerate() {
+            let _ = idx;
             downloaded = downloaded.saturating_add(seg.downloaded.max(0) as u64);
             if seg.status != DownloadSegmentStatus::Downloading {
                 continue;
             }
 
             active_workers = active_workers.saturating_add(1);
-            let remaining = segment_remaining_bytes(seg);
-            if remaining > largest_remaining {
-                largest_active = Some((idx, remaining));
-                largest_remaining = remaining;
-            }
         }
 
         WorkStealScan {
             downloaded: downloaded.min(total_file_size),
             active_workers,
-            largest_active,
         }
+    }
+
+    fn donor_min_age_ms(&self) -> u64 {
+        u64::from(self.target_chunk_time_seconds.max(1))
+            .saturating_mul(350)
+            .clamp(STEAL_MIN_DONOR_AGE_MS_FLOOR, STEAL_MIN_DONOR_AGE_MS_CEILING)
+    }
+
+    fn donor_min_progress_bytes(&self, sample: &SegmentRuntimeSample) -> u64 {
+        let warmup_window = sample
+            .throughput_bytes_per_second
+            .unwrap_or(self.min_segment_size_bytes)
+            .saturating_mul(self.donor_min_age_ms())
+            .div_ceil(1_000);
+        warmup_window.max(self.min_segment_size_bytes / 2)
+    }
+
+    fn donor_is_ready_for_split(
+        &self,
+        segment: &DownloadSegment,
+        sample: &SegmentRuntimeSample,
+        remaining_bytes: u64,
+    ) -> bool {
+        if remaining_bytes < self.min_segment_size_bytes.saturating_mul(2) {
+            return false;
+        }
+        if sample.active_for_ms.unwrap_or(0) < self.donor_min_age_ms() {
+            return false;
+        }
+
+        (segment.downloaded.max(0) as u64) >= self.donor_min_progress_bytes(sample)
+    }
+
+    fn recommended_steal_size(
+        &self,
+        remaining_bytes: u64,
+        sample: &SegmentRuntimeSample,
+        idle_worker_count: u32,
+    ) -> Option<u64> {
+        let throughput = sample.throughput_bytes_per_second.filter(|value| *value > 0)?;
+        let target_window_bytes = throughput
+            .saturating_mul(u64::from(self.target_chunk_time_seconds.max(1)))
+            .max(self.min_segment_size_bytes);
+        let eta_gain_floor = remaining_bytes.div_ceil(STEAL_MIN_ETA_GAIN_PERCENT);
+        let share_cap = remaining_bytes.div_ceil(u64::from(idle_worker_count.max(1)).saturating_add(1));
+        let challenger_size = target_window_bytes
+            .max(eta_gain_floor)
+            .max(self.min_segment_size_bytes)
+            .min(share_cap.max(self.min_segment_size_bytes))
+            .min(remaining_bytes.saturating_sub(self.min_segment_size_bytes));
+        (challenger_size >= self.min_segment_size_bytes).then_some(challenger_size)
     }
 
     fn is_in_late_segment_zone(
@@ -93,6 +144,7 @@ impl SegmentScheduler {
     pub fn attempt_work_steal(
         &self,
         segments: &mut [DownloadSegment],
+        samples: &[SegmentRuntimeSample],
         total_file_size: u64,
         idle_worker_count: u32,
     ) -> Option<DownloadSegment> {
@@ -105,23 +157,39 @@ impl SegmentScheduler {
             return None;
         }
 
-        let (largest_idx, largest_remaining) = scan.largest_active?;
+        let sample_by_segment: BTreeMap<u32, &SegmentRuntimeSample> = samples
+            .iter()
+            .map(|sample| (sample.segment_id, sample))
+            .collect();
 
-        if largest_remaining < self.min_segment_size_bytes.saturating_mul(2) {
-            return None;
+        let mut donor: Option<(usize, u64, u64)> = None;
+        for (idx, segment) in segments.iter().enumerate() {
+            if segment.status != DownloadSegmentStatus::Downloading {
+                continue;
+            }
+            let remaining = segment_remaining_bytes(segment);
+            let Some(sample) = sample_by_segment.get(&segment.id).copied() else {
+                continue;
+            };
+            if !self.donor_is_ready_for_split(segment, sample, remaining) {
+                continue;
+            }
+            let Some(challenger_size) =
+                self.recommended_steal_size(remaining, sample, idle_worker_count)
+            else {
+                continue;
+            };
+            match donor {
+                Some((_, current_remaining, _)) if current_remaining >= remaining => {}
+                _ => donor = Some((idx, remaining, challenger_size)),
+            }
         }
+
+        let (largest_idx, largest_remaining, challenger_size) = donor?;
 
         let largest_seg = &segments[largest_idx];
         let current_offset = segment_current_offset(largest_seg);
 
-        let challenger_size = largest_remaining
-            .checked_div(STEAL_TAIL_DIVISOR)
-            .unwrap_or(0)
-            .max(self.min_segment_size_bytes)
-            .min(largest_remaining.saturating_sub(self.min_segment_size_bytes));
-        if challenger_size < self.min_segment_size_bytes {
-            return None;
-        }
         let split_offset =
             current_offset.saturating_add(largest_remaining.saturating_sub(challenger_size)) as i64;
         let next_segment_id = segments
@@ -146,6 +214,7 @@ impl SegmentScheduler {
     pub fn fill_idle_slots(
         &self,
         segments: &mut Vec<DownloadSegment>,
+        samples: &[SegmentRuntimeSample],
         total_file_size: u64,
         desired_parallelism: usize,
     ) -> SegmentRefillPlan {
@@ -163,7 +232,8 @@ impl SegmentScheduler {
                 .iter()
                 .map(|segment| (segment.id, segment.end))
                 .collect();
-            let Some(stolen) = self.attempt_work_steal(segments.as_mut_slice(), total_file_size, 1)
+            let Some(stolen) =
+                self.attempt_work_steal(segments.as_mut_slice(), samples, total_file_size, 1)
             else {
                 break;
             };
@@ -295,6 +365,7 @@ pub struct SegmentRuntimeSample {
     pub remaining_bytes: u64,
     pub eta_seconds: Option<u64>,
     pub throughput_bytes_per_second: Option<u64>,
+    pub active_for_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,7 +382,7 @@ pub struct SegmentRefillPlan {
 
 #[cfg(test)]
 mod tests {
-    use super::{SegmentScheduler, STEAL_TAIL_DIVISOR};
+    use super::{SegmentRuntimeSample, SegmentScheduler};
     use crate::model::{DownloadSegment, DownloadSegmentStatus};
 
     fn downloading_segment(id: u32, start: i64, end: i64, downloaded: i64) -> DownloadSegment {
@@ -326,12 +397,28 @@ mod tests {
         }
     }
 
+    fn runtime_sample(
+        segment_id: u32,
+        remaining_bytes: u64,
+        throughput_bytes_per_second: u64,
+        active_for_ms: u64,
+    ) -> SegmentRuntimeSample {
+        SegmentRuntimeSample {
+            segment_id,
+            remaining_bytes,
+            eta_seconds: Some(remaining_bytes / throughput_bytes_per_second.max(1)),
+            throughput_bytes_per_second: Some(throughput_bytes_per_second),
+            active_for_ms: Some(active_for_ms),
+        }
+    }
+
     #[test]
     fn fill_idle_slots_proactively_splits_active_segments() {
-        let scheduler = SegmentScheduler::new(100, 20);
+        let scheduler = SegmentScheduler::new(100, 20, 1);
         let mut segments = vec![downloading_segment(1, 0, 1_199, 200)];
+        let samples = vec![runtime_sample(1, 1_000, 400, 800)];
 
-        let refill = scheduler.fill_idle_slots(&mut segments, 1_200, 3);
+        let refill = scheduler.fill_idle_slots(&mut segments, &samples, 1_200, 3);
 
         assert_eq!(refill.appended_segments.len(), 2);
         assert_eq!(segments.len(), 3);
@@ -339,46 +426,60 @@ mod tests {
     }
 
     #[test]
-    fn work_steal_biases_new_segment_toward_tail() {
-        let scheduler = SegmentScheduler::new(100, 20);
-        let mut segments = vec![downloading_segment(1, 0, 899, 100)];
+    fn work_steal_sizes_new_segment_from_throughput_window() {
+        let scheduler = SegmentScheduler::new(100, 20, 1);
+        let mut segments = vec![downloading_segment(1, 0, 899, 120)];
+        let samples = vec![runtime_sample(1, 780, 300, 900)];
 
-        let stolen = scheduler.attempt_work_steal(&mut segments, 900, 1);
+        let stolen = scheduler.attempt_work_steal(&mut segments, &samples, 900, 1);
 
         assert!(stolen.is_some());
         let stolen = stolen.unwrap_or_else(|| unreachable!());
-        let remaining = 800_u64;
-        let expected_min_start =
-            100_i64 + i64::try_from(remaining - remaining / STEAL_TAIL_DIVISOR).unwrap_or(i64::MAX);
-        assert!(stolen.start >= expected_min_start);
+        let stolen_size = (stolen.end - stolen.start + 1).max(0) as u64;
+        assert_eq!(stolen_size, 300);
+        assert_eq!(stolen.start, 600);
     }
 
     #[test]
     fn late_segment_guard_allows_large_remaining_window() {
-        let scheduler = SegmentScheduler::new(100, 20);
+        let scheduler = SegmentScheduler::new(100, 20, 1);
         let mut segments = vec![downloading_segment(1, 0, 1_999, 1_600)];
+        let samples = vec![runtime_sample(1, 400, 150, 900)];
 
-        let stolen = scheduler.attempt_work_steal(&mut segments, 2_000, 1);
+        let stolen = scheduler.attempt_work_steal(&mut segments, &samples, 2_000, 1);
 
         assert!(stolen.is_some());
     }
 
     #[test]
     fn work_steal_skips_exhausted_active_segments() {
-        let scheduler = SegmentScheduler::new(100, 20);
+        let scheduler = SegmentScheduler::new(100, 20, 1);
         let mut segments = vec![downloading_segment(1, 0, 99, 100)];
+        let samples = vec![runtime_sample(1, 0, 200, 900)];
 
-        let stolen = scheduler.attempt_work_steal(&mut segments, 100, 1);
+        let stolen = scheduler.attempt_work_steal(&mut segments, &samples, 100, 1);
 
         assert!(stolen.is_none());
     }
 
     #[test]
     fn late_segment_guard_blocks_small_tail_window() {
-        let scheduler = SegmentScheduler::new(100, 20);
+        let scheduler = SegmentScheduler::new(100, 20, 1);
         let mut segments = vec![downloading_segment(1, 0, 999, 850)];
+        let samples = vec![runtime_sample(1, 150, 120, 900)];
 
-        let stolen = scheduler.attempt_work_steal(&mut segments, 1_000, 1);
+        let stolen = scheduler.attempt_work_steal(&mut segments, &samples, 1_000, 1);
+
+        assert!(stolen.is_none());
+    }
+
+    #[test]
+    fn work_steal_skips_cold_donor_without_enough_age() {
+        let scheduler = SegmentScheduler::new(100, 20, 1);
+        let mut segments = vec![downloading_segment(1, 0, 1_199, 250)];
+        let samples = vec![runtime_sample(1, 950, 300, 120)];
+
+        let stolen = scheduler.attempt_work_steal(&mut segments, &samples, 1_200, 1);
 
         assert!(stolen.is_none());
     }

@@ -39,6 +39,8 @@ const AUTH_STATE_NONE = "none";
 const AUTH_STATE_MISSING = "missing";
 const AUTH_STATE_PAIRED = "paired";
 const AUTH_STATE_INVALID = "invalid";
+const BRIDGE_HEADER_CLIENT = "X-VDM-Client";
+const BRIDGE_HEADER_EXTENSION_ORIGIN = "X-VDM-Extension-Origin";
 
 // ---------------------------------------------------------------------------
 // In-memory state
@@ -89,6 +91,10 @@ async function persistPairingState(pairingCode, rotatedAt = 0) {
 
 function normalizedPairingCode() {
   return String(cachedSettings.bridgePairingCode ?? "").trim();
+}
+
+function extensionOrigin() {
+  return chrome.runtime.getURL("").replace(/\/$/, "");
 }
 
 function bridgeStatusSnapshot() {
@@ -207,7 +213,8 @@ async function syncPairingFromVdm() {
     response = await fetchBridge(BRIDGE_PAIR_PATH, {
       method: "GET",
       headers: {
-        "X-VDM-Client": client,
+        [BRIDGE_HEADER_CLIENT]: client,
+        [BRIDGE_HEADER_EXTENSION_ORIGIN]: extensionOrigin(),
       },
     });
   } catch {
@@ -252,7 +259,7 @@ async function buildBridgeAuthHeaders(method, path, bodyText = "") {
   const payload = [method.toUpperCase(), path, bridgeSessionNonce, timestamp, requestNonce, client, bodyHash].join("\n");
   const signature = await hmacSha256Hex(pairingCode, payload);
   return {
-    "X-VDM-Client": client,
+    [BRIDGE_HEADER_CLIENT]: client,
     "X-VDM-Timestamp": timestamp,
     "X-VDM-Request-Nonce": requestNonce,
     "X-VDM-Auth": signature,
@@ -594,11 +601,6 @@ async function markCaptureDelivered(preparedPayload, dedupeKey) {
   updateIcon();
   captureRecent.set(dedupeKey, Date.now());
 
-  const { recentCaptures = [] } = await chrome.storage.session.get("recentCaptures");
-  recentCaptures.push({ ...preparedPayload, ts: Date.now() });
-  if (recentCaptures.length > 12) recentCaptures.shift();
-  await chrome.storage.session.set({ recentCaptures });
-
   if (cachedSettings.notifyOnCapture) {
     chrome.notifications.create({
       type: "basic",
@@ -629,8 +631,15 @@ async function sendToVdm(payload) {
   captureInFlight.add(dedupeKey);
 
   try {
-    if (!vdmReachable || !bridgeSessionNonce || !vdmConnected) {
-      await checkVdmHealth();
+    const needsFreshHealth =
+      !vdmReachable ||
+      !bridgeSessionNonce ||
+      !vdmConnected ||
+      vdmAuthState === AUTH_STATE_MISSING ||
+      vdmAuthState === AUTH_STATE_INVALID;
+
+    if (needsFreshHealth) {
+      await checkVdmHealth({ force: true });
     }
     if (vdmAuthState === AUTH_STATE_MISSING || vdmAuthState === AUTH_STATE_INVALID) {
       return false;
@@ -644,7 +653,7 @@ async function sendToVdm(payload) {
     });
 
     if (!resp) {
-      await checkVdmHealth();
+      await checkVdmHealth({ force: true });
       return false;
     }
 
@@ -654,7 +663,7 @@ async function sendToVdm(payload) {
     }
 
     if (resp.status === 401) {
-      await checkVdmHealth();
+      await checkVdmHealth({ force: true });
       if (vdmAuthState === AUTH_STATE_PAIRED) {
         resp = await fetchAuthorizedBridgeResponse("/capture", {
           method: "POST",
@@ -669,19 +678,19 @@ async function sendToVdm(payload) {
       return false;
     }
 
-    await checkVdmHealth();
+    await checkVdmHealth({ force: true });
     return false;
   } catch {
-    await checkVdmHealth();
+    await checkVdmHealth({ force: true });
     return false;
   } finally {
     captureInFlight.delete(dedupeKey);
   }
 }
 
-async function initializeBridgeIntegration() {
+async function initializeBridgeIntegration({ force = false } = {}) {
   await loadSettings();
-  return checkVdmHealth();
+  return checkVdmHealth({ force });
 }
 
 async function focusVdmApp() {
@@ -690,7 +699,7 @@ async function focusVdmApp() {
     return false;
   }
   if (response.ok) {
-    void checkVdmHealth({ force: true });
+    await checkVdmHealth({ force: true });
   }
   return response.ok;
 }
@@ -701,6 +710,15 @@ async function restoreBrowserDownload(url) {
   } catch {
     chrome.tabs.create({ url, active: false });
   }
+}
+
+function notifyBridgeFallback(title, message) {
+  void chrome.notifications.create({
+    type: "basic",
+    iconUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQ==",
+    title,
+    message,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -799,7 +817,11 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   });
 
   if (!sent) {
-    chrome.tabs.create({ url: `${VDM_BASE_URL}/health?vdm-offline=1`, active: true });
+    await restoreBrowserDownload(url);
+    notifyBridgeFallback(
+      "VDM unavailable",
+      "The desktop app is offline, so the download continued in the browser.",
+    );
   }
 });
 
@@ -816,7 +838,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "get-status") {
     void (async () => {
-      await initializeBridgeIntegration();
+      await initializeBridgeIntegration({ force: msg.force !== false });
       sendResponse(bridgeStatusSnapshot());
     })();
     return true;

@@ -1,3 +1,4 @@
+mod app_update;
 mod capture_bridge;
 mod engine;
 mod model;
@@ -7,8 +8,8 @@ use engine::{
     EngineState, StartupSnapshot,
 };
 use model::{
-    AddDownloadArgs, ChecksumSpec, DownloadRecord, EngineSettings, HostTelemetryArgs,
-    ProbeDownloadArgs, ProbeResult, QueueState, ReorderDirection,
+    AddDownloadArgs, AppUpdateInfo, ChecksumSpec, DownloadRecord, EngineSettings,
+    HostTelemetryArgs, ProbeDownloadArgs, ProbeResult, QueueState, ReorderDirection,
 };
 use tauri::{AppHandle, Manager, State};
 
@@ -32,6 +33,27 @@ fn get_queue_state(state: State<'_, EngineState>) -> QueueState {
 #[tauri::command]
 fn get_engine_bootstrap_state(state: State<'_, EngineState>) -> EngineBootstrapState {
     state.inner().get_bootstrap_state()
+}
+
+#[tauri::command]
+fn retry_engine_bootstrap(state: State<'_, EngineState>) -> EngineBootstrapState {
+    state.inner().spawn_bootstrap();
+    state.inner().get_bootstrap_state()
+}
+
+#[tauri::command]
+async fn check_app_update(app: AppHandle) -> CommandResult<Option<AppUpdateInfo>> {
+    app_update::check_for_update(&app).await
+}
+
+#[tauri::command]
+async fn install_app_update(app: AppHandle) -> CommandResult<AppUpdateInfo> {
+    app_update::install_update(&app).await
+}
+
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    app.restart();
 }
 
 #[tauri::command]
@@ -203,6 +225,7 @@ fn take_pending_capture_payload() -> Option<capture_bridge::CapturePayload> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_handle = app.handle().clone();
             let engine = EngineState::new(app_handle.clone());
@@ -223,6 +246,10 @@ pub fn run() {
             get_engine_settings,
             get_queue_state,
             get_engine_bootstrap_state,
+            retry_engine_bootstrap,
+            check_app_update,
+            install_app_update,
+            restart_app,
             get_app_state,
             get_app_state_rows,
             get_startup_snapshot,

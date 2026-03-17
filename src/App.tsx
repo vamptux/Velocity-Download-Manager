@@ -1,10 +1,13 @@
 import { lazy, startTransition, Suspense, useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { type UiPrefs, loadUiPrefs } from "@/lib/uiPrefs";
 import { TitleBar } from "@/components/TitleBar";
 import { Sidebar } from "@/components/Sidebar";
 import { Toolbar } from "@/components/Toolbar";
 import { DownloadList } from "@/components/DownloadList";
 import { StatusBar } from "@/components/StatusBar";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { formatBytes } from "@/lib/format";
 import {
   canPauseDownload,
   canRestartDownload,
@@ -15,23 +18,30 @@ import {
 import { useEngineBridge } from "@/hooks/useEngineBridge";
 import { getQueueMoveState } from "@/lib/downloadQueue";
 import {
+  ipcCheckAppUpdate,
   ipcGetAppStateRows,
   ipcGetDownloadDetails,
   ipcGetDownloadRows,
   type EngineBootstrapState,
   ipcGetQueueState,
+  ipcInstallAppUpdate,
   ipcOpenDownloadFolder,
   ipcPauseDownload,
   ipcReorderDownload,
+  ipcRestartApp,
   ipcRestartDownload,
   ipcResumeDownload,
   ipcRemoveDownload,
+  ipcRetryEngineBootstrap,
   ipcStartQueue,
   ipcStopQueue,
   ipcUpdateEngineSettings,
   type DownloadDetailSnapshot,
 } from "@/lib/ipc";
+import { simplifyUserMessage } from "@/lib/userFacingMessages";
 import type {
+  AppUpdateInfo,
+  AppUpdateProgressEvent,
   DownloadCompletedEvent,
   DownloadProgressDiffEvent,
   QueueState,
@@ -50,12 +60,27 @@ const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   segmentCheckpointMaxIntervalMs: 3500,
   experimentalUncappedMode: false,
   trafficMode: "max",
+  speedLimitBytesPerSecond: null,
 };
 
 const LIVE_PROGRESS_HEARTBEAT_MS = 1200;
 const LIVE_PROGRESS_STALL_MS = 2500;
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const UPDATE_LAST_CHECK_KEY = "velocity-update:last-check";
+const UPDATE_DISMISSED_VERSION_KEY = "velocity-update:dismissed-version";
 
-function getErrorMessage(error: unknown): string {
+type AppUpdateStage = "idle" | "available" | "downloading" | "downloaded" | "failed" | "up-to-date";
+
+type AppUpdateState = {
+  stage: AppUpdateStage;
+  info: AppUpdateInfo | null;
+  downloadedBytes: number;
+  totalBytes: number | null;
+  error: string | null;
+  dismissedVersion: string | null;
+};
+
+function getActionErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message) {
     return error.message;
   }
@@ -64,28 +89,185 @@ function getErrorMessage(error: unknown): string {
     return error;
   }
 
-  return "VDM could not save the updated settings.";
+  return fallback;
+}
+
+function getErrorMessage(error: unknown): string {
+  return getActionErrorMessage(error, "Velocity Download Manager could not save the updated settings.");
+}
+
+function readStoredString(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredString(key: string, value: string | null): void {
+  try {
+    if (value == null) {
+      window.localStorage.removeItem(key);
+    } else {
+      window.localStorage.setItem(key, value);
+    }
+  } catch {
+    // Ignore storage failures on locked-down systems.
+  }
+}
+
+function readStoredNumber(key: string): number {
+  const raw = Number(readStoredString(key));
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
+function summarizeUpdateNotes(notes: string | null | undefined): string | null {
+  if (!notes) {
+    return null;
+  }
+
+  const firstMeaningfulLine = notes
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^[\s#>*-]+/, "").trim())
+    .find((line) => line.length > 0);
+
+  if (!firstMeaningfulLine) {
+    return null;
+  }
+
+  return firstMeaningfulLine.length > 160
+    ? `${firstMeaningfulLine.slice(0, 157).trimEnd()}...`
+    : firstMeaningfulLine;
+}
+
+function appUpdateProgressMessage(downloadedBytes: number, totalBytes: number | null): string {
+  if (totalBytes && totalBytes > 0) {
+    return `${formatBytes(downloadedBytes)} of ${formatBytes(totalBytes)} downloaded.`;
+  }
+
+  if (downloadedBytes > 0) {
+    return `${formatBytes(downloadedBytes)} downloaded.`;
+  }
+
+  return "Downloading the update package...";
+}
+
+type FloatingAlert = {
+  id: string;
+  tone: "error" | "warning" | "info" | "success";
+  eyebrow: string;
+  title: string;
+  message: string;
+  progressPercent?: number | null;
+  actionLabel?: string;
+  onAction?: () => void;
+  onDismiss?: () => void;
+};
+
+function alertToneClasses(tone: FloatingAlert["tone"]): {
+  border: string;
+  eyebrow: string;
+  button: string;
+} {
+  switch (tone) {
+    case "error":
+      return {
+        border: "border-[hsl(var(--status-error)/0.24)] bg-[linear-gradient(180deg,hsl(var(--status-error)/0.12),hsl(0,0%,9.4%))]",
+        eyebrow: "text-[hsl(var(--status-error))]",
+        button: "border-[hsl(var(--status-error)/0.28)] text-[hsl(var(--status-error))] hover:bg-[hsl(var(--status-error)/0.12)]",
+      };
+    case "warning":
+      return {
+        border: "border-[hsl(var(--status-paused)/0.24)] bg-[linear-gradient(180deg,hsl(var(--status-paused)/0.12),hsl(0,0%,9.4%))]",
+        eyebrow: "text-[hsl(var(--status-paused))]",
+        button: "border-[hsl(var(--status-paused)/0.28)] text-[hsl(var(--status-paused))] hover:bg-[hsl(var(--status-paused)/0.12)]",
+      };
+    case "success":
+      return {
+        border: "border-[hsl(var(--status-finished)/0.24)] bg-[linear-gradient(180deg,hsl(var(--status-finished)/0.12),hsl(0,0%,9.4%))]",
+        eyebrow: "text-[hsl(var(--status-finished))]",
+        button: "border-[hsl(var(--status-finished)/0.28)] text-[hsl(var(--status-finished))] hover:bg-[hsl(var(--status-finished)/0.12)]",
+      };
+    default:
+      return {
+        border: "border-border/70 bg-[linear-gradient(180deg,hsl(var(--card)),hsl(var(--background)))]",
+        eyebrow: "text-muted-foreground/56",
+        button: "border-border/60 text-foreground/78 hover:bg-accent",
+      };
+  }
 }
 
 function CompletionNoticeStack({
+  alerts,
   notices,
+  completionHistoryExpanded,
+  onToggleCompletionHistory,
   onOpenFolder,
   onDismiss,
 }: {
+  alerts: FloatingAlert[];
   notices: DownloadCompletedEvent[];
+  completionHistoryExpanded: boolean;
+  onToggleCompletionHistory: () => void;
   onOpenFolder: (id: string) => Promise<void> | void;
   onDismiss: (id: string) => void;
 }) {
-  if (notices.length === 0) {
+  const visibleNotices = completionHistoryExpanded ? notices : notices.slice(0, 3);
+  const hiddenNoticeCount = Math.max(0, notices.length - visibleNotices.length);
+
+  if (alerts.length === 0 && visibleNotices.length === 0 && hiddenNoticeCount === 0) {
     return null;
   }
 
   return (
     <div className="pointer-events-none absolute bottom-8 right-4 z-30 flex w-[320px] flex-col gap-2">
-      {notices.map((notice) => (
+      {alerts.map((alert) => {
+        const tone = alertToneClasses(alert.tone);
+        return (
+          <section
+            key={alert.id}
+            className={`pointer-events-auto rounded-xl border p-3 shadow-[0_18px_40px_rgba(0,0,0,0.36)] ${tone.border}`}
+          >
+            <div className={`text-[10px] font-semibold uppercase tracking-[0.14em] ${tone.eyebrow}`}>
+              {alert.eyebrow}
+            </div>
+            <div className="mt-1 text-[13px] font-semibold text-foreground/88">{alert.title}</div>
+            <div className="mt-1 text-[11px] leading-relaxed text-muted-foreground/66">{alert.message}</div>
+            {typeof alert.progressPercent === "number" ? (
+              <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-black/20">
+                <div
+                  className="h-full rounded-full bg-[linear-gradient(90deg,hsl(var(--primary)),hsl(var(--status-downloading)/0.78))] transition-[width] duration-300"
+                  style={{ width: `${Math.min(100, Math.max(4, alert.progressPercent))}%` }}
+                />
+              </div>
+            ) : null}
+            <div className="mt-3 flex items-center gap-2">
+              {alert.actionLabel && alert.onAction ? (
+                <button
+                  type="button"
+                  onClick={alert.onAction}
+                  className={`rounded-md border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${tone.button}`}
+                >
+                  {alert.actionLabel}
+                </button>
+              ) : null}
+              {alert.onDismiss ? (
+                <button
+                  type="button"
+                  onClick={alert.onDismiss}
+                  className="rounded-md border border-border/60 px-2.5 py-1.5 text-[11px] text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  Dismiss
+                </button>
+              ) : null}
+            </div>
+          </section>
+        );
+      })}
+      {visibleNotices.map((notice) => (
         <section
           key={notice.id}
-          className="pointer-events-auto rounded-xl border border-border/70 bg-[linear-gradient(180deg,hsl(0,0%,11.5%),hsl(0,0%,8.8%))] p-3 shadow-[0_18px_40px_rgba(0,0,0,0.36)]"
+          className="pointer-events-auto rounded-xl border border-border/70 bg-[linear-gradient(180deg,hsl(var(--card)),hsl(var(--background)))] p-3 shadow-[0_18px_40px_rgba(0,0,0,0.36)]"
         >
           <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[hsl(var(--status-finished))]">
             Download Finished
@@ -110,6 +292,27 @@ function CompletionNoticeStack({
           </div>
         </section>
       ))}
+      {notices.length > 3 ? (
+        <section className="pointer-events-auto rounded-xl border border-border/70 bg-[linear-gradient(180deg,hsl(var(--card)),hsl(var(--background)))] p-3 shadow-[0_18px_40px_rgba(0,0,0,0.36)]">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/46">
+            Completion History
+          </div>
+          <div className="mt-1 text-[11px] text-muted-foreground/64">
+            {hiddenNoticeCount > 0
+              ? `${hiddenNoticeCount} more completed download${hiddenNoticeCount === 1 ? " is" : "s are"} waiting.`
+              : "Showing recent completion activity."}
+          </div>
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onToggleCompletionHistory}
+              className="rounded-md border border-border/70 bg-black/10 px-2.5 py-1.5 text-[11px] font-medium text-foreground/78 transition-colors hover:bg-accent hover:text-foreground"
+            >
+              {completionHistoryExpanded ? "Show Less" : "Review All"}
+            </button>
+          </div>
+        </section>
+      ) : null}
     </div>
   );
 }
@@ -145,12 +348,25 @@ export function App() {
   const [queueState, setQueueState] = useState<QueueState>({ running: true });
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
   const [bootstrapState, setBootstrapState] = useState<EngineBootstrapState>({ ready: false, error: null });
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deleteTargetIds, setDeleteTargetIds] = useState<Set<string>>(new Set());
   const [completionNotices, setCompletionNotices] = useState<DownloadCompletedEvent[]>([]);
+  const [completionHistoryExpanded, setCompletionHistoryExpanded] = useState(false);
+  const [dismissedBootstrapError, setDismissedBootstrapError] = useState<string | null>(null);
+  const [dismissedDownloadIssueSignature, setDismissedDownloadIssueSignature] = useState<string | null>(null);
   const [downloadDetails, setDownloadDetails] = useState<Record<string, DownloadDetailSnapshot>>({});
+  const [uiPrefs, setUiPrefs] = useState<UiPrefs>(() => ({ ...loadUiPrefs() }));
+  const [appUpdate, setAppUpdate] = useState<AppUpdateState>(() => ({
+    stage: "idle",
+    info: null,
+    downloadedBytes: 0,
+    totalBytes: null,
+    error: null,
+    dismissedVersion: readStoredString(UPDATE_DISMISSED_VERSION_KEY),
+  }));
   const completionTimers = useRef<Map<string, number>>(new Map());
   const lastRealtimeSyncAt = useRef(Date.now());
   const eventBridgeAttached = useRef(false);
@@ -214,6 +430,14 @@ export function App() {
       (stats, download) => {
         if (download.status === "queued") {
           stats.queuedCount += 1;
+        } else if (download.status === "paused") {
+          stats.pausedCount += 1;
+        } else if (download.status === "finished") {
+          stats.finishedCount += 1;
+        }
+
+        if (download.status !== "finished" && download.speedLimitBytesPerSecond != null) {
+          stats.manualOverrideCount += 1;
         }
 
         if (download.status !== "downloading") {
@@ -230,7 +454,15 @@ export function App() {
         }
         return stats;
       },
-      { activeCount: 0, activeConnections: 0, queuedCount: 0, totalSpeed: 0 },
+      {
+        activeCount: 0,
+        activeConnections: 0,
+        queuedCount: 0,
+        pausedCount: 0,
+        finishedCount: 0,
+        totalSpeed: 0,
+        manualOverrideCount: 0,
+      },
     ),
     [downloads],
   );
@@ -346,7 +578,7 @@ export function App() {
   );
 
   const enqueueCompletionNotice = useCallback((notice: DownloadCompletedEvent) => {
-    setCompletionNotices((prev) => [notice, ...prev.filter((entry) => entry.id !== notice.id)].slice(0, 3));
+    setCompletionNotices((prev) => [notice, ...prev.filter((entry) => entry.id !== notice.id)].slice(0, 8));
 
     const existingTimer = completionTimers.current.get(notice.id);
     if (existingTimer) {
@@ -362,6 +594,123 @@ export function App() {
     if (typeof Notification !== "undefined" && document.visibilityState === "hidden" && Notification.permission === "granted") {
       new Notification("Download finished", { body: notice.name });
     }
+  }, []);
+
+  useEffect(() => {
+    if (!settingsNotice) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setSettingsNotice(null);
+    }, 4200);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [settingsNotice]);
+
+  useEffect(() => {
+    if (!bootstrapState.error) {
+      setDismissedBootstrapError(null);
+    }
+  }, [bootstrapState.error]);
+
+  useEffect(() => {
+    if (!downloads.some((download) => download.status === "error")) {
+      setDismissedDownloadIssueSignature(null);
+    }
+  }, [downloads]);
+
+  useEffect(() => {
+    if (import.meta.env.DEV) {
+      return;
+    }
+
+    let disposed = false;
+    const unlistenPromise = listen<AppUpdateProgressEvent>("app://update-progress", (event) => {
+      if (disposed) {
+        return;
+      }
+
+      setAppUpdate((prev) => {
+        switch (event.payload.event) {
+          case "started":
+            return {
+              ...prev,
+              stage: "downloading",
+              downloadedBytes: 0,
+              totalBytes: event.payload.data.contentLength ?? null,
+              error: null,
+            };
+          case "progress":
+            return {
+              ...prev,
+              stage: "downloading",
+              downloadedBytes: prev.downloadedBytes + event.payload.data.chunkLength,
+            };
+          case "finished":
+            return {
+              ...prev,
+              downloadedBytes: prev.totalBytes ?? prev.downloadedBytes,
+            };
+          default:
+            return prev;
+        }
+      });
+    });
+
+    return () => {
+      disposed = true;
+      void unlistenPromise.then((unlisten) => unlisten()).catch(() => null);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (import.meta.env.DEV) {
+      return;
+    }
+
+    if (Date.now() - readStoredNumber(UPDATE_LAST_CHECK_KEY) < UPDATE_CHECK_INTERVAL_MS) {
+      return;
+    }
+
+    let active = true;
+
+    void ipcCheckAppUpdate()
+      .then((update) => {
+        if (!active) {
+          return;
+        }
+
+        writeStoredString(UPDATE_LAST_CHECK_KEY, String(Date.now()));
+
+        if (!update) {
+          setAppUpdate((prev) => ({
+            ...prev,
+            stage: "up-to-date",
+            info: null,
+            downloadedBytes: 0,
+            totalBytes: null,
+            error: null,
+          }));
+          return;
+        }
+
+        setAppUpdate((prev) => ({
+          ...prev,
+          stage: prev.dismissedVersion === update.version ? "idle" : "available",
+          info: update,
+          downloadedBytes: 0,
+          totalBytes: null,
+          error: null,
+        }));
+      })
+      .catch(() => null);
+
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -605,6 +954,7 @@ export function App() {
       try {
         const updated = await ipcUpdateEngineSettings(nextSettings);
         setSettings(updated);
+        setSettingsNotice("Engine settings saved. New transfers will use the updated profile.");
         await refreshDownloads();
         setSettingsOpen(false);
       } catch (error) {
@@ -615,6 +965,90 @@ export function App() {
     },
     [refreshDownloads],
   );
+
+  const handleUpdateGlobalSpeedLimit = useCallback(
+    async (limitBytesPerSecond: number | null) => {
+      const updated = await ipcUpdateEngineSettings({
+        ...settings,
+        speedLimitBytesPerSecond: limitBytesPerSecond,
+      });
+      setSettings(updated);
+      await refreshDownloads();
+    },
+    [refreshDownloads, settings],
+  );
+
+  const handleRetryBootstrap = useCallback(async () => {
+    setDismissedBootstrapError(null);
+    try {
+      setBootstrapState(await ipcRetryEngineBootstrap());
+    } catch (error) {
+      setBootstrapState({ ready: true, error: getErrorMessage(error) });
+    }
+  }, []);
+
+  const handleDismissAppUpdate = useCallback(() => {
+    const dismissedVersion = appUpdate.info?.version ?? appUpdate.dismissedVersion;
+    if (dismissedVersion) {
+      writeStoredString(UPDATE_DISMISSED_VERSION_KEY, dismissedVersion);
+    }
+
+    setAppUpdate((prev) => ({
+      ...prev,
+      stage: prev.stage === "downloaded" ? prev.stage : "idle",
+      dismissedVersion,
+      error: null,
+    }));
+  }, [appUpdate.dismissedVersion, appUpdate.info]);
+
+  const handleInstallAppUpdate = useCallback(async () => {
+    setAppUpdate((prev) => ({
+      ...prev,
+      stage: "downloading",
+      downloadedBytes: 0,
+      totalBytes: null,
+      error: null,
+    }));
+
+    try {
+      const installedUpdate = await ipcInstallAppUpdate();
+      writeStoredString(UPDATE_DISMISSED_VERSION_KEY, null);
+      writeStoredString(UPDATE_LAST_CHECK_KEY, String(Date.now()));
+
+      setAppUpdate((prev) => ({
+        ...prev,
+        stage: "downloaded",
+        info: installedUpdate,
+        downloadedBytes: prev.totalBytes ?? prev.downloadedBytes,
+        dismissedVersion: null,
+        error: null,
+      }));
+    } catch (error) {
+      setAppUpdate((prev) => ({
+        ...prev,
+        stage: "failed",
+        error: simplifyUserMessage(
+          getActionErrorMessage(error, "Velocity Download Manager could not install the update."),
+        ),
+        downloadedBytes: 0,
+        totalBytes: null,
+      }));
+    }
+  }, []);
+
+  const handleRestartAppUpdate = useCallback(async () => {
+    try {
+      await ipcRestartApp();
+    } catch (error) {
+      setAppUpdate((prev) => ({
+        ...prev,
+        stage: "failed",
+        error: simplifyUserMessage(
+          getActionErrorMessage(error, "Velocity Download Manager could not restart to finish the update."),
+        ),
+      }));
+    }
+  }, []);
 
   // Keyboard shortcuts: Ctrl+N, Delete, Space
   useEffect(() => {
@@ -647,12 +1081,182 @@ export function App() {
   const restartTooltip = selectedTransferState.restartRequiredCount > 0
     ? "Clean-restart selected downloads from byte 0"
     : "Restart selected";
+  const failedDownloads = useMemo(
+    () => downloads.filter((download) => download.status === "error"),
+    [downloads],
+  );
+  const failedDownloadIssueSignature = useMemo(
+    () => failedDownloads.map((download) => `${download.id}:${download.errorMessage ?? download.diagnostics.terminalReason ?? ""}`).join("|"),
+    [failedDownloads],
+  );
+  const appUpdateProgressPercent = useMemo(() => {
+    if (!appUpdate.totalBytes || appUpdate.totalBytes <= 0) {
+      return null;
+    }
+
+    return Math.round((appUpdate.downloadedBytes / appUpdate.totalBytes) * 100);
+  }, [appUpdate.downloadedBytes, appUpdate.totalBytes]);
+  const appUpdateNotesSummary = useMemo(
+    () => summarizeUpdateNotes(appUpdate.info?.notes),
+    [appUpdate.info?.notes],
+  );
+  const floatingAlerts = useMemo<FloatingAlert[]>(() => {
+    const alerts: FloatingAlert[] = [];
+
+    if (bootstrapState.error && bootstrapState.error !== dismissedBootstrapError) {
+      alerts.push({
+        id: `bootstrap:${bootstrapState.error}`,
+        tone: "error",
+        eyebrow: "Engine",
+        title: "Engine startup needs attention",
+        message: simplifyUserMessage(bootstrapState.error),
+        actionLabel: "Retry",
+        onAction: () => {
+          void handleRetryBootstrap();
+        },
+        onDismiss: () => {
+          setDismissedBootstrapError(bootstrapState.error);
+        },
+      });
+    }
+
+    if (!settingsOpen && settingsError) {
+      alerts.push({
+        id: `settings-error:${settingsError}`,
+        tone: "error",
+        eyebrow: "Settings",
+        title: "Settings were not saved",
+        message: simplifyUserMessage(settingsError),
+        actionLabel: "Open",
+        onAction: () => {
+          setSettingsOpen(true);
+        },
+        onDismiss: () => {
+          setSettingsError(null);
+        },
+      });
+    }
+
+    if (appUpdate.stage === "available" && appUpdate.info && appUpdate.info.version !== appUpdate.dismissedVersion) {
+      alerts.push({
+        id: `app-update:available:${appUpdate.info.version}`,
+        tone: "info",
+        eyebrow: "Update",
+        title: `Version ${appUpdate.info.version} is ready`,
+        message: appUpdateNotesSummary ?? "A new build of Velocity Download Manager is available.",
+        actionLabel: "Install",
+        onAction: () => {
+          void handleInstallAppUpdate();
+        },
+        onDismiss: handleDismissAppUpdate,
+      });
+    }
+
+    if (appUpdate.stage === "downloading" && appUpdate.info) {
+      alerts.push({
+        id: `app-update:downloading:${appUpdate.info.version}`,
+        tone: "info",
+        eyebrow: "Update",
+        title: `Installing ${appUpdate.info.version}`,
+        message: appUpdateProgressMessage(appUpdate.downloadedBytes, appUpdate.totalBytes),
+        progressPercent: appUpdateProgressPercent,
+      });
+    }
+
+    if (appUpdate.stage === "downloaded" && appUpdate.info) {
+      alerts.push({
+        id: `app-update:downloaded:${appUpdate.info.version}`,
+        tone: "success",
+        eyebrow: "Update",
+        title: "Restart to finish the update",
+        message: `Velocity Download Manager ${appUpdate.info.version} is installed and ready to apply.`,
+        actionLabel: "Restart",
+        onAction: () => {
+          void handleRestartAppUpdate();
+        },
+      });
+    }
+
+    if (appUpdate.stage === "failed" && appUpdate.error) {
+      alerts.push({
+        id: `app-update:failed:${appUpdate.info?.version ?? "unknown"}`,
+        tone: "error",
+        eyebrow: "Update",
+        title: "Update install failed",
+        message: appUpdate.error,
+        actionLabel: "Retry",
+        onAction: () => {
+          void handleInstallAppUpdate();
+        },
+        onDismiss: handleDismissAppUpdate,
+      });
+    }
+
+    if (failedDownloads.length > 0 && failedDownloadIssueSignature !== dismissedDownloadIssueSignature) {
+      const lead = failedDownloads[0];
+      const overflow = Math.max(0, failedDownloads.length - 2);
+      const leadNames = failedDownloads.slice(0, 2).map((download) => download.name).join(", ");
+      alerts.push({
+        id: `download-issues:${failedDownloadIssueSignature}`,
+        tone: "warning",
+        eyebrow: "Downloads",
+        title: failedDownloads.length === 1 ? `${lead.name} needs attention` : `${failedDownloads.length} downloads need attention`,
+        message: failedDownloads.length === 1
+          ? simplifyUserMessage(lead.errorMessage ?? lead.diagnostics.terminalReason ?? "The transfer stopped and may need a retry.")
+          : `${leadNames}${overflow > 0 ? ` and ${overflow} more` : ""} stopped and may need a retry.`,
+        actionLabel: "Review",
+        onAction: () => {
+          setSelectedIds(new Set([lead.id]));
+          setDismissedDownloadIssueSignature(failedDownloadIssueSignature);
+        },
+        onDismiss: () => {
+          setDismissedDownloadIssueSignature(failedDownloadIssueSignature);
+        },
+      });
+    }
+
+    if (settingsNotice) {
+      alerts.push({
+        id: `settings-notice:${settingsNotice}`,
+        tone: "success",
+        eyebrow: "Settings",
+        title: "Settings saved",
+        message: settingsNotice,
+        onDismiss: () => {
+          setSettingsNotice(null);
+        },
+      });
+    }
+
+    return alerts;
+  }, [
+    bootstrapState.error,
+    dismissedBootstrapError,
+    dismissedDownloadIssueSignature,
+    failedDownloadIssueSignature,
+    failedDownloads,
+    appUpdate.dismissedVersion,
+    appUpdate.downloadedBytes,
+    appUpdate.error,
+    appUpdate.info,
+    appUpdate.stage,
+    appUpdate.totalBytes,
+    appUpdateNotesSummary,
+    appUpdateProgressPercent,
+    handleDismissAppUpdate,
+    handleInstallAppUpdate,
+    handleRestartAppUpdate,
+    handleRetryBootstrap,
+    settingsError,
+    settingsNotice,
+    settingsOpen,
+  ]);
 
   return (
     <TooltipProvider delayDuration={400}>
       <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
         <TitleBar onSearch={setSearchQuery} />
-        <div className="flex flex-1 overflow-hidden">
+        <div id="vdm-content" className="flex flex-1 overflow-hidden">
           <Sidebar activeCategory={activeCategory} onCategoryChange={setActiveCategory} downloads={downloads} />
           <main className="flex flex-1 flex-col overflow-hidden">
             <Toolbar
@@ -703,21 +1307,33 @@ export function App() {
                 />
               </Suspense>
             ) : null}
-            <StatusBar
-              queuedCount={downloadStats.queuedCount}
-              queueRunning={queueState.running}
-              activeCount={downloadStats.activeCount}
-              activeLimit={settings.maxActiveDownloads}
-              connectionCount={downloadStats.activeConnections}
-              downloadSpeed={downloadStats.totalSpeed}
-              trafficMode={settings.trafficMode}
-              engineBootstrapReady={bootstrapState.ready}
-              engineBootstrapError={bootstrapState.error}
-            />
           </main>
         </div>
+        {uiPrefs.showStatusBar && (
+          <StatusBar
+            queuedCount={downloadStats.queuedCount}
+            pausedCount={downloadStats.pausedCount}
+            finishedCount={downloadStats.finishedCount}
+            queueRunning={queueState.running}
+            activeCount={downloadStats.activeCount}
+            activeLimit={settings.maxActiveDownloads}
+            connectionCount={downloadStats.activeConnections}
+            downloadSpeed={downloadStats.totalSpeed}
+            speedLimitBytesPerSecond={settings.speedLimitBytesPerSecond ?? null}
+            manualOverrideCount={downloadStats.manualOverrideCount}
+            engineBootstrapReady={bootstrapState.ready}
+            engineBootstrapError={bootstrapState.error}
+            onRetryEngineBootstrap={() => {
+              void handleRetryBootstrap();
+            }}
+            onUpdateGlobalSpeedLimit={(limitBytesPerSecond) => handleUpdateGlobalSpeedLimit(limitBytesPerSecond)}
+          />
+        )}
         <CompletionNoticeStack
+          alerts={floatingAlerts}
           notices={completionNotices}
+          completionHistoryExpanded={completionHistoryExpanded}
+          onToggleCompletionHistory={() => setCompletionHistoryExpanded((prev) => !prev)}
           onOpenFolder={async (id) => {
             await handleOpenFolder(id);
             dismissCompletionNotice(id);
@@ -753,6 +1369,8 @@ export function App() {
             error={settingsError}
             onOpenChange={setSettingsOpen}
             onSave={handleSaveSettings}
+            onClearError={() => setSettingsError(null)}
+            onUiPrefsChange={setUiPrefs}
           />
         </Suspense>
       ) : null}

@@ -129,6 +129,8 @@ pub struct EngineSettings {
     pub experimental_uncapped_mode: bool,
     #[serde(default)]
     pub traffic_mode: TrafficMode,
+    #[serde(default)]
+    pub speed_limit_bytes_per_second: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, TS)]
@@ -151,6 +153,7 @@ impl Default for EngineSettings {
             segment_checkpoint_max_interval_ms: default_segment_checkpoint_max_interval_ms(),
             experimental_uncapped_mode: false,
             traffic_mode: TrafficMode::default(),
+            speed_limit_bytes_per_second: None,
         }
     }
 }
@@ -185,6 +188,8 @@ pub struct HostProfile {
     pub average_throughput_bytes_per_second: Option<u64>,
     #[serde(default)]
     pub telemetry_samples: u32,
+    #[serde(default)]
+    pub last_telemetry_at: Option<i64>,
     pub cooldown_until: Option<i64>,
     #[serde(default)]
     pub ramp_attempts_without_gain: u32,
@@ -246,6 +251,32 @@ pub struct ProbeScopeCache {
     pub probe_failure_streak: u32,
     #[serde(default)]
     pub last_probe_error_at: Option<i64>,
+    #[serde(default)]
+    pub average_ttfb_ms: Option<u64>,
+    #[serde(default)]
+    pub average_throughput_bytes_per_second: Option<u64>,
+    #[serde(default)]
+    pub telemetry_samples: u32,
+    #[serde(default)]
+    pub last_telemetry_at: Option<i64>,
+    #[serde(default)]
+    pub throttle_events: u32,
+    #[serde(default)]
+    pub timeout_events: u32,
+    #[serde(default)]
+    pub reset_events: u32,
+    #[serde(default)]
+    pub cooldown_until: Option<i64>,
+    #[serde(default)]
+    pub ramp_attempts_without_gain: u32,
+    #[serde(default)]
+    pub concurrency_locked: bool,
+    #[serde(default)]
+    pub locked_connections: Option<u32>,
+    #[serde(default)]
+    pub lock_reason: Option<String>,
+    #[serde(default)]
+    pub last_instability_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -552,10 +583,33 @@ pub struct AddDownloadArgs {
     pub start_immediately: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUpdateInfo {
+    pub version: String,
+    pub current_version: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase", tag = "event", content = "data")]
+pub enum AppUpdateProgressEvent {
+    #[serde(rename_all = "camelCase")]
+    Started { content_length: Option<u64> },
+    #[serde(rename_all = "camelCase")]
+    Progress { chunk_length: u64 },
+    Finished,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostTelemetryArgs {
     pub host: String,
+    #[serde(default)]
+    pub scope_key: Option<String>,
     pub attempted_connections: Option<u32>,
     pub sustained_gain_bytes_per_second: Option<i64>,
     pub throughput_bytes_per_second: Option<u64>,

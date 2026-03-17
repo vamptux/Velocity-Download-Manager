@@ -14,12 +14,11 @@ pub(super) fn append_download_log(
     let message = message.into();
     let timestamp = unix_epoch_millis();
 
-    if let Some(last) = download.engine_log.last_mut() {
-        if last.level == level && last.code == code && last.message == message {
+    if let Some(last) = download.engine_log.last_mut()
+        && last.level == level && last.code == code && last.message == message {
             last.timestamp = timestamp;
             return;
         }
-    }
 
     download.engine_log.push(DownloadLogEntry {
         timestamp,

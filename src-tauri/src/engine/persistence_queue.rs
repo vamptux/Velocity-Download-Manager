@@ -67,8 +67,9 @@ impl SnapshotPersistQueue {
 fn run_snapshot_writer(snapshot_path: PathBuf, receiver: Receiver<PersistRequest>) {
     let mut disconnected = false;
     loop {
-        let Ok(mut request) = receiver.recv() else {
-            break;
+        let mut request = match receiver.recv() {
+            Ok(request) => request,
+            Err(_) => break,
         };
 
         let mut latest_snapshot = request.snapshot;
@@ -79,7 +80,8 @@ fn run_snapshot_writer(snapshot_path: PathBuf, receiver: Receiver<PersistRequest
 
         if acknowledgements.is_empty() {
             loop {
-                match receiver.recv_timeout(Duration::from_millis(COALESCE_WINDOW_MS)) {
+                let next_request = receiver.recv_timeout(Duration::from_millis(COALESCE_WINDOW_MS));
+                match next_request {
                     Ok(mut next) => {
                         latest_snapshot = next.snapshot;
                         if let Some(ack) = next.ack.take() {
@@ -96,7 +98,11 @@ fn run_snapshot_writer(snapshot_path: PathBuf, receiver: Receiver<PersistRequest
             }
         }
 
-        while let Ok(mut next) = receiver.try_recv() {
+        loop {
+            let mut next = match receiver.try_recv() {
+                Ok(next) => next,
+                Err(_) => break,
+            };
             latest_snapshot = next.snapshot;
             if let Some(ack) = next.ack.take() {
                 acknowledgements.push(ack);

@@ -309,15 +309,13 @@ async fn probe_download_headers_internal(
             .find_map(|stage| stage.metadata.html_resolution.as_ref())
             .cloned()
         {
-            if request_state.can_resolve_wrapper_hop() {
-                if let Some(direct_download_url) = hint.direct_download_url.as_deref() {
-                    if !urls_match_after_normalization(&request_state.url, direct_download_url) {
+            if request_state.can_resolve_wrapper_hop()
+                && let Some(direct_download_url) = hint.direct_download_url.as_deref()
+                    && !urls_match_after_normalization(&request_state.url, direct_download_url) {
                         request_state
                             .retarget_to_direct_download(direct_download_url, hint.request_referer.clone());
                         continue;
                     }
-                }
-            }
 
             let all_stages_html = attempts
                 .ordered_stages()
@@ -327,8 +325,7 @@ async fn probe_download_headers_internal(
             if request_state.can_resolve_wrapper_hop()
                 && all_stages_html
                 && hint.direct_download_url.is_none()
-            {
-                if let Some(app_api_hint) = hint.app_api.as_ref() {
+                && let Some(app_api_hint) = hint.app_api.as_ref() {
                     let api_resolution_result = resolve_html_app_api_download_url(
                         client,
                         &request_state.url,
@@ -358,7 +355,6 @@ async fn probe_download_headers_internal(
                         }
                     }
                 }
-            }
 
             let same_url_wrapper_hint = hint.suggested_name.is_some()
                 || hint
@@ -1023,6 +1019,35 @@ fn probe_method_label(method: ProbeMethod) -> &'static str {
     }
 }
 
+pub fn normalize_protocol_label(protocol: &str) -> &'static str {
+    let protocol = protocol.trim();
+    if protocol.eq_ignore_ascii_case("http3")
+        || protocol.eq_ignore_ascii_case("http/3")
+        || protocol.eq_ignore_ascii_case("h3")
+    {
+        "http3"
+    } else if protocol.eq_ignore_ascii_case("http2")
+        || protocol.eq_ignore_ascii_case("http/2")
+        || protocol.eq_ignore_ascii_case("h2")
+    {
+        "http2"
+    } else if protocol.eq_ignore_ascii_case("http1.1")
+        || protocol.eq_ignore_ascii_case("http/1.1")
+    {
+        "http1.1"
+    } else if protocol.eq_ignore_ascii_case("http1.0")
+        || protocol.eq_ignore_ascii_case("http/1.0")
+    {
+        "http1.0"
+    } else if protocol.eq_ignore_ascii_case("http0.9")
+        || protocol.eq_ignore_ascii_case("http/0.9")
+    {
+        "http0.9"
+    } else {
+        "http-unknown"
+    }
+}
+
 pub fn protocol_label(version: reqwest::Version) -> &'static str {
     match version {
         reqwest::Version::HTTP_3 => "http3",
@@ -1041,7 +1066,8 @@ mod tests {
         extract_html_follow_up_request, is_html_interstitial_response, HtmlFollowUpMethod,
     };
     use super::{
-        classify_range_observation, should_try_standard_probe, ProbeStageMetadata, RangeObservation,
+        classify_range_observation, normalize_protocol_label, should_try_standard_probe,
+        ProbeStageMetadata, RangeObservation,
     };
     use crate::model::ResumeValidators;
 
@@ -1065,6 +1091,14 @@ mod tests {
             Some("text/html; charset=utf-8"),
             None,
         ));
+    }
+
+    #[test]
+    fn normalizes_legacy_protocol_aliases() {
+        assert_eq!(normalize_protocol_label("h2"), "http2");
+        assert_eq!(normalize_protocol_label("HTTP/1.1"), "http1.1");
+        assert_eq!(normalize_protocol_label("h3"), "http3");
+        assert_eq!(normalize_protocol_label("spdy"), "http-unknown");
     }
 
     #[test]

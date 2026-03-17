@@ -55,12 +55,12 @@ function ToolbarButton({
   active = false,
   variant = "blue",
 }: ToolbarButtonProps) {
-  const activeClass =
+  const activeColor =
     variant === "green"
-      ? "text-[hsl(var(--status-finished))] bg-[hsl(var(--status-finished)/0.09)] hover:bg-[hsl(var(--status-finished)/0.15)] border border-[hsl(var(--status-finished)/0.2)]"
+      ? "text-[hsl(var(--status-finished))]"
       : variant === "amber"
-      ? "text-[hsl(var(--status-paused))] bg-[hsl(var(--status-paused)/0.09)] hover:bg-[hsl(var(--status-paused)/0.16)] border border-[hsl(var(--status-paused)/0.2)]"
-      : "text-[hsl(var(--status-downloading)/0.9)] bg-[hsl(var(--status-downloading)/0.08)] hover:bg-[hsl(var(--status-downloading)/0.14)] border border-[hsl(var(--status-downloading)/0.18)]";
+        ? "text-[hsl(var(--status-paused))]"
+        : "text-[hsl(var(--status-downloading))]";
 
   return (
     <Tooltip>
@@ -69,19 +69,23 @@ function ToolbarButton({
           onClick={onClick}
           disabled={disabled}
           className={cn(
-            "flex flex-col items-center justify-center gap-[3px]",
-            "min-w-[48px] h-[38px] px-2.5 rounded-md transition-all duration-200",
+            "group relative flex flex-col items-center justify-center gap-[3px]",
+            "min-w-[46px] h-[38px] px-2 rounded-md transition-all duration-150",
             disabled
-              ? "text-muted-foreground/18 pointer-events-none border border-transparent"
+              ? "text-muted-foreground/18 pointer-events-none"
               : danger
-              ? "text-[hsl(var(--status-error)/0.55)] hover:text-[hsl(var(--status-error))] hover:bg-[hsl(var(--status-error)/0.1)]"
+              ? "text-[hsl(var(--status-error)/0.5)] hover:text-[hsl(var(--status-error)/0.85)] hover:bg-white/[0.035]"
               : active
-              ? activeClass
-              : "text-muted-foreground/45 hover:bg-[hsl(0,0%,17%)] hover:text-foreground/85 border border-transparent hover:border-white/[0.06]",
+              ? cn(activeColor, "hover:bg-white/[0.04]")
+              : "text-muted-foreground/40 hover:text-foreground/75 hover:bg-white/[0.04]",
           )}
         >
-          <Icon size={15} strokeWidth={1.6} />
-          <span className="text-[9.5px] leading-none tracking-wide">{label}</span>
+          <Icon
+            size={15}
+            strokeWidth={active ? 1.9 : 1.6}
+            className="transition-all duration-150 group-hover:scale-[1.08]"
+          />
+          <span className="text-[9px] leading-none tracking-wide">{label}</span>
         </button>
       </TooltipTrigger>
       <TooltipContent>{tooltip}</TooltipContent>
@@ -123,13 +127,13 @@ function NewDownloadSplitButton({ onNewDownload }: { onNewDownload: (prefillUrl?
 
   return (
     <div ref={ref} className="relative flex items-center mr-2.5">
-      {/* Main button — copper left fading to grey right */}
+      {/* Main button — steel-grey gradient */}
       <button
         onClick={() => onNewDownload()}
-        style={{ background: "linear-gradient(90deg, hsl(20,60%,46%) 0%, hsl(12,42%,31%) 55%, hsl(0,0%,20%) 100%)" }}
-        className="flex items-center gap-[5px] px-3 h-[26px] rounded-l text-[11.5px] font-semibold tracking-tight text-[hsl(24,10%,95%)] hover:brightness-110 transition-all"
+        style={{ background: "linear-gradient(90deg, hsl(var(--accent-h) 22% 34%) 0%, hsl(var(--accent-h) 16% 26%) 52%, hsl(0,0%,19%) 100%)" }}
+        className="flex items-center gap-[5px] px-3 h-[26px] rounded-l text-[11.5px] font-medium tracking-tight text-[hsl(0,0%,92%)] hover:brightness-110 active:brightness-95 transition-all antialiased"
       >
-        <Zap size={11} strokeWidth={2.5} fill="currentColor" />
+        <Zap size={11} strokeWidth={2.5} fill="currentColor" className="shrink-0" />
         New Download
       </button>
 
@@ -138,7 +142,7 @@ function NewDownloadSplitButton({ onNewDownload }: { onNewDownload: (prefillUrl?
         onClick={() => setOpen((v) => !v)}
         style={{ background: "hsl(0,0%,20%)" }}
         className={cn(
-          "flex items-center justify-center w-[18px] h-[26px] rounded-r border-l border-black/30 text-[hsl(24,10%,68%)] hover:brightness-125 transition-all",
+          "flex items-center justify-center w-[18px] h-[26px] rounded-r border-l border-black/30 text-[hsl(0,0%,68%)] hover:brightness-125 transition-all",
           open && "brightness-125",
         )}
       >

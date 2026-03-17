@@ -11,6 +11,9 @@ node_modules/
 dist/
 .turbo
 .bun/
+.cache/
+coverage/
+.eslintcache
 
 # Env
 .env
@@ -26,3 +29,10 @@ Thumbs.db
 
 # IDE
 .idea/
+
+# Release signing
+.tauri/
+*.key
+*.key.pub
+*.pem
+*.sig

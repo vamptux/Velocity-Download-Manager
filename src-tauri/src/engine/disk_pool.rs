@@ -6,6 +6,20 @@ use tokio::sync::mpsc;
 
 use crate::engine::disk::write_at_offset;
 
+const DISK_QUEUE_PRESSURE_WARM_PERCENT: usize = 55;
+const DISK_QUEUE_PRESSURE_ELEVATED_PERCENT: usize = 70;
+const DISK_QUEUE_PRESSURE_HIGH_PERCENT: usize = 85;
+const DISK_QUEUE_PRESSURE_CRITICAL_PERCENT: usize = 92;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QueuePressureTier {
+    Normal,
+    Warm,
+    Elevated,
+    High,
+    Critical,
+}
+
 pub struct WriteBlock {
     pub file: Arc<File>,
     pub buffer: Vec<u8>,
@@ -47,13 +61,11 @@ impl DiskPool {
                         break;
                     };
                     depth.fetch_sub(1, Ordering::Relaxed);
-                    if let Err(error) = write_at_offset(&block.file, &block.buffer, block.offset) {
-                        if let Ok(mut slot) = write_error.lock() {
-                            if slot.is_none() {
+                    if let Err(error) = write_at_offset(&block.file, &block.buffer, block.offset)
+                        && let Ok(mut slot) = write_error.lock()
+                            && slot.is_none() {
                                 *slot = Some(error.to_string());
                             }
-                        }
-                    }
                     pending.fetch_sub(1, Ordering::Relaxed);
                 })
                 .expect("Failed to spawn IO worker thread");
@@ -76,8 +88,23 @@ impl DiskPool {
         queue_utilization_percent_from_counts(self.queue_depth(), self.capacity)
     }
 
-    pub fn is_queue_utilization_at_least(&self, threshold_percent: usize) -> bool {
-        self.capacity > 0 && self.queue_utilization_percent() >= threshold_percent.min(100)
+    pub fn pressure_tier(&self) -> QueuePressureTier {
+        queue_pressure_tier_from_utilization(self.queue_utilization_percent())
+    }
+
+    pub fn under_pressure(&self) -> bool {
+        self.pressure_tier() >= QueuePressureTier::Warm
+    }
+
+    pub fn blocks_new_supply(&self) -> bool {
+        self.pressure_tier() >= QueuePressureTier::Critical
+    }
+
+    pub fn recommended_parallelism(&self, requested_parallelism: u32) -> u32 {
+        recommended_parallelism_for_pressure(
+            requested_parallelism,
+            self.queue_utilization_percent(),
+        )
     }
 
     pub fn pending_writes(&self) -> usize {
@@ -110,7 +137,33 @@ fn queue_utilization_percent_from_counts(queue_depth: usize, capacity: usize) ->
     if capacity == 0 {
         0
     } else {
-        queue_depth.saturating_mul(100) / capacity
+        (queue_depth.saturating_mul(100) / capacity).min(100)
+    }
+}
+
+fn queue_pressure_tier_from_utilization(utilization_percent: usize) -> QueuePressureTier {
+    match utilization_percent {
+        DISK_QUEUE_PRESSURE_CRITICAL_PERCENT..=100 => QueuePressureTier::Critical,
+        DISK_QUEUE_PRESSURE_HIGH_PERCENT.. => QueuePressureTier::High,
+        DISK_QUEUE_PRESSURE_ELEVATED_PERCENT.. => QueuePressureTier::Elevated,
+        DISK_QUEUE_PRESSURE_WARM_PERCENT.. => QueuePressureTier::Warm,
+        _ => QueuePressureTier::Normal,
+    }
+}
+
+fn recommended_parallelism_for_pressure(
+    requested_parallelism: u32,
+    utilization_percent: usize,
+) -> u32 {
+    let requested_parallelism = requested_parallelism.max(1);
+    match queue_pressure_tier_from_utilization(utilization_percent) {
+        QueuePressureTier::Normal | QueuePressureTier::Warm => requested_parallelism,
+        QueuePressureTier::Elevated => requested_parallelism.saturating_sub(1).max(1),
+        QueuePressureTier::High => {
+            let reduction = requested_parallelism.div_ceil(3);
+            requested_parallelism.saturating_sub(reduction).max(1)
+        }
+        QueuePressureTier::Critical => 1,
     }
 }
 
@@ -120,7 +173,11 @@ fn disk_worker_count_from_parallelism(parallelism: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{disk_worker_count_from_parallelism, queue_utilization_percent_from_counts};
+    use super::{
+        disk_worker_count_from_parallelism, queue_pressure_tier_from_utilization,
+        queue_utilization_percent_from_counts, recommended_parallelism_for_pressure,
+        QueuePressureTier,
+    };
 
     #[test]
     fn queue_utilization_handles_zero_capacity() {
@@ -133,6 +190,7 @@ mod tests {
         assert_eq!(queue_utilization_percent_from_counts(64, 256), 25);
         assert_eq!(queue_utilization_percent_from_counts(192, 256), 75);
         assert_eq!(queue_utilization_percent_from_counts(256, 256), 100);
+        assert_eq!(queue_utilization_percent_from_counts(320, 256), 100);
     }
 
     #[test]
@@ -142,5 +200,22 @@ mod tests {
         assert_eq!(disk_worker_count_from_parallelism(8), 4);
         assert_eq!(disk_worker_count_from_parallelism(32), 16);
         assert_eq!(disk_worker_count_from_parallelism(64), 16);
+    }
+
+    #[test]
+    fn queue_pressure_tiers_escalate_smoothly() {
+        assert_eq!(queue_pressure_tier_from_utilization(20), QueuePressureTier::Normal);
+        assert_eq!(queue_pressure_tier_from_utilization(55), QueuePressureTier::Warm);
+        assert_eq!(queue_pressure_tier_from_utilization(70), QueuePressureTier::Elevated);
+        assert_eq!(queue_pressure_tier_from_utilization(85), QueuePressureTier::High);
+        assert_eq!(queue_pressure_tier_from_utilization(92), QueuePressureTier::Critical);
+    }
+
+    #[test]
+    fn recommended_parallelism_downshifts_before_critical_queue_depth() {
+        assert_eq!(recommended_parallelism_for_pressure(6, 40), 6);
+        assert_eq!(recommended_parallelism_for_pressure(6, 72), 5);
+        assert_eq!(recommended_parallelism_for_pressure(6, 88), 4);
+        assert_eq!(recommended_parallelism_for_pressure(6, 96), 1);
     }
 }

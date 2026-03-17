@@ -70,6 +70,15 @@ function updatePairingStatus() {
     return;
   }
 
+  if (currentBridgeStatus.authState === "missing") {
+    elPairingStatus.dataset.state = "missing";
+    elPairingStatus.textContent = "VDM is online. The secure bridge is finalizing.";
+    if (bridgeStatusDetail) {
+      bridgeStatusDetail.textContent = "The extension is syncing the local bridge secret and should be ready in a moment.";
+    }
+    return;
+  }
+
   if (currentBridgeStatus.connected) {
     const syncedAt = formatTimestamp(currentBridgeStatus.pairingSyncedAt);
     elPairingStatus.dataset.state = "ready";
@@ -91,7 +100,7 @@ function updatePairingStatus() {
 
 async function refreshBridgeStatus() {
   try {
-    const status = await chrome.runtime.sendMessage({ type: "get-status" });
+    const status = await chrome.runtime.sendMessage({ type: "get-status", force: true });
     currentBridgeStatus = {
       enabled: !!status?.enabled,
       connected: !!status?.connected,

@@ -268,7 +268,7 @@ function EmptyState() {
     <div className="flex flex-1 flex-col items-center justify-center gap-4 py-16">
       <div
         className="flex h-[52px] w-[52px] items-center justify-center rounded-xl"
-        style={{ background: "linear-gradient(135deg, hsl(0,0%,16%), hsl(0,0%,12%))", border: "1px solid hsl(0,0%,22%)" }}
+        style={{ background: "linear-gradient(135deg, hsl(var(--accent-h) 12% 16%), hsl(var(--background)))", border: "1px solid hsl(var(--border))" }}
       >
         <Download size={22} strokeWidth={1.4} className="text-muted-foreground/40" />
       </div>

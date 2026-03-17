@@ -33,5 +33,7 @@ pub(super) fn sanitize_engine_settings(mut settings: EngineSettings) -> EngineSe
             i64::from(settings.segment_checkpoint_min_interval_ms),
             RUNTIME_CHECKPOINT_MAX_INTERVAL_MS,
         ) as u32;
+    settings.speed_limit_bytes_per_second =
+        settings.speed_limit_bytes_per_second.filter(|value| *value > 0);
     settings
 }

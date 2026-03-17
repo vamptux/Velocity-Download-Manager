@@ -87,6 +87,7 @@ mod tests {
                     remaining_bytes: 10,
                     eta_seconds: Some(1),
                     throughput_bytes_per_second: Some(4 * 1024 * 1024),
+                    active_for_ms: None,
                 },
             ),
             (
@@ -96,6 +97,7 @@ mod tests {
                     remaining_bytes: 10,
                     eta_seconds: Some(1),
                     throughput_bytes_per_second: Some(6 * 1024 * 1024),
+                    active_for_ms: None,
                 },
             ),
         ]);
@@ -135,6 +137,7 @@ mod tests {
                 remaining_bytes: 10,
                 eta_seconds: Some(1),
                 throughput_bytes_per_second: Some(5 * 1024 * 1024),
+                active_for_ms: None,
             },
         )]);
 

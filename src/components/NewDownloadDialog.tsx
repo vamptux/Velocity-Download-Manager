@@ -10,9 +10,8 @@ import {
   DialogInput,
   DownloadCapturePane,
   ProbeSummaryStrip,
-  getCaptureErrorMessage,
-  useDefaultCaptureSavePath,
 } from "@/components/DownloadCapturePane";
+import { getCaptureErrorMessage, useDefaultCaptureSavePath } from "@/lib/captureUtils";
 
 interface NewDownloadDialogProps {
   open: boolean;
@@ -158,7 +157,7 @@ export function NewDownloadDialog({ open, initialUrl, onOpenChange, onDownloadAd
         <Dialog.Content
           className={cn(
             "fixed left-1/2 top-1/2 z-50 -translate-x-1/2 -translate-y-1/2",
-            "w-[500px] rounded-xl border border-border bg-[linear-gradient(180deg,hsl(0,0%,10.5%),hsl(0,0%,8.8%))] shadow-2xl shadow-black/60 p-0 outline-none",
+            "w-[500px] rounded-xl border border-border bg-[linear-gradient(180deg,hsl(var(--card)),hsl(var(--background)))] shadow-2xl shadow-black/60 p-0 outline-none",
             "data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 data-[state=open]:slide-in-from-top-2",
             "data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95",
           )}
@@ -168,15 +167,15 @@ export function NewDownloadDialog({ open, initialUrl, onOpenChange, onDownloadAd
             <div className="flex items-center gap-2.5">
               <div
                 className="flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded"
-                style={{ background: "linear-gradient(135deg, hsl(20,58%,52%), hsl(12,50%,34%))" }}
+                style={{ background: "linear-gradient(135deg, hsl(var(--accent-h) 25% 38%), hsl(var(--accent-h) 18% 24%))", boxShadow: "0 1px 4px rgba(0,0,0,0.35)" }}
               >
-                <ArrowDownToLine size={11} className="text-white" strokeWidth={2.3} />
+                <ArrowDownToLine size={11} className="text-white" strokeWidth={2.2} />
               </div>
-              <Dialog.Title className="text-[13px] font-semibold text-foreground">
+              <Dialog.Title className="text-[13px] font-medium tracking-[-0.01em] text-foreground/92">
                 New Download
               </Dialog.Title>
             </div>
-            <Dialog.Close className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground transition-colors">
+            <Dialog.Close className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground/60 hover:bg-accent hover:text-foreground transition-colors">
               <X size={13} strokeWidth={2} />
             </Dialog.Close>
           </div>
@@ -230,6 +229,7 @@ export function NewDownloadDialog({ open, initialUrl, onOpenChange, onDownloadAd
                 setFilenameDirty(false);
               }}
               errorMessage={submitError}
+              onErrorDismiss={() => setSubmitError(null)}
               fieldIds={{
                 category: "nd-category",
                 savePath: "nd-savepath",
@@ -249,8 +249,8 @@ export function NewDownloadDialog({ open, initialUrl, onOpenChange, onDownloadAd
               </Dialog.Close>
               <button
                 type="submit"
-                style={{ background: "linear-gradient(90deg, hsl(20,58%,48%) 0%, hsl(12,42%,32%) 55%, hsl(0,0%,22%) 100%)" }}
-                className="h-8 px-5 rounded-md text-[12.5px] font-semibold text-[hsl(24,10%,95%)] hover:brightness-110 transition-all disabled:opacity-40 disabled:pointer-events-none"
+                style={{ background: "linear-gradient(90deg, hsl(var(--accent-h) 22% 32%) 0%, hsl(var(--accent-h) 15% 25%) 55%, hsl(0,0%,18%) 100%)" }}
+                className="h-8 px-5 rounded-md text-[12.5px] font-semibold text-[hsl(0,0%,93%)] hover:brightness-110 transition-all disabled:opacity-40 disabled:pointer-events-none"
                 disabled={!url.trim() || submitting}
               >
                 {submitting ? "Adding…" : "Download"}

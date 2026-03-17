@@ -27,7 +27,7 @@ export function TitleBar({ onSearch }: { onSearch?: (q: string) => void }) {
       <div className="flex items-center pl-2.5">
         <div
           className="mr-2 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-[4px]"
-          style={{ background: "linear-gradient(135deg, hsl(24,62%,54%), hsl(12,52%,34%))" }}
+          style={{ background: "linear-gradient(135deg, hsl(var(--accent-h) 25% 38%), hsl(var(--accent-h) 18% 24%))" }}
         >
           <ArrowDownToLine size={9} className="text-white" strokeWidth={2.5} />
         </div>
@@ -43,11 +43,11 @@ export function TitleBar({ onSearch }: { onSearch?: (q: string) => void }) {
 
       <div data-tauri-drag-region className="flex flex-1 items-center justify-center gap-2">
         <span
-          className="pointer-events-none select-none text-[12px] font-semibold tracking-[0.04em] text-foreground/38"
+          className="pointer-events-none select-none text-[12px] font-semibold tracking-[0.04em] text-foreground/30"
           style={{ letterSpacing: "0.03em" }}
         >
           Velocity{" "}
-          <span className="text-[hsl(var(--primary)/0.7)]">DM</span>
+          <span className="text-[hsl(var(--primary)/0.55)]">DM</span>
         </span>
       </div>
 
@@ -68,27 +68,27 @@ export function TitleBar({ onSearch }: { onSearch?: (q: string) => void }) {
         />
       </div>
 
-      <div className="flex items-stretch self-stretch">
+      <div className="flex items-stretch self-stretch border-l border-white/[0.06]">
         <button
           onClick={minimize}
           aria-label="Minimize"
-          className="group flex w-11 items-center justify-center text-muted-foreground/40 hover:bg-white/[0.07] hover:text-foreground/75 transition-colors"
+          className="group flex w-[42px] items-center justify-center text-muted-foreground/58 hover:bg-white/[0.1] hover:text-foreground/90 transition-colors"
         >
-          <Minus size={12} strokeWidth={1.6} />
+          <Minus size={14} strokeWidth={1.8} />
         </button>
         <button
           onClick={maximize}
           aria-label="Maximize"
-          className="group flex w-11 items-center justify-center text-muted-foreground/40 hover:bg-white/[0.07] hover:text-foreground/75 transition-colors"
+          className="group flex w-[42px] items-center justify-center text-muted-foreground/58 hover:bg-white/[0.1] hover:text-foreground/90 transition-colors"
         >
-          <Maximize2 size={10} strokeWidth={1.6} />
+          <Maximize2 size={11} strokeWidth={1.8} />
         </button>
         <button
           onClick={close}
           aria-label="Close"
-          className="group flex w-[46px] items-center justify-center text-muted-foreground/40 hover:bg-[hsl(0,62%,42%)] hover:text-white transition-colors"
+          className="group flex w-[46px] items-center justify-center text-muted-foreground/58 hover:bg-[hsl(0,66%,46%)] hover:text-white transition-colors"
         >
-          <X size={12} strokeWidth={1.6} />
+          <X size={13} strokeWidth={1.9} />
         </button>
       </div>
     </header>

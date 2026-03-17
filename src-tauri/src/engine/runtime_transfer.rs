@@ -16,6 +16,7 @@ use super::http_helpers::{
     apply_request_cookies, apply_request_payload, apply_request_referer,
     parse_content_range_bounds, request_context_supports_segmented_transfer,
 };
+use super::probe::protocol_label;
 use crate::engine::disk_pool::{DiskPool, WriteBlock};
 use crate::engine::http_pool::HttpPool;
 use crate::model::{
@@ -111,11 +112,15 @@ struct RetryPolicy {
     budget: u32,
     backoff_base_ms: u64,
     backoff_max_ms: u64,
+    jitter_percent: u8,
 }
 
 const THROTTLE_EXTRA_RETRIES: u32 = 6;
 const THROTTLE_BACKOFF_MAX_MS: u64 = 30_000;
 const RETRY_AFTER_MAX_SECONDS: u64 = 120;
+const DEFAULT_RETRY_JITTER_PERCENT: u8 = 15;
+const ADAPTIVE_CHUNK_BUFFER_FLOOR_BYTES: usize = 256 * 1024;
+const ADAPTIVE_CHUNK_BUFFER_CEILING_BYTES: usize = 8 * 1024 * 1024;
 
 struct FetchSegmentOutcome {
     response: reqwest::Response,
@@ -130,6 +135,38 @@ struct FetchSegmentRequest {
     start: u64,
     end: u64,
     connection_reused_hint: bool,
+}
+
+impl RetryPolicy {
+    fn from_config(config: &TransferWorkerConfig) -> Self {
+        let backoff_base_ms = config.backoff_base_ms.max(10);
+        Self {
+            budget: config.retry_budget.max(1),
+            backoff_base_ms,
+            backoff_max_ms: config.backoff_max_ms.max(backoff_base_ms),
+            jitter_percent: DEFAULT_RETRY_JITTER_PERCENT,
+        }
+    }
+
+    fn delay_ms(self, attempt: u32, throttled: bool, retry_after_ms: Option<u64>) -> u64 {
+        let backoff_cap = if throttled {
+            THROTTLE_BACKOFF_MAX_MS
+        } else {
+            self.backoff_max_ms
+        };
+        let base_delay = exponential_backoff_ms(self.backoff_base_ms, backoff_cap, attempt);
+        jittered_retry_delay_ms(
+            base_delay.max(retry_after_ms.unwrap_or(0)),
+            self.jitter_percent,
+        )
+    }
+
+    fn stream_recovery_delay_ms(self, attempt: u32) -> u64 {
+        jittered_retry_delay_ms(
+            exponential_backoff_ms(self.backoff_base_ms, self.backoff_max_ms, attempt),
+            self.jitter_percent,
+        )
+    }
 }
 
 fn validate_range_response(
@@ -159,11 +196,10 @@ fn validate_range_response(
             Ok(())
         }
         StatusCode::OK => {
-            if let Some((start, end, _)) = parse_content_range_bounds(content_range) {
-                if start == request.start && end == request.end {
+            if let Some((start, end, _)) = parse_content_range_bounds(content_range)
+                && start == request.start && end == request.end {
                     return Ok(());
                 }
-            }
 
             let content_length = header_to_u64(headers.get(CONTENT_LENGTH));
             if request.start == 0 && content_length == Some(requested_len) {
@@ -218,6 +254,46 @@ fn plan_buffered_write(
         bytes_to_write: writable as usize,
         boundary_reached: current_pos.saturating_add(buffered_len as u64) > dynamic_end,
     }
+}
+
+fn adaptive_chunk_buffer_target(
+    base_chunk_buffer_size: usize,
+    observed_throughput_bytes_per_second: u64,
+    queue_utilization_percent: usize,
+) -> usize {
+    let floor = adaptive_chunk_buffer_floor(base_chunk_buffer_size);
+    let ceiling = adaptive_chunk_buffer_ceiling(base_chunk_buffer_size);
+
+    if observed_throughput_bytes_per_second == 0 {
+        return base_chunk_buffer_size.clamp(floor, ceiling);
+    }
+
+    let target_window_ms = match queue_utilization_percent {
+        85..=100 => 16_u64,
+        70..=84 => 24_u64,
+        55..=69 => 40_u64,
+        0..=34 => 72_u64,
+        _ => 56_u64,
+    };
+    let target = observed_throughput_bytes_per_second
+        .saturating_mul(target_window_ms)
+        .div_ceil(1_000);
+    usize::try_from(target)
+        .unwrap_or(usize::MAX)
+        .clamp(floor, ceiling)
+}
+
+fn adaptive_chunk_buffer_floor(base_chunk_buffer_size: usize) -> usize {
+    base_chunk_buffer_size
+        .saturating_div(4)
+        .max(ADAPTIVE_CHUNK_BUFFER_FLOOR_BYTES)
+}
+
+fn adaptive_chunk_buffer_ceiling(base_chunk_buffer_size: usize) -> usize {
+    base_chunk_buffer_size.saturating_mul(2).clamp(
+        adaptive_chunk_buffer_floor(base_chunk_buffer_size),
+        ADAPTIVE_CHUNK_BUFFER_CEILING_BYTES,
+    )
 }
 
 #[derive(Clone)]
@@ -394,11 +470,8 @@ where
     let mut emitted_ttfb_sample = false;
     let mut request_ordinal = 0_u64;
     let mut stream_drops = 0u32;
-    let retry_policy = RetryPolicy {
-        budget: config.retry_budget.max(1),
-        backoff_base_ms: config.backoff_base_ms.max(10),
-        backoff_max_ms: config.backoff_max_ms.max(config.backoff_base_ms.max(10)),
-    };
+    let mut observed_throughput_bytes_per_second = 0_u64;
+    let retry_policy = RetryPolicy::from_config(config);
     let mut initial_response = initial_response;
     segment.status = DownloadSegmentStatus::Downloading;
     on_progress(SegmentRuntimeProgress {
@@ -426,7 +499,8 @@ where
             end: current_end,
             connection_reused_hint: pooled_client_reused || request_ordinal > 0,
         };
-        let mut fetch_outcome = if request_ordinal == 0 {
+        let mut fetch_outcome;
+        if request_ordinal == 0 {
             if let Some(initial) = initial_response.take() {
                 if validate_range_response(
                     initial.response.status(),
@@ -435,15 +509,15 @@ where
                 )
                 .is_ok()
                 {
-                    FetchSegmentOutcome {
+                    fetch_outcome = FetchSegmentOutcome {
                         response: initial.response,
                         ttfb_ms: initial.ttfb_ms,
                         connection_reused_hint: initial.connection_reused_hint,
                         negotiated_protocol: initial.negotiated_protocol,
                         retry_attempts: 0,
-                    }
+                    };
                 } else {
-                    fetch_segment_stream_with_retry(
+                    fetch_outcome = fetch_segment_stream_with_retry(
                         &client,
                         &config.url,
                         request,
@@ -453,10 +527,10 @@ where
                         config.request_cookies.as_deref(),
                         &control,
                     )
-                    .await?
+                    .await?;
                 }
             } else {
-                fetch_segment_stream_with_retry(
+                fetch_outcome = fetch_segment_stream_with_retry(
                     &client,
                     &config.url,
                     request,
@@ -466,10 +540,10 @@ where
                     config.request_cookies.as_deref(),
                     &control,
                 )
-                .await?
+                .await?;
             }
         } else {
-            fetch_segment_stream_with_retry(
+            fetch_outcome = fetch_segment_stream_with_retry(
                 &client,
                 &config.url,
                 request,
@@ -479,8 +553,8 @@ where
                 config.request_cookies.as_deref(),
                 &control,
             )
-            .await?
-        };
+            .await?;
+        }
         request_ordinal = request_ordinal.saturating_add(1);
         if fetch_outcome.retry_attempts > 0 {
             segment.retry_attempts = segment
@@ -523,17 +597,27 @@ where
 
             let dynamic_end = control.current_end().max(segment.start) as u64;
             let write_plan = plan_buffered_write(current_pos, dynamic_end, local_buffer.len());
+            let flush_target = adaptive_chunk_buffer_target(
+                config.chunk_buffer_size,
+                observed_throughput_bytes_per_second,
+                disk_pool.queue_utilization_percent(),
+            );
 
-            if local_buffer.len() >= config.chunk_buffer_size || write_plan.boundary_reached {
+            if local_buffer.len() >= flush_target || write_plan.boundary_reached {
                 segment.end = dynamic_end as i64;
                 if write_plan.bytes_to_write == 0 {
                     local_buffer.clear();
                     break;
                 }
 
+                let next_buffer_capacity = adaptive_chunk_buffer_target(
+                    config.chunk_buffer_size,
+                    observed_throughput_bytes_per_second,
+                    disk_pool.queue_utilization_percent(),
+                );
                 let mut write_buffer = std::mem::replace(
                     &mut local_buffer,
-                    Vec::with_capacity(config.chunk_buffer_size),
+                    Vec::with_capacity(next_buffer_capacity),
                 );
                 if write_plan.bytes_to_write < write_buffer.len() {
                     write_buffer.truncate(write_plan.bytes_to_write);
@@ -564,6 +648,9 @@ where
                 } else {
                     0
                 };
+                if throughput > 0 {
+                    observed_throughput_bytes_per_second = throughput;
+                }
 
                 on_progress(SegmentRuntimeProgress {
                     segment_id: segment.id,
@@ -629,7 +716,10 @@ where
                     stream_drops
                 ));
             }
-            sleep(Duration::from_millis(config.backoff_base_ms)).await;
+            sleep(Duration::from_millis(
+                retry_policy.stream_recovery_delay_ms(stream_drops.saturating_sub(1)),
+            ))
+            .await;
             continue;
         }
 
@@ -669,26 +759,32 @@ where
     let pooled_client_reused = client_lease.reused_pool_client;
     let timeout = Duration::from_secs(config.request_timeout_secs.max(1));
     let mut attempt = 0u32;
+    let retry_policy = RetryPolicy::from_config(config);
     let starting_offset = options.starting_offset;
     let check_interval = options.space_check_interval_bytes.max(1);
     let mut initial_response = initial_response;
 
     loop {
-        let outcome = if let Some(initial) = initial_response.take() {
-            Ok(initial)
+        let outcome;
+        if let Some(initial) = initial_response.take() {
+            outcome = Ok(initial);
         } else {
             let request_started = Instant::now();
-            build_transfer_request(client.as_ref(), config)
+            let response = build_transfer_request(client.as_ref(), config)
                 .timeout(timeout)
                 .send()
-                .await
-                .map(|response| InitialResponseStream {
-                    ttfb_ms: request_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                    negotiated_protocol: None,
-                    response,
-                    connection_reused_hint: pooled_client_reused,
-                })
-        };
+                .await;
+            outcome = response.map(|response| {
+                    let negotiated_protocol = Some(protocol_label(response.version()).to_string());
+                    InitialResponseStream {
+                        ttfb_ms: request_started.elapsed().as_millis().min(u64::MAX as u128)
+                            as u64,
+                        negotiated_protocol,
+                        response,
+                        connection_reused_hint: pooled_client_reused,
+                    }
+                });
+        }
         match outcome {
             Ok(initial) if initial.response.status().is_success() => {
                 let mut response = initial.response;
@@ -700,10 +796,11 @@ where
                 let mut emitted_ttfb_sample = false;
                 let mut downloaded_any_bytes = false;
                 let mut pre_byte_stream_error: Option<String> = None;
+                let mut observed_throughput_bytes_per_second = 0_u64;
                 let reported_content_length = header_to_u64(response.headers().get(CONTENT_LENGTH));
                 let negotiated_protocol = initial
                     .negotiated_protocol
-                    .or_else(|| Some(http_version_label(response.version()).to_string()));
+                    .or_else(|| Some(protocol_label(response.version()).to_string()));
                 let ttfb_ms = initial.ttfb_ms;
                 let connection_reused_hint = initial.connection_reused_hint;
 
@@ -738,18 +835,28 @@ where
                     local_buffer.extend_from_slice(&chunk);
                     downloaded_any_bytes = true;
 
-                    if local_buffer.len() >= config.chunk_buffer_size {
+                    let flush_target = adaptive_chunk_buffer_target(
+                        config.chunk_buffer_size,
+                        observed_throughput_bytes_per_second,
+                        disk_pool.queue_utilization_percent(),
+                    );
+                    if local_buffer.len() >= flush_target {
                         let written = local_buffer.len() as u64;
+                        let next_buffer_capacity = adaptive_chunk_buffer_target(
+                            config.chunk_buffer_size,
+                            observed_throughput_bytes_per_second,
+                            disk_pool.queue_utilization_percent(),
+                        );
                         current_offset = flush_unknown_size_buffer(
                             disk_pool,
                             output_file,
                             &mut local_buffer,
-                            config.chunk_buffer_size,
+                            next_buffer_capacity,
                             current_offset,
                         )
                         .await?;
-                        if let Some(path) = options.space_check_path.as_deref() {
-                            if current_offset >= next_space_check_at {
+                        if let Some(path) = options.space_check_path.as_deref()
+                            && current_offset >= next_space_check_at {
                                 enforce_unknown_size_free_space(
                                     path,
                                     options.space_safety_margin_bytes,
@@ -757,10 +864,12 @@ where
                                 )?;
                                 next_space_check_at = current_offset.saturating_add(check_interval);
                             }
-                        }
                         window_bytes = window_bytes.saturating_add(written);
                         let throughput =
                             compute_window_throughput(&mut window_start, &mut window_bytes);
+                        if throughput > 0 {
+                            observed_throughput_bytes_per_second = throughput;
+                        }
                         on_progress(UnknownSizeStreamProgress {
                             downloaded: i64::try_from(current_offset).unwrap_or(i64::MAX),
                             throughput_bytes_per_second: throughput,
@@ -784,10 +893,7 @@ where
                             "Single-stream transfer failed before any bytes were received: {error}"
                         ));
                     }
-                    let delay = config
-                        .backoff_base_ms
-                        .saturating_mul(2u64.saturating_pow(attempt.min(8)))
-                        .min(config.backoff_max_ms);
+                    let delay = retry_policy.delay_ms(attempt, false, None);
                     sleep(Duration::from_millis(delay)).await;
                     attempt = attempt.saturating_add(1);
                     continue;
@@ -795,11 +901,16 @@ where
 
                 if !local_buffer.is_empty() {
                     let written = local_buffer.len() as u64;
+                    let next_buffer_capacity = adaptive_chunk_buffer_target(
+                        config.chunk_buffer_size,
+                        observed_throughput_bytes_per_second,
+                        disk_pool.queue_utilization_percent(),
+                    );
                     current_offset = flush_unknown_size_buffer(
                         disk_pool,
                         output_file,
                         &mut local_buffer,
-                        config.chunk_buffer_size,
+                        next_buffer_capacity,
                         current_offset,
                     )
                     .await?;
@@ -859,18 +970,8 @@ where
                         status, retry_limit
                     ));
                 }
-                let base_delay = config
-                    .backoff_base_ms
-                    .saturating_mul(2u64.saturating_pow(attempt.min(8)))
-                    .min(if throttled {
-                        THROTTLE_BACKOFF_MAX_MS
-                    } else {
-                        config.backoff_max_ms
-                    });
-                sleep(Duration::from_millis(
-                    base_delay.max(retry_after_ms.unwrap_or(0)),
-                ))
-                .await;
+                let delay = retry_policy.delay_ms(attempt, throttled, retry_after_ms);
+                sleep(Duration::from_millis(delay)).await;
             }
             Err(error) => {
                 if attempt >= config.retry_budget {
@@ -878,10 +979,7 @@ where
                         "Network error before single-stream transfer could stabilize: {error}"
                     ));
                 }
-                let delay = config
-                    .backoff_base_ms
-                    .saturating_mul(2u64.saturating_pow(attempt.min(8)))
-                    .min(config.backoff_max_ms);
+                let delay = retry_policy.delay_ms(attempt, false, None);
                 sleep(Duration::from_millis(delay)).await;
             }
         }
@@ -893,7 +991,7 @@ async fn flush_unknown_size_buffer(
     disk_pool: &Arc<DiskPool>,
     output_file: &Arc<File>,
     buffer: &mut Vec<u8>,
-    chunk_buffer_size: usize,
+    replacement_capacity: usize,
     current_offset: u64,
 ) -> Result<u64, String> {
     let to_write = buffer.len();
@@ -903,7 +1001,7 @@ async fn flush_unknown_size_buffer(
 
     let write_block = WriteBlock {
         file: Arc::clone(output_file),
-        buffer: std::mem::replace(buffer, Vec::with_capacity(chunk_buffer_size)),
+        buffer: std::mem::replace(buffer, Vec::with_capacity(replacement_capacity)),
         offset: current_offset,
     };
     disk_pool
@@ -940,6 +1038,43 @@ fn compute_window_throughput(window_start: &mut Instant, window_bytes: &mut u64)
     *window_start = Instant::now();
     *window_bytes = 0;
     throughput
+}
+
+fn exponential_backoff_ms(base_delay_ms: u64, max_delay_ms: u64, attempt: u32) -> u64 {
+    base_delay_ms
+        .saturating_mul(2u64.saturating_pow(attempt.min(8)))
+        .min(max_delay_ms)
+}
+
+fn jittered_retry_delay_ms(base_delay_ms: u64, jitter_percent: u8) -> u64 {
+    let entropy = retry_jitter_entropy().unwrap_or(base_delay_ms);
+    jittered_retry_delay_with_entropy(base_delay_ms, jitter_percent, entropy)
+}
+
+fn jittered_retry_delay_with_entropy(
+    base_delay_ms: u64,
+    jitter_percent: u8,
+    entropy: u64,
+) -> u64 {
+    if base_delay_ms == 0 || jitter_percent == 0 {
+        return base_delay_ms;
+    }
+
+    let max_extra_ms = base_delay_ms
+        .saturating_mul(u64::from(jitter_percent))
+        .saturating_div(100);
+    if max_extra_ms == 0 {
+        return base_delay_ms;
+    }
+
+    let extra_ms = entropy % max_extra_ms.saturating_add(1);
+    base_delay_ms.saturating_add(extra_ms)
+}
+
+fn retry_jitter_entropy() -> Option<u64> {
+    let mut bytes = [0_u8; 8];
+    getrandom::getrandom(&mut bytes).ok()?;
+    Some(u64::from_le_bytes(bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -983,15 +1118,12 @@ async fn fetch_segment_stream_with_retry(
                     if control.is_canceled() {
                         return Err("segment-canceled".to_string());
                     }
-                    let delay = retry_policy
-                        .backoff_base_ms
-                        .saturating_mul(2u64.saturating_pow(attempt.min(8)))
-                        .min(retry_policy.backoff_max_ms);
+                    let delay = retry_policy.delay_ms(attempt, false, None);
                     sleep(Duration::from_millis(delay)).await;
                     attempt = attempt.saturating_add(1);
                     continue;
                 }
-                let negotiated_protocol = Some(http_version_label(response.version()).to_string());
+                let negotiated_protocol = Some(protocol_label(response.version()).to_string());
                 let ttfb_ms = request_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                 return Ok(FetchSegmentOutcome {
                     response,
@@ -1029,15 +1161,7 @@ async fn fetch_segment_stream_with_retry(
                 if control.is_canceled() {
                     return Err("segment-canceled".to_string());
                 }
-                let base_delay = retry_policy
-                    .backoff_base_ms
-                    .saturating_mul(2u64.saturating_pow(attempt.min(8)))
-                    .min(if throttled {
-                        THROTTLE_BACKOFF_MAX_MS
-                    } else {
-                        retry_policy.backoff_max_ms
-                    });
-                let delay = base_delay.max(retry_after_ms.unwrap_or(0));
+                let delay = retry_policy.delay_ms(attempt, throttled, retry_after_ms);
                 sleep(Duration::from_millis(delay)).await;
                 attempt = attempt.saturating_add(1);
                 continue;
@@ -1054,10 +1178,7 @@ async fn fetch_segment_stream_with_retry(
         if control.is_canceled() {
             return Err("segment-canceled".to_string());
         }
-        let delay = retry_policy
-            .backoff_base_ms
-            .saturating_mul(2u64.saturating_pow(attempt.min(8)))
-            .min(retry_policy.backoff_max_ms);
+        let delay = retry_policy.delay_ms(attempt, false, None);
         sleep(Duration::from_millis(delay)).await;
         attempt = attempt.saturating_add(1);
     }
@@ -1067,16 +1188,6 @@ fn parse_retry_after_delay_ms(value: &reqwest::header::HeaderValue) -> Option<u6
     let raw = value.to_str().ok()?.trim();
     let seconds = raw.parse::<u64>().ok()?.min(RETRY_AFTER_MAX_SECONDS);
     Some(seconds.saturating_mul(1_000))
-}
-
-fn http_version_label(version: reqwest::Version) -> &'static str {
-    match version {
-        reqwest::Version::HTTP_09 => "http/0.9",
-        reqwest::Version::HTTP_10 => "http/1.0",
-        reqwest::Version::HTTP_11 => "http/1.1",
-        reqwest::Version::HTTP_2 => "h2",
-        _ => "http/1.x",
-    }
 }
 
 #[cfg(test)]
@@ -1089,8 +1200,9 @@ mod tests {
     };
 
     use super::{
-        plan_buffered_write, validate_range_response, BufferedWritePlan, FetchSegmentRequest,
-        TokenBucketRateLimiter,
+        adaptive_chunk_buffer_target, exponential_backoff_ms,
+        jittered_retry_delay_with_entropy, plan_buffered_write, validate_range_response,
+        BufferedWritePlan, FetchSegmentRequest, TokenBucketRateLimiter,
     };
 
     #[test]
@@ -1179,5 +1291,39 @@ mod tests {
         limiter.acquire(8 * 1024 * 1024).await;
 
         assert!(started.elapsed() < Duration::from_millis(20));
+    }
+
+    #[test]
+    fn jittered_retry_delay_stays_within_bound() {
+        let delay = jittered_retry_delay_with_entropy(1_000, 15, 150);
+
+        assert_eq!(delay, 1_150);
+    }
+
+    #[test]
+    fn retry_after_floor_is_preserved_before_jitter() {
+        let floor = exponential_backoff_ms(200, 3_000, 2).max(5_000);
+        let delay = jittered_retry_delay_with_entropy(floor, 15, 0);
+
+        assert_eq!(delay, 5_000);
+    }
+
+    #[test]
+    fn adaptive_chunk_buffer_grows_for_high_throughput_on_clear_queue() {
+        let target = adaptive_chunk_buffer_target(2 * 1024 * 1024, 256 * 1024 * 1024, 20);
+
+        assert_eq!(target, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn adaptive_chunk_buffer_shrinks_when_disk_queue_is_hot() {
+        let target = adaptive_chunk_buffer_target(4 * 1024 * 1024, 128 * 1024 * 1024, 90);
+
+        assert!(target < 4 * 1024 * 1024);
+        assert!(target >= 2 * 1024 * 1024);
+
+        let pressured = adaptive_chunk_buffer_target(4 * 1024 * 1024, 32 * 1024 * 1024, 90);
+        assert!(pressured < target);
+        assert!(pressured >= 1024 * 1024);
     }
 }

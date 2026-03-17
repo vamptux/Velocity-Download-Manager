@@ -1,10 +1,9 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
   ArrowDown,
   ArrowUp,
-  CheckCircle2,
   FolderOpen,
   Info,
   Layers,
@@ -31,6 +30,7 @@ import {
 import {
   activeConnectionCount,
   CATEGORY_ICONS,
+  CATEGORY_ICON_COLORS,
   checksumAlgorithmLabel,
   failureKindLabel,
   formatCooldownLabel,
@@ -46,6 +46,7 @@ import {
   formatTimeRemaining,
 } from "@/lib/format";
 import { calculateDisplayProgress } from "@/lib/downloadProgress";
+import { simplifyUserMessage } from "@/lib/userFacingMessages";
 import type {
   Download as DownloadItem,
   DownloadIntegrity,
@@ -214,7 +215,7 @@ function CapabilityBadge({
           "bg-[hsl(var(--status-paused)/0.14)] text-[hsl(var(--status-paused))]",
         tone === "error" &&
           "bg-[hsl(var(--status-error)/0.12)] text-[hsl(var(--status-error))]",
-        tone === "neutral" && "bg-white/6 text-muted-foreground/76",
+        tone === "neutral" && "bg-white/[0.065] text-foreground/62",
       )}
     >
       {label}
@@ -326,22 +327,17 @@ function SegmentRow({
   const isActive = segment.status === "downloading";
   const retryAttempts = sample?.retryAttempts ?? segment.retryAttempts ?? 0;
   const failureReason = sample?.terminalFailureReason ?? null;
-  const throughput = Number(sample?.throughputBytesPerSecond ?? 0n);
-  const etaSeconds =
-    sample?.etaSeconds !== null && sample?.etaSeconds !== undefined
-      ? Number(sample.etaSeconds)
-      : null;
 
   return (
     <div
-      className="grid items-center gap-x-3 py-[7px]"
-      style={{ gridTemplateColumns: "18px 1fr 90px 96px 16px" }}
+      className="grid items-center gap-x-2.5 py-[4px]"
+      style={{ gridTemplateColumns: "16px 1fr 14px" }}
     >
-      <span className="text-right text-[9px] font-mono text-muted-foreground/22 tabular-nums select-none">
+      <span className="text-right text-[9px] font-mono text-muted-foreground/25 tabular-nums select-none">
         {segment.id + 1}
       </span>
 
-      <div className="relative h-[6px] overflow-hidden rounded-full bg-white/[0.06]">
+      <div className="relative h-[5px] overflow-hidden rounded-full bg-white/[0.06]">
         <div
           className={cn(
             "h-full rounded-full transition-[width] duration-300",
@@ -355,44 +351,30 @@ function SegmentRow({
         />
         {isActive && (
           <div
-            className="absolute right-0 top-0 h-full w-[18px] rounded-full"
+            className="absolute right-0 top-0 h-full w-[14px] rounded-full"
             style={{
               background:
-                "linear-gradient(90deg, transparent, hsl(var(--status-downloading)/0.55))",
+                "linear-gradient(90deg, transparent, hsl(var(--status-downloading)/0.5))",
             }}
           />
         )}
       </div>
 
-      <span className="text-right text-[10px] tabular-nums text-muted-foreground/45">
-        {isDone
-          ? formatBytes(total, DETAIL_BYTE_FORMAT)
-          : `${formatBytes(Math.max(0, segment.downloaded), DETAIL_BYTE_FORMAT)} / ${formatBytes(total, DETAIL_BYTE_FORMAT)}`}
-      </span>
-      <span className="text-right text-[9.5px] tabular-nums text-muted-foreground/42">
-        {failureReason
-          ? "failed"
-          : throughput > 0
-            ? formatBytesPerSecond(throughput, DETAIL_SPEED_FORMAT)
-            : "—"}
-        {retryAttempts > 0
-          ? ` · r${retryAttempts}`
-          : etaSeconds !== null && etaSeconds > 0
-            ? ` · ${formatTimeRemaining(etaSeconds)}`
-            : ""}
-      </span>
-
       <span
         className={cn(
-          "text-center text-[11px] font-bold leading-none",
+          "text-center text-[10px] font-bold leading-none",
           isDone
-            ? "text-[hsl(var(--status-finished)/0.7)]"
+            ? "text-[hsl(var(--status-finished)/0.65)]"
             : isActive
-              ? "text-[hsl(var(--status-downloading)/0.65)]"
-              : "text-muted-foreground/18",
+              ? "text-[hsl(var(--status-downloading)/0.6)]"
+              : failureReason
+                ? "text-[hsl(var(--status-error)/0.5)]"
+                : retryAttempts > 0
+                  ? "text-[hsl(var(--status-paused)/0.55)]"
+                  : "text-muted-foreground/16",
         )}
       >
-        {isDone ? "✓" : isActive ? "♥" : "·"}
+        {isDone ? "done" : isActive ? "live" : failureReason ? "err" : retryAttempts > 0 ? "r" : "."}
       </span>
     </div>
   );
@@ -459,62 +441,13 @@ function BlockProgressMap({ download }: { download: DownloadItem }) {
   const targetConnections = targetConnectionCount(download);
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="flex items-end justify-between">
-        <div className="flex flex-col gap-1">
-          <span
-            className={cn(
-              "text-[26px] font-bold tracking-tight leading-none",
-              status === "finished"
-                ? "text-[hsl(var(--status-finished))]"
-                : download.speed > 0 && status === "downloading"
-                  ? "text-foreground"
-                  : "text-foreground/28",
-            )}
-          >
-            {status === "finished" ? (
-              <span className="flex items-center gap-2.5">
-                <CheckCircle2
-                  size={22}
-                  strokeWidth={1.7}
-                  className="text-[hsl(var(--status-finished))]"
-                />
-                <span>Complete</span>
-              </span>
-            ) : download.speed > 0 ? (
-              formatBytesPerSecond(download.speed, DETAIL_SPEED_FORMAT)
-            ) : (
-              <span className="text-[22px]">&#x2014;</span>
-            )}
-          </span>
-          {(download.timeLeft ?? 0) > 0 && (
-            <span className="text-[11px] text-muted-foreground/45 tabular-nums">
-              {formatTimeRemaining(download.timeLeft, DETAIL_TIME_FORMAT)}{" "}
-              remaining
-            </span>
-          )}
-        </div>
-
-        <div className="flex flex-col items-end gap-1">
-          {size > 0 && (
-            <span className="text-[22px] font-semibold tabular-nums leading-none text-foreground/50">
-              {Math.round(progress)}%
-            </span>
-          )}
-          <span className="text-[11px] tabular-nums text-muted-foreground/40">
-            {size > 0
-              ? `${formatBytes(downloaded, DETAIL_BYTE_FORMAT)} / ${formatBytes(size, DETAIL_BYTE_FORMAT)}`
-              : formatBytes(downloaded, DETAIL_BYTE_FORMAT)}
-          </span>
-        </div>
-      </div>
-
+    <div className="flex flex-col gap-2">
       {blockStates ? (
         <div
           className="w-full overflow-hidden rounded-sm"
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, 8px)",
+            gridTemplateColumns: "repeat(auto-fill, 7px)",
             gap: "2px",
           }}
         >
@@ -522,7 +455,7 @@ function BlockProgressMap({ download }: { download: DownloadItem }) {
             <div
               key={i}
               className={cn(
-                "h-[8px] w-[8px] rounded-[2px]",
+                "h-[7px] w-[7px] rounded-[2px]",
                 state === "complete" && "bg-[hsl(var(--status-downloading))]",
                 state === "active" && "bg-[hsl(var(--status-downloading)/0.4)]",
                 state === "pending" && "bg-white/[0.06]",
@@ -531,7 +464,7 @@ function BlockProgressMap({ download }: { download: DownloadItem }) {
           ))}
         </div>
       ) : (
-        <div className="h-[8px] overflow-hidden rounded-sm bg-white/[0.06]">
+        <div className="h-[7px] overflow-hidden rounded-sm bg-white/[0.06]">
           <div
             className={cn(
               "h-full transition-[width] duration-300",
@@ -548,41 +481,36 @@ function BlockProgressMap({ download }: { download: DownloadItem }) {
         </div>
       )}
 
-      {hasSegments ? (
-        <div className="flex items-center gap-4 text-[10.5px] text-muted-foreground/46">
-          <span>
-            <span className="tabular-nums text-foreground/58 font-medium">
-              {finishedSegments}
+      <div className="flex items-center gap-3 text-[10px] text-muted-foreground/40">
+        {status === "finished" ? (
+          <span className="text-[hsl(var(--status-finished)/0.8)] font-medium">Complete</span>
+        ) : hasSegments ? (
+          <>
+            <span>
+              <span className="tabular-nums text-foreground/55 font-medium">{finishedSegments}</span>
+              <span className="ml-0.5 text-muted-foreground/32">/ {segments.length} parts</span>
             </span>
-            <span> / {segments.length} parts</span>
+            <span className="h-2.5 w-px bg-border/30" />
+            <span>
+              <span className="tabular-nums text-foreground/55 font-medium">{activeConnections}</span>
+              <span className="ml-0.5 text-muted-foreground/32">active</span>
+              <span className="mx-1 text-muted-foreground/20">/</span>
+              <span className="tabular-nums text-foreground/55 font-medium">{targetConnections}</span>
+              <span className="ml-0.5 text-muted-foreground/32">target</span>
+            </span>
+            {download.writerBackpressure && (
+              <>
+                <span className="h-2.5 w-px bg-border/30" />
+                <span className="text-[hsl(var(--status-paused)/0.75)] text-[9.5px]">Disk pressure</span>
+              </>
+            )}
+          </>
+        ) : (
+          <span className="text-[9.5px]">
+            {download.capabilities.rangeSupported ? "Range-resumable" : "Single connection"}
           </span>
-          <span className="h-3 w-px bg-border/40" />
-          <span>
-            <span className="tabular-nums text-foreground/58 font-medium">
-              {activeConnections}
-            </span>
-            <span> active · </span>
-            <span className="tabular-nums text-foreground/58 font-medium">
-              {targetConnections}
-            </span>
-            <span> target</span>
-          </span>
-          {download.writerBackpressure && (
-            <>
-              <span className="h-3 w-px bg-border/40" />
-              <span className="text-[hsl(var(--status-paused)/0.8)]">
-                Disk pressure
-              </span>
-            </>
-          )}
-        </div>
-      ) : (
-        <div className="text-[10.5px] text-muted-foreground/40">
-          {download.capabilities.rangeSupported
-            ? "Range-resumable single stream"
-            : "Single connection"}
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
@@ -590,14 +518,17 @@ function BlockProgressMap({ download }: { download: DownloadItem }) {
 function SignalRow({
   icon: Icon,
   message,
+  title,
   tone,
 }: {
   icon: React.ElementType;
   message: string;
+  title?: string;
   tone: "warn" | "error" | "note";
 }) {
   return (
     <div
+      title={title}
       className={cn(
         "flex items-start gap-2 rounded-lg border px-3 py-2 text-[11px]",
         tone === "warn" &&
@@ -660,7 +591,7 @@ function SelectionSummary({
   ).length;
 
   return (
-    <section className="shrink-0 border-t border-border/80 bg-[linear-gradient(180deg,hsl(0,0%,10.5%),hsl(0,0%,8.2%))] px-4 py-3 shadow-[0_-10px_30px_rgba(0,0,0,0.28)]">
+    <section className="shrink-0 border-t border-border/80 bg-[linear-gradient(180deg,hsl(var(--card)),hsl(var(--background)))] px-4 py-3 shadow-[0_-10px_30px_rgba(0,0,0,0.28)]">
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
           <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/44">
@@ -706,6 +637,36 @@ function SingleSelection({
   onClearSelection: () => void;
 }) {
   const [tab, setTab] = useState<DetailTab>("general");
+  const [panelHeight, setPanelHeight] = useState(210);
+  const isDragging = useRef(false);
+
+  function startPanelResize(e: React.MouseEvent) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = panelHeight;
+    isDragging.current = true;
+
+    function onMove(ev: MouseEvent) {
+      const delta = startY - ev.clientY; // drag up = grow panel
+      setPanelHeight(Math.max(168, Math.min(520, startH + delta)));
+    }
+
+    function onUp() {
+      isDragging.current = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      // Snap to default if within range
+      setPanelHeight((h) => (Math.abs(h - 210) <= 22 ? 210 : h));
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    }
+
+    document.body.style.cursor = "ns-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
   const segmentSamplesById = useMemo(
     () =>
       new Map(
@@ -727,6 +688,7 @@ function SingleSelection({
   const displaySourceUrl = redactUrlDisplay(sourceUrl);
   const integrityBadge = integrityBadgeLabel(download.integrity);
   const CategoryIcon = CATEGORY_ICONS[download.category];
+  const categoryIconColor = CATEGORY_ICON_COLORS[download.category];
   const recentLogEntries = download.engineLog.slice(-20).reverse();
   const restartLabel = restartRequirementLabel(download);
   const restartReason = restartRequirementReason(download);
@@ -841,6 +803,7 @@ function SingleSelection({
     const rows: Array<{
       icon: React.ElementType;
       message: string;
+      title?: string;
       tone: "warn" | "error" | "note";
     }> = [];
 
@@ -849,11 +812,20 @@ function SingleSelection({
       message: string | null | undefined,
       tone: "warn" | "error" | "note",
     ) => {
-      if (!message || seen.has(message)) {
+      if (!message) {
         return;
       }
-      seen.add(message);
-      rows.push({ icon, message, tone });
+      const normalized = simplifyUserMessage(message);
+      if (seen.has(normalized)) {
+        return;
+      }
+      seen.add(normalized);
+      rows.push({
+        icon,
+        message: normalized,
+        title: normalized === message ? undefined : message,
+        tone,
+      });
     };
 
     if (restartReason) {
@@ -930,7 +902,20 @@ function SingleSelection({
       push(Info, note, "note");
     }
 
-    return rows;
+    if (rows.length <= 3) {
+      return rows;
+    }
+
+    const overflowCount = rows.length - 2;
+    return [
+      ...rows.slice(0, 2),
+      {
+        icon: Info,
+        message: `${overflowCount} more diagnostic ${overflowCount === 1 ? "message is" : "messages are"} available in Engine Log.`,
+        title: undefined,
+        tone: "note" as const,
+      },
+    ];
   })();
 
   const TAB_META: { id: DetailTab; label: string; icon: React.ElementType }[] =
@@ -941,7 +926,18 @@ function SingleSelection({
     ];
 
   return (
-    <section className="shrink-0 border-t border-border/80">
+    <section
+      className="relative flex flex-col overflow-hidden border-t border-border/80"
+      style={{ height: panelHeight }}
+    >
+      {/* Drag handle – sits at top, cursor:ns-resize, snaps to default height */}
+      <div
+        role="separator"
+        aria-label="Drag to resize panel"
+        onMouseDown={startPanelResize}
+        className="absolute top-0 left-0 right-0 h-[5px] cursor-ns-resize z-10 hover:bg-primary/14 active:bg-primary/24 transition-colors"
+        title="Drag to resize"
+      />
       <div
         className="flex h-[32px] items-stretch shrink-0 border-b border-border/60"
         style={{ background: "hsl(0,0%,7.5%)" }}
@@ -955,8 +951,8 @@ function SingleSelection({
               className={cn(
                 "relative flex h-full items-center gap-1.5 px-4 text-[11px] tracking-wide transition-colors",
                 tab === id
-                  ? "font-semibold text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-[1.5px] after:rounded-t-sm after:bg-primary"
-                  : "text-muted-foreground/45 hover:text-foreground/70",
+                  ? "font-semibold text-foreground/95 after:absolute after:bottom-0 after:left-0 after:right-0 after:h-[2px] after:rounded-t-sm after:bg-primary"
+                  : "text-foreground/42 hover:text-foreground/72",
               )}
             >
               <Icon
@@ -971,18 +967,14 @@ function SingleSelection({
         <button
           type="button"
           onClick={onClearSelection}
-          className="mr-2 my-auto flex h-6 w-6 items-center justify-center rounded text-muted-foreground/38 hover:bg-accent hover:text-foreground transition-colors"
+          className="mr-2 my-auto flex h-6 w-6 items-center justify-center rounded text-muted-foreground/45 hover:bg-accent hover:text-foreground transition-colors"
         >
           <X size={11} strokeWidth={2} />
         </button>
       </div>
 
       <div
-        className="overflow-y-auto"
-        style={{
-          maxHeight: "30vh",
-          background: "linear-gradient(180deg, hsl(0,0%,10%), hsl(0,0%,8%))",
-        }}
+        className="flex-1 overflow-y-auto min-h-0 bg-[hsl(var(--background))]"
       >
         {tab === "general" && (
           <div className="flex items-start gap-3.5 px-4 py-3">
@@ -990,14 +982,14 @@ function SingleSelection({
               className="flex h-[52px] w-[52px] shrink-0 items-center justify-center rounded-lg"
               style={{
                 background:
-                  "linear-gradient(145deg, hsl(0,0%,16%), hsl(0,0%,11%))",
-                border: "1px solid hsl(0,0%,22%)",
+                  "linear-gradient(145deg, hsl(var(--card)), hsl(var(--muted)))",
+                border: "1px solid hsl(var(--border))",
               }}
             >
               <CategoryIcon
                 size={22}
                 strokeWidth={1.3}
-                className="text-muted-foreground/52"
+                className={categoryIconColor}
               />
             </div>
 
@@ -1152,6 +1144,7 @@ function SingleSelection({
                       key={`${signal.message}-${index}`}
                       icon={signal.icon}
                       message={signal.message}
+                      title={signal.title}
                       tone={signal.tone}
                     />
                   ))}
@@ -1159,12 +1152,13 @@ function SingleSelection({
               ) : null}
 
               {hostBadges.length > 0 || hostFields.length > 0 ? (
-                <div className="rounded-md border border-border/55 bg-black/12 px-2.5 py-2">
-                  <div className="text-[9.5px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/38">
-                    Host Planner
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[9px] font-semibold uppercase tracking-[0.15em] text-muted-foreground/38">Host</span>
+                    <div className="flex-1 h-px bg-border/25" />
                   </div>
                   {hostBadges.length > 0 ? (
-                    <div className="mt-1.5 flex flex-wrap gap-1">
+                    <div className="flex flex-wrap gap-1">
                       {hostBadges.map((badge) => (
                         <CapabilityBadge
                           key={badge.label}
@@ -1175,7 +1169,7 @@ function SingleSelection({
                     </div>
                   ) : null}
                   {hostFields.length > 0 ? (
-                    <div className="mt-1.5 grid grid-cols-2 gap-1.5">
+                    <div className="grid grid-cols-2 gap-1">
                       {hostFields.map((field) => (
                         <Field
                           key={field.label}

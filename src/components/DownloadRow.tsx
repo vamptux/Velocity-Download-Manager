@@ -29,6 +29,8 @@ import {
 import {
   activeConnectionCount,
   CATEGORY_ICONS,
+  CATEGORY_ICON_BG,
+  CATEGORY_ICON_COLORS,
   CATEGORY_LABELS,
   integrityStatusDetail,
   integritySummaryLabel,
@@ -46,6 +48,7 @@ import {
   calculateDisplayProgress,
   useSmoothedNumber,
 } from "@/lib/downloadProgress";
+import { simplifyUserMessage } from "@/lib/userFacingMessages";
 import {
   ipcPauseDownload,
   ipcRestartDownload,
@@ -154,13 +157,13 @@ function ProgressBar({
   active?: boolean;
 }) {
   return (
-    <div className="absolute bottom-0 left-0 right-0 h-[3px] bg-white/[0.04]">
+    <div className="absolute bottom-0 left-0 right-0 h-[2px] bg-white/[0.03]">
       <div
         className={cn(
           "h-full transition-[width] duration-200 relative overflow-hidden",
           paused
-            ? "bg-[hsl(var(--status-paused)/0.75)]"
-            : "bg-[hsl(var(--status-downloading))]",
+            ? "bg-[hsl(var(--status-paused)/0.55)]"
+            : "bg-gradient-to-r from-[hsl(var(--status-downloading)/0.5)] via-[hsl(var(--status-downloading)/0.85)] to-[hsl(var(--primary))]",
         )}
         style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
       >
@@ -169,7 +172,7 @@ function ProgressBar({
             className="absolute inset-0"
             style={{
               background:
-                "linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.22) 50%, transparent 100%)",
+                "linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.28) 50%, transparent 100%)",
               backgroundSize: "400px 100%",
               animation: "progress-shimmer 1.8s linear infinite",
             }}
@@ -253,6 +256,7 @@ export const DownloadRow = memo(function DownloadRow({
 }: DownloadRowProps) {
   const { label, color, Icon } = STATUS_META[download.status];
   const CategoryIcon = CATEGORY_ICONS[download.category];
+  const categoryIconColor = CATEGORY_ICON_COLORS[download.category];
   const pct = calculateDisplayProgress(
     download.downloaded,
     download.size,
@@ -275,11 +279,14 @@ export const DownloadRow = memo(function DownloadRow({
   const restartLabel = restartRequirementLabel(download);
   const integritySummary = integritySummaryLabel(download);
   const isAlt = index % 2 !== 0;
+  const simplifiedErrorMessage = download.errorMessage
+    ? simplifyUserMessage(download.errorMessage)
+    : null;
   const summaryText =
     download.status === "error" && download.integrity.state === "mismatch"
       ? `${integritySummary ?? "Checksum mismatch"} · ${download.host || CATEGORY_LABELS[download.category]}`
-      : download.status === "error" && download.errorMessage
-      ? download.errorMessage
+      : download.status === "error" && simplifiedErrorMessage
+      ? simplifiedErrorMessage
       : download.diagnostics.restartRequired
         ? `${restartLabel ?? "Restart only"} · ${download.host || CATEGORY_LABELS[download.category]}`
       : integritySummary && download.host
@@ -375,12 +382,13 @@ export const DownloadRow = memo(function DownloadRow({
         <ContextMenu.Trigger asChild>
           <div
             className={cn(
-              "relative flex items-center text-[12px] border-b border-border/30 cursor-default select-none transition-colors group/row",
+              "relative flex items-center text-[12px] border-b border-border/25 cursor-default select-none transition-colors group/row",
               selected
                 ? "bg-accent/70"
                 : isAlt
                   ? "bg-[hsl(var(--row-alt))] hover:bg-accent/20"
                   : "hover:bg-accent/15",
+              isDownloading && !selected && "shadow-[inset_2px_0_0_hsl(var(--status-downloading)/0.3)]",
             )}
             style={{ minHeight: "38px" }}
             onClick={() => onActivate(download.id)}
@@ -400,12 +408,18 @@ export const DownloadRow = memo(function DownloadRow({
               />
             </div>
 
-            <div className="flex w-6 shrink-0 items-center justify-center">
-              <CategoryIcon
-                size={13}
-                className="text-muted-foreground/50 shrink-0"
-                strokeWidth={1.5}
-              />
+            {/* Category icon with gradient badge */}
+            <div className="flex w-7 shrink-0 items-center justify-center">
+              <div
+                className="flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[4px]"
+                style={{ background: CATEGORY_ICON_BG[download.category] }}
+              >
+                <CategoryIcon
+                  size={11.5}
+                  className={cn("shrink-0", categoryIconColor)}
+                  strokeWidth={1.6}
+                />
+              </div>
             </div>
 
             <div className="flex flex-1 flex-col justify-center min-w-0 px-2 py-[2px]">
@@ -441,7 +455,11 @@ export const DownloadRow = memo(function DownloadRow({
               <Icon
                 size={11}
                 strokeWidth={1.8}
-                className={cn("shrink-0", isDownloading && "animate-spin")}
+                className={cn(
+                  "shrink-0",
+                  isDownloading && "animate-spin",
+                )}
+                style={isDownloading ? { filter: "drop-shadow(0 0 4px hsl(var(--status-downloading) / 0.6))" } : undefined}
               />
               <div className="flex flex-col min-w-0">
                 <span className="text-[11px] font-medium leading-tight">
@@ -459,8 +477,8 @@ export const DownloadRow = memo(function DownloadRow({
               className={cn(
                 "w-[80px] shrink-0 px-2 text-right text-[11px] tabular-nums",
                 isDownloading && download.speed > 0
-                  ? "text-[hsl(var(--status-downloading)/0.85)]"
-                  : "text-muted-foreground/50",
+                  ? "text-[hsl(var(--status-downloading)/0.88)] font-medium"
+                  : "text-muted-foreground/45",
               )}
             >
               {formatBytesPerSecond(download.speed, {
@@ -493,7 +511,7 @@ export const DownloadRow = memo(function DownloadRow({
           <ContextMenu.Content
             className={cn(
               "z-50 min-w-[210px] rounded-lg border border-border/75 py-1",
-              "bg-[hsl(0,0%,10%)] shadow-[0_12px_32px_rgba(0,0,0,0.55)]",
+              "bg-popover shadow-[0_12px_32px_rgba(0,0,0,0.55)]",
               "data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 data-[state=open]:slide-in-from-top-1",
             )}
           >

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AppUpdateInfo,
   AddDownloadArgs as BackendAddDownloadArgs,
   CapturePayload,
   ChecksumSpec,
@@ -98,6 +99,22 @@ export async function ipcGetQueueState(): Promise<QueueState> {
 
 export async function ipcGetEngineBootstrapState(): Promise<EngineBootstrapState> {
   return invoke<EngineBootstrapState>("get_engine_bootstrap_state");
+}
+
+export async function ipcRetryEngineBootstrap(): Promise<EngineBootstrapState> {
+  return invoke<EngineBootstrapState>("retry_engine_bootstrap");
+}
+
+export async function ipcCheckAppUpdate(): Promise<AppUpdateInfo | null> {
+  return invoke<AppUpdateInfo | null>("check_app_update");
+}
+
+export async function ipcInstallAppUpdate(): Promise<AppUpdateInfo> {
+  return invoke<AppUpdateInfo>("install_app_update");
+}
+
+export async function ipcRestartApp(): Promise<void> {
+  await invoke("restart_app");
 }
 
 export async function ipcGetAppState(): Promise<AppState> {

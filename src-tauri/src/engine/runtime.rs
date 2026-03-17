@@ -35,13 +35,18 @@ const RUNTIME_RAMP_MIN_INTERVAL_MS: i64 = 1_200;
 const RUNTIME_RAMP_MIN_SPEED_BYTES_PER_SECOND: u64 = 2 * 1024 * 1024;
 const RUNTIME_RAMP_WARMUP_MIN_INTERVAL_MS: i64 = 550;
 const RUNTIME_RAMP_WARMUP_MIN_SPEED_BYTES_PER_SECOND: u64 = 768 * 1024;
+const RUNTIME_RAMP_WINDOW_SAMPLES: usize = 3;
+const RUNTIME_RAMP_HISTORY_RETENTION_MS: i64 = 8_000;
+const RUNTIME_RAMP_SAMPLE_MIN_INTERVAL_MS: i64 = 200;
+const RUNTIME_RAMP_FAST_PATH_GAIN_PERCENT: u64 = 45;
+const RUNTIME_RAMP_FAST_PATH_MAX_TTFB_MS: u64 = 450;
+const RUNTIME_RAMP_NEGATIVE_GAIN_PERCENT: u64 = 10;
+const RUNTIME_RAMP_NEGATIVE_GAIN_WINDOWS: u32 = 2;
 const RUNTIME_ADAPTIVE_POLL_MS: u64 = 400;
 const UNKNOWN_SIZE_SPACE_CHECK_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
 const UNKNOWN_SIZE_SPACE_SAFETY_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 const DISK_DRAIN_WAIT_POLL_MS: u64 = 25;
 const DISK_DRAIN_WAIT_TIMEOUT_MS: u64 = 20_000;
-const DISK_BACKPRESSURE_THRESHOLD_PERCENT: usize = 60;
-const DISK_SUPPLY_GUARD_THRESHOLD_PERCENT: usize = 75;
 
 struct RuntimeWakeLockGuard {
     engine: EngineState,
@@ -89,6 +94,153 @@ struct RuntimeProbeTarget<'a> {
     request_form_fields: &'a [DownloadRequestField],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeRampSample {
+    recorded_at_ms: i64,
+    target_connections: u32,
+    speed_bytes_per_second: u64,
+    ttfb_ms: Option<u64>,
+}
+
+struct RuntimeRampState {
+    samples: VecDeque<RuntimeRampSample>,
+    last_change_at_ms: i64,
+    last_change_speed: Option<u64>,
+    last_changed_target: u32,
+    negative_gain_windows: u32,
+}
+
+impl RuntimeRampState {
+    fn new(now_ms: i64, current_target: u32) -> Self {
+        Self {
+            samples: VecDeque::new(),
+            last_change_at_ms: now_ms,
+            last_change_speed: None,
+            last_changed_target: current_target.max(1),
+            negative_gain_windows: 0,
+        }
+    }
+
+    fn record_sample(
+        &mut self,
+        now_ms: i64,
+        current_target: u32,
+        speed_bytes_per_second: u64,
+        ttfb_ms: Option<u64>,
+    ) {
+        let current_target = current_target.max(1);
+        if self.last_changed_target != current_target {
+            self.last_changed_target = current_target;
+            self.last_change_at_ms = now_ms;
+            self.last_change_speed = None;
+            self.negative_gain_windows = 0;
+        }
+
+        let sample = RuntimeRampSample {
+            recorded_at_ms: now_ms,
+            target_connections: current_target,
+            speed_bytes_per_second,
+            ttfb_ms,
+        };
+        if let Some(last) = self.samples.back_mut()
+            && last.target_connections == current_target
+            && now_ms.saturating_sub(last.recorded_at_ms) < RUNTIME_RAMP_SAMPLE_MIN_INTERVAL_MS
+        {
+            *last = sample;
+        } else {
+            self.samples.push_back(sample);
+        }
+
+        let retain_after = now_ms.saturating_sub(RUNTIME_RAMP_HISTORY_RETENTION_MS);
+        while matches!(self.samples.front(), Some(front) if front.recorded_at_ms < retain_after) {
+            self.samples.pop_front();
+        }
+        while self.samples.len() > RUNTIME_RAMP_WINDOW_SAMPLES.saturating_mul(4) {
+            self.samples.pop_front();
+        }
+    }
+
+    fn stable_speed(&self, current_target: u32) -> Option<u64> {
+        average_recent_u64(
+            self.samples
+                .iter()
+                .rev()
+                .filter(|sample| sample.target_connections == current_target)
+                .map(|sample| sample.speed_bytes_per_second)
+                .filter(|value| *value > 0)
+                .take(RUNTIME_RAMP_WINDOW_SAMPLES),
+        )
+    }
+
+    fn stable_ttfb_ms(&self, current_target: u32) -> Option<u64> {
+        let mut samples: Vec<u64> = self
+            .samples
+            .iter()
+            .rev()
+            .filter(|sample| sample.target_connections == current_target)
+            .filter_map(|sample| sample.ttfb_ms)
+            .take(RUNTIME_RAMP_WINDOW_SAMPLES)
+            .collect();
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_unstable();
+        Some(samples[samples.len() / 2])
+    }
+
+    fn sample_count(&self, current_target: u32) -> usize {
+        self.samples
+            .iter()
+            .rev()
+            .filter(|sample| sample.target_connections == current_target)
+            .take(RUNTIME_RAMP_WINDOW_SAMPLES)
+            .count()
+    }
+
+    fn marginal_gain(&self, current_target: u32) -> Option<i64> {
+        if self.last_changed_target != current_target {
+            return None;
+        }
+
+        let baseline = self.last_change_speed?;
+        let stable_speed = self.stable_speed(current_target)?;
+        Some(
+            i64::try_from(stable_speed)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(i64::try_from(baseline).unwrap_or(i64::MAX)),
+        )
+    }
+
+    fn mark_change(&mut self, now_ms: i64, next_target: u32, baseline_speed: u64) {
+        self.last_change_at_ms = now_ms;
+        self.last_change_speed = Some(baseline_speed);
+        self.last_changed_target = next_target.max(1);
+        self.negative_gain_windows = 0;
+    }
+
+    fn reset_negative_gain_windows(&mut self) {
+        self.negative_gain_windows = 0;
+    }
+
+    fn note_negative_gain_window(&mut self) {
+        self.negative_gain_windows = self.negative_gain_windows.saturating_add(1);
+    }
+}
+
+fn average_recent_u64(values: impl Iterator<Item = u64>) -> Option<u64> {
+    let mut total = 0_u64;
+    let mut count = 0_u64;
+    for value in values {
+        total = total.saturating_add(value);
+        count = count.saturating_add(1);
+    }
+    if count == 0 {
+        None
+    } else {
+        Some(total / count)
+    }
+}
+
 fn median_runtime_ttfb(snapshot: &RuntimeTelemetrySnapshot) -> Option<u64> {
     let mut samples = snapshot.ttfb_samples_ms.clone();
     if samples.is_empty() {
@@ -115,21 +267,18 @@ fn runtime_protocol_hint(snapshot: &RuntimeTelemetrySnapshot) -> Option<String> 
 }
 
 fn resume_validators_compatible(saved: &ResumeValidators, fresh: &ResumeValidators) -> bool {
-    if let (Some(left), Some(right)) = (&saved.etag, &fresh.etag) {
-        if left != right {
+    if let (Some(left), Some(right)) = (&saved.etag, &fresh.etag)
+        && left != right {
             return false;
         }
-    }
-    if let (Some(left), Some(right)) = (&saved.last_modified, &fresh.last_modified) {
-        if left != right {
+    if let (Some(left), Some(right)) = (&saved.last_modified, &fresh.last_modified)
+        && left != right {
             return false;
         }
-    }
-    if let (Some(left), Some(right)) = (saved.content_length, fresh.content_length) {
-        if left != right {
+    if let (Some(left), Some(right)) = (saved.content_length, fresh.content_length)
+        && left != right {
             return false;
         }
-    }
     true
 }
 
@@ -321,12 +470,39 @@ fn push_unique_diagnostic(values: &mut Vec<String>, message: impl Into<String>) 
     }
 }
 
+fn record_runtime_warning(
+    engine: &EngineState,
+    runtime_download: &mut DownloadRecord,
+    code: &str,
+    warning: String,
+) {
+    push_unique_diagnostic(&mut runtime_download.diagnostics.warnings, warning.clone());
+
+    if let Ok(mut registry) = engine.registry_guard() {
+        if let Some(download) = registry
+            .downloads
+            .iter_mut()
+            .find(|download| download.id == runtime_download.id)
+        {
+            push_unique_diagnostic(&mut download.diagnostics.warnings, warning.clone());
+            append_download_log(download, DownloadLogLevel::Warn, code, warning.clone());
+            runtime_download.diagnostics = download.diagnostics.clone();
+            runtime_download.engine_log = download.engine_log.clone();
+        }
+        let _ = engine.persist_registry(&registry);
+    }
+}
+
 fn disk_queue_under_pressure(disk_pool: &disk_pool::DiskPool) -> bool {
-    disk_pool.is_queue_utilization_at_least(DISK_BACKPRESSURE_THRESHOLD_PERCENT)
+    disk_pool.under_pressure()
 }
 
 fn disk_queue_blocks_new_supply(disk_pool: &disk_pool::DiskPool) -> bool {
-    disk_pool.is_queue_utilization_at_least(DISK_SUPPLY_GUARD_THRESHOLD_PERCENT)
+    disk_pool.blocks_new_supply()
+}
+
+fn disk_queue_parallelism_target(disk_pool: &disk_pool::DiskPool, requested_parallelism: u32) -> u32 {
+    disk_pool.recommended_parallelism(requested_parallelism)
 }
 
 fn apply_bootstrap_capabilities(download: &mut DownloadRecord, bootstrap: &DownloadProbeData) {
@@ -542,14 +718,22 @@ async fn run_unknown_size_stream_runtime(
         .open(&runtime_download.temp_path)
         .map_err(|error| format!("Failed opening temp file: {error}"))?;
     let output_file = Arc::new(file);
+    let mut temp_file_lock =
+        acquire_temp_transfer_lock(Arc::clone(&output_file), &runtime_download.temp_path);
+    if let Some(warning) = temp_file_lock.warning.clone() {
+        record_runtime_warning(engine, runtime_download, "runtime.temp-lock", warning);
+    }
     let _wake_lock_guard = RuntimeWakeLockGuard::acquire(engine);
     let disk_pool = Arc::new(disk_pool::DiskPool::new(256));
     let checkpoint_clock = Arc::new(AtomicI64::new(unix_epoch_millis()));
     let runtime_telemetry: Arc<Mutex<RuntimeTelemetrySnapshot>> =
         Arc::new(Mutex::new(RuntimeTelemetrySnapshot::default()));
+    let runtime_settings = engine.get_settings();
+    let effective_download_limit =
+        effective_download_speed_limit(&*runtime_download, &runtime_settings);
     let per_download_limiter = Some(engine.download_rate_limiter(
         &runtime_download.id,
-        runtime_download.speed_limit_bytes_per_second,
+        effective_download_limit,
     ));
     let per_host_limiter = engine.host_rate_limiter(
         &runtime_download.host,
@@ -565,7 +749,11 @@ async fn run_unknown_size_stream_runtime(
         request_cookies: runtime_download.compatibility.request_cookies.clone(),
         request_method: runtime_download.compatibility.request_method.clone(),
         request_form_fields: runtime_download.compatibility.request_form_fields.clone(),
-        chunk_buffer_size: runtime_chunk_buffer_size(&runtime_download.traffic_mode),
+        chunk_buffer_size: runtime_chunk_buffer_size_with_pressure(
+            &runtime_download.traffic_mode,
+            runtime_download.speed,
+            disk_pool.queue_utilization_percent(),
+        ),
         request_timeout_secs: 30,
         retry_budget: 4,
         backoff_base_ms: 180,
@@ -599,8 +787,8 @@ async fn run_unknown_size_stream_runtime(
                     return Err("Download no longer active.".to_string());
                 };
 
-                if let Some(telemetry) = progress.telemetry.as_ref() {
-                    if let Ok(mut snapshot) = runtime_telemetry.lock() {
+                if let Some(telemetry) = progress.telemetry.as_ref()
+                    && let Ok(mut snapshot) = runtime_telemetry.lock() {
                         if let Some(ttfb_ms) = telemetry.ttfb_ms.filter(|value| *value > 0) {
                             snapshot.ttfb_samples_ms.push(ttfb_ms);
                         }
@@ -623,7 +811,6 @@ async fn run_unknown_size_stream_runtime(
                             *counter = counter.saturating_add(1);
                         }
                     }
-                }
 
                 download.downloaded = progress.downloaded.max(0);
                 if progress.throughput_bytes_per_second > 0 {
@@ -682,14 +869,13 @@ async fn run_unknown_size_stream_runtime(
                     outcome.downloaded, final_len
                 ));
             }
-            if let Some(reported) = outcome.reported_content_length {
-                if reported != final_len {
+            if let Some(reported) = outcome.reported_content_length
+                && reported != final_len {
                     return Err(format!(
                         "Unknown-size transfer reached EOF at {} bytes but the final stream reported Content-Length {}.",
                         final_len, reported
                     ));
                 }
-            }
             Ok(final_len)
         }
         Err(error) => {
@@ -705,6 +891,8 @@ async fn run_unknown_size_stream_runtime(
         }
     };
 
+    let mut temp_lock_release_warning = temp_file_lock.release();
+
     drop(output_file);
     drop(disk_pool);
 
@@ -713,7 +901,10 @@ async fn run_unknown_size_stream_runtime(
             let finalize_result =
                 finalize_download_file(&runtime_download.temp_path, &runtime_download.target_path)?;
             let finalize_used_copy_fallback = finalize_result.used_copy_fallback;
-            let finalize_warnings = finalize_result.warnings;
+            let mut finalize_warnings = finalize_result.warnings;
+            if let Some(warning) = temp_lock_release_warning.take() {
+                finalize_warnings.push(warning);
+            }
 
             let runtime_telemetry_snapshot = runtime_telemetry
                 .lock()
@@ -776,6 +967,7 @@ async fn run_unknown_size_stream_runtime(
                 clear_runtime_checkpoint(download);
                 HostTelemetryArgs {
                     host: download.host.clone(),
+                    scope_key: Some(download_scope_key(download)),
                     attempted_connections: Some(1),
                     sustained_gain_bytes_per_second: None,
                     throughput_bytes_per_second: None,
@@ -855,6 +1047,7 @@ async fn run_unknown_size_stream_runtime(
                 clear_runtime_checkpoint(download);
                 HostTelemetryArgs {
                     host: download.host.clone(),
+                    scope_key: Some(download_scope_key(download)),
                     attempted_connections: Some(1),
                     sustained_gain_bytes_per_second: None,
                     throughput_bytes_per_second: None,
@@ -892,7 +1085,15 @@ struct RuntimeSupplyAdjustment {
     control_updates: Vec<(u32, i64)>,
     response: Option<DownloadRecord>,
     dispatch_plan: RuntimeDispatchPlan,
-    ramp_speed: Option<u64>,
+}
+
+struct RuntimeSupplyInputs<'a> {
+    settings: &'a EngineSettings,
+    scheduler: &'a SegmentScheduler,
+    runtime_samples: &'a [SegmentRuntimeSample],
+    disk_pool: &'a disk_pool::DiskPool,
+    ramp_state: &'a mut RuntimeRampState,
+    median_ttfb_ms: Option<u64>,
 }
 
 fn cooldown_retry_delay_ms(cooldown_until: Option<i64>) -> Option<u64> {
@@ -919,16 +1120,82 @@ fn runtime_ramp_requirements(current_target: u32) -> (i64, u64) {
     }
 }
 
+fn ramp_positive_gain_threshold(reference_throughput: u64) -> i64 {
+    let relative_threshold = reference_throughput
+        .saturating_mul(RUNTIME_RAMP_FAST_PATH_GAIN_PERCENT)
+        .div_ceil(100);
+    super::host_planner::ramp_gain_threshold_bytes_per_second(reference_throughput)
+        .max(i64::try_from(relative_threshold).unwrap_or(i64::MAX))
+}
+
+fn ramp_negative_gain_threshold(reference_throughput: u64) -> i64 {
+    let relative_threshold = reference_throughput
+        .saturating_mul(RUNTIME_RAMP_NEGATIVE_GAIN_PERCENT)
+        .div_ceil(100);
+    super::host_planner::ramp_gain_threshold_bytes_per_second(reference_throughput)
+        .max(i64::try_from(relative_threshold).unwrap_or(i64::MAX))
+}
+
+fn should_fast_path_ramp(
+    current_target: u32,
+    max_target: u32,
+    sample_count: usize,
+    stable_ttfb_ms: Option<u64>,
+    last_change_speed: Option<u64>,
+    sustained_gain: Option<i64>,
+) -> bool {
+    if current_target != 2
+        || max_target < 4
+        || sample_count < RUNTIME_RAMP_WINDOW_SAMPLES
+        || stable_ttfb_ms.is_none_or(|ttfb_ms| ttfb_ms > RUNTIME_RAMP_FAST_PATH_MAX_TTFB_MS)
+    {
+        return false;
+    }
+
+    let Some(reference_throughput) = last_change_speed.filter(|value| *value > 0) else {
+        return false;
+    };
+    let Some(gain) = sustained_gain else {
+        return false;
+    };
+
+    gain >= ramp_positive_gain_threshold(reference_throughput)
+}
+
+fn should_proactively_downshift(
+    current_target: u32,
+    sample_count: usize,
+    last_change_speed: Option<u64>,
+    sustained_gain: Option<i64>,
+) -> bool {
+    if current_target <= 1 || sample_count < RUNTIME_RAMP_WINDOW_SAMPLES {
+        return false;
+    }
+
+    let Some(reference_throughput) = last_change_speed.filter(|value| *value > 0) else {
+        return false;
+    };
+    let Some(gain) = sustained_gain else {
+        return false;
+    };
+
+    gain <= -ramp_negative_gain_threshold(reference_throughput)
+}
+
 fn adjust_runtime_segment_supply(
     engine: &EngineState,
     download_id: &str,
-    settings: &EngineSettings,
-    scheduler: &SegmentScheduler,
-    disk_pool: &disk_pool::DiskPool,
-    last_ramp_at_ms: i64,
-    last_ramp_speed: Option<u64>,
+    inputs: RuntimeSupplyInputs<'_>,
 ) -> Result<RuntimeSupplyAdjustment, String> {
     let now = unix_epoch_millis();
+    let RuntimeSupplyInputs {
+        settings,
+        scheduler,
+        runtime_samples,
+        disk_pool,
+        ramp_state,
+        median_ttfb_ms,
+    } = inputs;
     let disk_supply_guard = disk_queue_blocks_new_supply(disk_pool);
     let mut registry = engine.registry_guard()?;
     let Some(download_index) = registry
@@ -942,12 +1209,10 @@ fn adjust_runtime_segment_supply(
             control_updates: Vec::new(),
             response: None,
             dispatch_plan: RuntimeDispatchPlan::default(),
-            ramp_speed: None,
         });
     };
 
     let mut telemetry_payload: Option<HostTelemetryArgs> = None;
-    let previous_target = registry.downloads[download_index].target_connections.max(1);
     {
         let download = &mut registry.downloads[download_index];
         let current_target = download.target_connections.max(1);
@@ -967,38 +1232,120 @@ fn adjust_runtime_segment_supply(
             .min_segment_size_bytes
             .saturating_mul(u64::from(current_target.saturating_add(1)));
         let speed = download.speed;
+        ramp_state.record_sample(now, current_target, speed, median_ttfb_ms);
+        let stable_speed = ramp_state.stable_speed(current_target).unwrap_or(speed);
+        let stable_ttfb_ms = ramp_state.stable_ttfb_ms(current_target).or(median_ttfb_ms);
+        let sample_count = ramp_state.sample_count(current_target);
+        let sustained_gain = ramp_state.marginal_gain(current_target);
         let (ramp_interval_ms, ramp_speed_floor) = runtime_ramp_requirements(current_target);
-        let can_ramp = now.saturating_sub(last_ramp_at_ms) >= ramp_interval_ms
+        let can_ramp = now.saturating_sub(ramp_state.last_change_at_ms) >= ramp_interval_ms
             && download.capabilities.segmented
-            && !download.writer_backpressure
             && !disk_supply_guard
             && cooldown_retry_delay_ms(download.host_cooldown_until).is_none()
             && current_target < max_target
             && active_workers.saturating_add(queued_workers) >= current_target
             && remaining_bytes >= required_window
-            && speed >= ramp_speed_floor;
+            && stable_speed >= ramp_speed_floor
+            && disk_queue_parallelism_target(
+                disk_pool,
+                current_target.saturating_add(1).min(max_target),
+            ) > current_target;
 
         if can_ramp {
-            let next_target = current_target.saturating_add(1).min(max_target);
-            let sustained_gain = last_ramp_speed.map(|previous| {
-                i64::try_from(speed)
-                    .unwrap_or(i64::MAX)
-                    .saturating_sub(i64::try_from(previous).unwrap_or(i64::MAX))
-            });
-            download.target_connections = next_target;
-            telemetry_payload = Some(HostTelemetryArgs {
-                host: download.host.clone(),
-                attempted_connections: Some(next_target),
-                sustained_gain_bytes_per_second: sustained_gain,
-                throughput_bytes_per_second: Some(speed).filter(|value| *value > 0),
-                ttfb_ms: None,
-                negotiated_protocol: download.host_protocol.clone(),
-                connection_reused: None,
-                throttle_event: false,
-                timeout_event: false,
-                reset_event: false,
-                range_validation_failed: false,
-            });
+            let fast_path = should_fast_path_ramp(
+                current_target,
+                max_target,
+                sample_count,
+                stable_ttfb_ms,
+                ramp_state.last_change_speed,
+                sustained_gain,
+            );
+            let next_target = current_target
+                .saturating_add(if fast_path { 2 } else { 1 })
+                .min(max_target);
+            if next_target > current_target {
+                download.target_connections = next_target;
+                ramp_state.mark_change(now, next_target, stable_speed.max(1));
+                append_download_log(
+                    download,
+                    DownloadLogLevel::Info,
+                    if fast_path {
+                        "runtime.ramp-fast-path"
+                    } else {
+                        "runtime.ramp-up"
+                    },
+                    format!(
+                        "Raised live target connections from {} to {} after a stable ramp window around {}/s{}.",
+                        current_target,
+                        next_target,
+                        format_bytes_compact(stable_speed.max(1)),
+                        stable_ttfb_ms
+                            .map(|ttfb_ms| format!(" with median TTFB {}ms", ttfb_ms))
+                            .unwrap_or_default()
+                    ),
+                );
+                telemetry_payload = Some(HostTelemetryArgs {
+                    host: download.host.clone(),
+                    scope_key: Some(download_scope_key(download)),
+                    attempted_connections: Some(next_target),
+                    sustained_gain_bytes_per_second: sustained_gain,
+                    throughput_bytes_per_second: Some(stable_speed).filter(|value| *value > 0),
+                    ttfb_ms: stable_ttfb_ms,
+                    negotiated_protocol: download.host_protocol.clone(),
+                    connection_reused: None,
+                    throttle_event: false,
+                    timeout_event: false,
+                    reset_event: false,
+                    range_validation_failed: false,
+                });
+            }
+        } else if !disk_supply_guard
+            && cooldown_retry_delay_ms(download.host_cooldown_until).is_none()
+            && active_workers.saturating_add(queued_workers) >= current_target
+            && should_proactively_downshift(
+                current_target,
+                sample_count,
+                ramp_state.last_change_speed,
+                sustained_gain,
+            )
+        {
+            ramp_state.note_negative_gain_window();
+            if ramp_state.negative_gain_windows >= RUNTIME_RAMP_NEGATIVE_GAIN_WINDOWS {
+                let next_target = current_target.saturating_sub(1).max(1);
+                if next_target < current_target {
+                    let lost_gain = sustained_gain.unwrap_or_default().unsigned_abs();
+                    download.target_connections = next_target;
+                    ramp_state.mark_change(now, next_target, stable_speed.max(1));
+                    append_download_log(
+                        download,
+                        DownloadLogLevel::Warn,
+                        "runtime.downshift",
+                        format!(
+                            "Reduced live target connections from {} to {} after the last ramp window lost about {}/s of aggregate throughput.",
+                            current_target,
+                            next_target,
+                            format_bytes_compact(lost_gain)
+                        ),
+                    );
+                    telemetry_payload = Some(HostTelemetryArgs {
+                        host: download.host.clone(),
+                        scope_key: Some(download_scope_key(download)),
+                        attempted_connections: Some(current_target),
+                        sustained_gain_bytes_per_second: sustained_gain,
+                        throughput_bytes_per_second: Some(stable_speed)
+                            .filter(|value| *value > 0),
+                        ttfb_ms: stable_ttfb_ms,
+                        negotiated_protocol: download.host_protocol.clone(),
+                        connection_reused: None,
+                        throttle_event: false,
+                        timeout_event: false,
+                        reset_event: false,
+                        range_validation_failed: false,
+                    });
+                }
+            }
+        } else {
+            ramp_state.reset_negative_gain_windows();
         }
     }
 
@@ -1017,30 +1364,22 @@ fn adjust_runtime_segment_supply(
         control_updates: Vec::new(),
         response: None,
         dispatch_plan,
-        ramp_speed: None,
     };
     {
         let download = &mut registry.downloads[download_index];
-        let active_workers = download
-            .segments
-            .iter()
-            .filter(|segment| matches!(segment.status, DownloadSegmentStatus::Downloading))
-            .count() as u32;
-        let target_parallel = if download.writer_backpressure || disk_supply_guard {
-            active_workers.max(1)
-        } else {
-            download
-                .target_connections
-                .max(1)
-                .min(download.max_connections.max(1))
-        };
+        let requested_parallel = download
+            .target_connections
+            .max(1)
+            .min(download.max_connections.max(1));
+        let target_parallel = disk_queue_parallelism_target(disk_pool, requested_parallel);
         adjustment.desired_parallel = usize::try_from(target_parallel)
             .unwrap_or(usize::MAX)
             .max(1);
 
-        if download.capabilities.segmented && !download.writer_backpressure && !disk_supply_guard {
+        if download.capabilities.segmented && !disk_supply_guard {
             let refill = scheduler.fill_idle_slots(
                 &mut download.segments,
+                runtime_samples,
                 download.size.max(0) as u64,
                 adjustment.desired_parallel,
             );
@@ -1048,9 +1387,6 @@ fn adjust_runtime_segment_supply(
             adjustment.appended_segments = refill.appended_segments;
         }
 
-        if download.target_connections.max(1) > previous_target {
-            adjustment.ramp_speed = Some(download.speed);
-        }
         if telemetry_payload.is_some() || !adjustment.appended_segments.is_empty() {
             adjustment.response = Some(download.clone());
         }
@@ -1155,7 +1491,7 @@ impl EngineState {
                 Some(probe)
             } else {
                 let probe_target = runtime_probe_target(&runtime_download);
-                if let Some(client_lease) = http_pool.get_client(probe_target.url) {
+                match http_pool.get_client(probe_target.url) { Some(client_lease) => {
                     probe_runtime_bootstrap_with_client(
                         client_lease.client.as_ref(),
                         probe_target.url,
@@ -1168,13 +1504,13 @@ impl EngineState {
                     .await
                     .ok()
                     .map(|bootstrap| bootstrap.probe)
-                } else {
+                } _ => {
                     None
-                }
+                }}
             };
 
-            if let Some(probe) = validation_probe {
-                if !resume_validators_compatible(&runtime_download.validators, &probe.validators) {
+            if let Some(probe) = validation_probe
+                && !resume_validators_compatible(&runtime_download.validators, &probe.validators) {
                     let mut registry = self.registry_guard()?;
                     if let Some(download) = registry
                         .downloads
@@ -1194,7 +1530,6 @@ impl EngineState {
                     drop(registry);
                     reset_temp_file_path(&runtime_download.temp_path)?;
                 }
-            }
         }
 
         if requires_unknown_size_restart(&runtime_download) {
@@ -1279,7 +1614,15 @@ impl EngineState {
                 } else {
                     1
                 },
-                settings.min_segment_size_bytes,
+                &settings,
+                runtime_host_profile
+                    .as_ref()
+                    .and_then(|profile| profile.average_throughput_bytes_per_second)
+                    .or(runtime_download.host_average_throughput_bytes_per_second),
+                runtime_host_profile
+                    .as_ref()
+                    .and_then(|profile| profile.average_ttfb_ms)
+                    .or(runtime_download.host_average_ttfb_ms),
             );
         }
 
@@ -1299,14 +1642,22 @@ impl EngineState {
             reserve_known_size_temp_file(&file, runtime_download.size as u64)?;
         }
         let output_file = Arc::new(file);
+        let mut temp_file_lock =
+            acquire_temp_transfer_lock(Arc::clone(&output_file), &runtime_download.temp_path);
+        if let Some(warning) = temp_file_lock.warning.clone() {
+            record_runtime_warning(self, &mut runtime_download, "runtime.temp-lock", warning);
+        }
         let _wake_lock_guard = RuntimeWakeLockGuard::acquire(self);
         let disk_pool = Arc::new(disk_pool::DiskPool::new(256));
         let checkpoint_clock = Arc::new(AtomicI64::new(unix_epoch_millis()));
         let scheduler = SegmentScheduler::new(
             settings.min_segment_size_bytes,
             settings.late_segment_ratio_percent,
+            settings.target_chunk_time_seconds,
         );
         let runtime_samples: Arc<Mutex<BTreeMap<u32, SegmentRuntimeSample>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let segment_started_at: Arc<Mutex<BTreeMap<u32, i64>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         let runtime_telemetry: Arc<Mutex<RuntimeTelemetrySnapshot>> =
             Arc::new(Mutex::new(RuntimeTelemetrySnapshot::default()));
@@ -1319,15 +1670,18 @@ impl EngineState {
                         remaining_bytes: sample.remaining_bytes,
                         eta_seconds: sample.eta_seconds,
                         throughput_bytes_per_second: sample.throughput_bytes_per_second,
+                        active_for_ms: None,
                     },
                 );
             }
         }
         let segment_controls: Arc<Mutex<BTreeMap<u32, SegmentRuntimeControl>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
+        let effective_download_limit =
+            effective_download_speed_limit(&runtime_download, &settings);
         let per_download_limiter = Some(self.download_rate_limiter(
             &runtime_download.id,
-            runtime_download.speed_limit_bytes_per_second,
+            effective_download_limit,
         ));
         let per_host_limiter = self.host_rate_limiter(
             &runtime_download.host,
@@ -1341,8 +1695,10 @@ impl EngineState {
             },
         ));
         let mut runtime_attempt = 0u32;
-        let mut last_ramp_at_ms = unix_epoch_millis();
-        let mut last_ramp_speed: Option<u64> = None;
+        let mut ramp_state = RuntimeRampState::new(
+            unix_epoch_millis(),
+            runtime_download.target_connections.max(1),
+        );
 
         loop {
             let mut pending_segments: Vec<DownloadSegment> = runtime_download
@@ -1400,8 +1756,8 @@ impl EngineState {
                         }
                         let _ = self.persist_registry(&registry);
                     }
-                } else if restored_pairs > 0 {
-                    if let Ok(mut registry) = self.registry_guard() {
+                } else if restored_pairs > 0
+                    && let Ok(mut registry) = self.registry_guard() {
                         if let Some(download) = registry
                             .downloads
                             .iter_mut()
@@ -1419,7 +1775,6 @@ impl EngineState {
                         }
                         let _ = self.persist_registry(&registry);
                     }
-                }
             }
             let mut expected_canceled: BTreeMap<u32, ()> = BTreeMap::new();
             let mut runtime_error: Option<String> = None;
@@ -1443,8 +1798,10 @@ impl EngineState {
                             .compatibility
                             .request_form_fields
                             .clone(),
-                        chunk_buffer_size: runtime_chunk_buffer_size(
+                        chunk_buffer_size: runtime_chunk_buffer_size_with_pressure(
                             &runtime_download.traffic_mode,
+                            runtime_download.speed,
+                            disk_pool.queue_utilization_percent(),
                         ),
                         request_timeout_secs: 30,
                         retry_budget: segment.retry_budget.max(1),
@@ -1460,8 +1817,12 @@ impl EngineState {
                     let http_pool = http_pool.clone();
                     let checkpoint_clock = Arc::clone(&checkpoint_clock);
                     let runtime_samples = Arc::clone(&runtime_samples);
+                    let segment_started_at = Arc::clone(&segment_started_at);
                     let runtime_telemetry = Arc::clone(&runtime_telemetry);
                     let initial_stream_slot = Arc::clone(&initial_stream_slot);
+                    if let Ok(mut started_at) = segment_started_at.lock() {
+                        started_at.insert(segment.id, unix_epoch_millis());
+                    }
                     let initial_response = if segment.start <= 0 {
                         initial_stream_slot
                             .lock()
@@ -1520,11 +1881,25 @@ impl EngineState {
                                         let end = reg_segment.end.max(reg_segment.start) as u64;
                                         let remaining_bytes =
                                             end.saturating_sub(current_offset).saturating_add(1);
+                                        let segment_age_ms = segment_started_at
+                                            .lock()
+                                            .ok()
+                                            .and_then(|started_at| {
+                                                started_at.get(&reg_segment.id).copied()
+                                            })
+                                            .map(|started_at_ms| {
+                                                u64::try_from(
+                                                    unix_epoch_millis()
+                                                        .saturating_sub(started_at_ms),
+                                                )
+                                                .unwrap_or(u64::MAX)
+                                            });
                                         let mut runtime_sample = SegmentRuntimeSample {
                                             segment_id: reg_segment.id,
                                             remaining_bytes,
                                             eta_seconds: None,
                                             throughput_bytes_per_second: None,
+                                            active_for_ms: segment_age_ms,
                                         };
                                         if let Ok(mut samples) = runtime_samples.lock() {
                                             let previous_throughput =
@@ -1543,6 +1918,7 @@ impl EngineState {
                                                     .filter(|value| *value > 0)
                                                     .map(|value| remaining_bytes / value.max(1)),
                                                 throughput_bytes_per_second: stable_throughput,
+                                                active_for_ms: segment_age_ms,
                                             };
                                             samples.insert(reg_segment.id, runtime_sample.clone());
                                             aggregate_speed = Some(recompute_download_speed(
@@ -1560,8 +1936,8 @@ impl EngineState {
                                             progress.retry_attempts,
                                             progress.terminal_failure_reason.clone(),
                                         );
-                                        if let Some(telemetry) = progress.telemetry.as_ref() {
-                                            if let Ok(mut snapshot) = runtime_telemetry.lock() {
+                                        if let Some(telemetry) = progress.telemetry.as_ref()
+                                            && let Ok(mut snapshot) = runtime_telemetry.lock() {
                                                 if let Some(ttfb_ms) =
                                                     telemetry.ttfb_ms.filter(|value| *value > 0)
                                                 {
@@ -1588,7 +1964,6 @@ impl EngineState {
                                                     *counter = counter.saturating_add(1);
                                                 }
                                             }
-                                        }
                                     }
                                     download.downloaded = download
                                         .segments
@@ -1663,29 +2038,36 @@ impl EngineState {
             }
 
             while !join_set.is_empty() {
+                let median_ttfb_ms = runtime_telemetry
+                    .lock()
+                    .ok()
+                    .and_then(|snapshot| median_runtime_ttfb(&snapshot));
+                let runtime_sample_snapshot = runtime_samples
+                    .lock()
+                    .ok()
+                    .map(|value| value.values().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
                 let adjustment = adjust_runtime_segment_supply(
                     self,
                     &runtime_download.id,
-                    &settings,
-                    &scheduler,
-                    disk_pool.as_ref(),
-                    last_ramp_at_ms,
-                    last_ramp_speed,
+                    RuntimeSupplyInputs {
+                        settings: &settings,
+                        scheduler: &scheduler,
+                        runtime_samples: &runtime_sample_snapshot,
+                        disk_pool: disk_pool.as_ref(),
+                        ramp_state: &mut ramp_state,
+                        median_ttfb_ms,
+                    },
                 )?;
                 desired_parallel = adjustment.desired_parallel;
-                if let Some(ramp_speed) = adjustment.ramp_speed {
-                    last_ramp_at_ms = unix_epoch_millis();
-                    last_ramp_speed = Some(ramp_speed);
-                }
-                if !adjustment.control_updates.is_empty() {
-                    if let Ok(controls) = segment_controls.lock() {
+                if !adjustment.control_updates.is_empty()
+                    && let Ok(controls) = segment_controls.lock() {
                         for (segment_id, end) in adjustment.control_updates {
                             if let Some(control) = controls.get(&segment_id) {
                                 control.set_end(end);
                             }
                         }
                     }
-                }
                 for next_segment in adjustment.appended_segments {
                     queue.push_back(next_segment);
                 }
@@ -1725,8 +2107,11 @@ impl EngineState {
                         if let Ok(mut controls) = segment_controls.lock() {
                             controls.remove(&segment_id);
                         }
-                        if segment.retry_attempts > 0 || terminal_failure_reason.is_some() {
-                            if let Ok(mut registry) = self.registry_guard() {
+                        if let Ok(mut started_at) = segment_started_at.lock() {
+                            started_at.remove(&segment_id);
+                        }
+                        if (segment.retry_attempts > 0 || terminal_failure_reason.is_some())
+                            && let Ok(mut registry) = self.registry_guard() {
                                 if let Some(download) = registry
                                     .downloads
                                     .iter_mut()
@@ -1741,7 +2126,6 @@ impl EngineState {
                                 }
                                 let _ = self.persist_registry(&registry);
                             }
-                        }
                         completed_segments.push(segment);
                         if let Err(error) = result {
                             if error == "segment-canceled"
@@ -1761,21 +2145,18 @@ impl EngineState {
                                     .downloads
                                     .iter_mut()
                                     .find(|download| download.id == runtime_download.id)
-                                {
-                                    if let Some(race_winner) = resolve_runtime_race_winner(
+                                    && let Some(race_winner) = resolve_runtime_race_winner(
                                         download,
                                         winner_id,
                                         &mut race_by_segment,
                                     ) {
                                         expected_canceled.insert(race_winner.loser_id, ());
-                                        if let Ok(controls) = segment_controls.lock() {
-                                            if let Some(control) = controls.get(&race_winner.loser_id)
+                                        if let Ok(controls) = segment_controls.lock()
+                                            && let Some(control) = controls.get(&race_winner.loser_id)
                                             {
                                                 control.cancel();
                                             }
-                                        }
                                     }
-                                }
                                 let _ = self.persist_registry(&registry);
                             }
                             while join_set.len() < desired_parallel && !queue.is_empty() {
@@ -1784,8 +2165,8 @@ impl EngineState {
                             if join_set.len() < desired_parallel && queue.is_empty() {
                                 let mut appended: Option<DownloadSegment> = None;
                                 let mut control_updates: Vec<(u32, i64)> = Vec::new();
-                                if let Ok(mut registry) = self.registry_guard() {
-                                    if let Some(download) = registry
+                                if let Ok(mut registry) = self.registry_guard()
+                                    && let Some(download) = registry
                                         .downloads
                                         .iter_mut()
                                         .find(|download| download.id == runtime_download.id)
@@ -1807,16 +2188,14 @@ impl EngineState {
                                             let _ = self.persist_registry(&registry);
                                         }
                                     }
-                                }
-                                if !control_updates.is_empty() {
-                                    if let Ok(controls) = segment_controls.lock() {
+                                if !control_updates.is_empty()
+                                    && let Ok(controls) = segment_controls.lock() {
                                         for (segment_id, end) in control_updates {
                                             if let Some(control) = controls.get(&segment_id) {
                                                 control.set_end(end);
                                             }
                                         }
                                     }
-                                }
                                 if let Some(next_segment) = appended {
                                     queue.push_back(next_segment);
                                     while join_set.len() < desired_parallel && !queue.is_empty() {
@@ -1848,8 +2227,8 @@ impl EngineState {
                     *segment = updated;
                 }
             }
-            if let Ok(registry) = self.registry_guard() {
-                if let Some(download) = registry
+            if let Ok(registry) = self.registry_guard()
+                && let Some(download) = registry
                     .downloads
                     .iter()
                     .find(|download| download.id == runtime_download.id)
@@ -1862,7 +2241,6 @@ impl EngineState {
                     runtime_download.host_max_connections = download.host_max_connections;
                     runtime_download.host_cooldown_until = download.host_cooldown_until;
                 }
-            }
 
             if runtime_error.is_none() {
                 continue;
@@ -1894,6 +2272,7 @@ impl EngineState {
                 {
                     telemetry_payload = Some(HostTelemetryArgs {
                         host: download.host.clone(),
+                        scope_key: Some(download_scope_key(download)),
                         attempted_connections: Some(download.target_connections.max(1)),
                         sustained_gain_bytes_per_second: None,
                         throughput_bytes_per_second: Some(download.speed)
@@ -1981,13 +2360,17 @@ impl EngineState {
             .sync_data()
             .map_err(|error| format!("Failed syncing temp file before finalize: {error}"))?;
         take_disk_pool_error(disk_pool.as_ref())?;
+        let mut temp_lock_release_warning = temp_file_lock.release();
         drop(output_file);
         drop(disk_pool);
 
         let finalize_result =
             finalize_download_file(&runtime_download.temp_path, &runtime_download.target_path)?;
         let finalize_used_copy_fallback = finalize_result.used_copy_fallback;
-        let finalize_warnings = finalize_result.warnings;
+        let mut finalize_warnings = finalize_result.warnings;
+        if let Some(warning) = temp_lock_release_warning.take() {
+            finalize_warnings.push(warning);
+        }
         let mut registry = self.registry_guard()?;
         if let Some(download_index) = registry
             .downloads
@@ -2047,6 +2430,7 @@ impl EngineState {
                 clear_runtime_checkpoint(download);
                 HostTelemetryArgs {
                     host: download.host.clone(),
+                    scope_key: Some(download_scope_key(download)),
                     attempted_connections: Some(download.target_connections.max(1)),
                     sustained_gain_bytes_per_second: None,
                     throughput_bytes_per_second: throughput_snapshot,
@@ -2084,8 +2468,8 @@ impl EngineState {
 #[cfg(test)]
 mod tests {
     use super::{
-        disk_queue_blocks_new_supply, disk_queue_under_pressure, merge_resume_validators,
-        needs_runtime_metadata_bootstrap, runtime_ramp_requirements,
+        average_recent_u64, disk_queue_blocks_new_supply, disk_queue_under_pressure,
+        merge_resume_validators, needs_runtime_metadata_bootstrap, runtime_ramp_requirements,
     };
     use crate::engine::disk_pool::DiskPool;
     use crate::engine::runtime_recovery::{
@@ -2283,5 +2667,10 @@ mod tests {
 
         assert!(warmup_interval < steady_interval);
         assert!(warmup_speed < steady_speed);
+    }
+
+    #[test]
+    fn average_recent_u64_returns_none_for_empty_iterators() {
+        assert_eq!(average_recent_u64(std::iter::empty()), None);
     }
 }

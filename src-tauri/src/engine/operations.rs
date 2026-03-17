@@ -317,10 +317,11 @@ impl EngineState {
         let host_profile = registry.host_profiles.get(&host);
         let cached_probe =
             host_profile.and_then(|profile| fresh_probe_capabilities(profile, &scope_key, now));
-        let effective_connections = effective_connection_target(
+        let effective_connections = effective_connection_target_for_scope(
             registry.settings.default_max_connections,
             &registry.settings,
             host_profile,
+            Some(&scope_key),
         );
         let mut warnings = probe
             .as_ref()
@@ -354,7 +355,7 @@ impl EngineState {
             cached_probe.as_ref(),
             now,
         );
-        if let Some(warning) = profile_warning(host_profile) {
+        if let Some(warning) = profile_warning_for_scope(host_profile, Some(&scope_key)) {
             warnings.push(warning);
         }
         let available_space = save_path
@@ -397,10 +398,11 @@ impl EngineState {
         let range_supported = range_supported && exact_request_shape_allows_segmentation;
         let resumable = resumable && exact_request_shape_allows_segmentation;
         let planned_connections = if range_supported && resumable && size.unwrap_or(0) > 0 {
-            initial_target_connections(
+            initial_target_connections_for_scope(
                 effective_connections,
                 &registry.settings,
                 host_profile,
+                Some(&scope_key),
                 size,
             )
         } else {
@@ -423,10 +425,10 @@ impl EngineState {
             final_url,
             host,
             host_max_connections: host_profile.and_then(|profile| profile.max_connections),
-            host_average_ttfb_ms: host_profile.and_then(|profile| profile.average_ttfb_ms),
-            host_average_throughput_bytes_per_second: host_profile
-                .and_then(|profile| profile.average_throughput_bytes_per_second),
-            host_diagnostics: host_diagnostics_summary(host_profile),
+            host_average_ttfb_ms: effective_average_ttfb_ms(host_profile, Some(&scope_key)),
+            host_average_throughput_bytes_per_second:
+                effective_average_throughput_bytes_per_second(host_profile, Some(&scope_key)),
+            host_diagnostics: host_diagnostics_summary_for_scope(host_profile, Some(&scope_key)),
             suggested_name: suggested_name.clone(),
             target_path,
             size,
@@ -499,8 +501,12 @@ impl EngineState {
         let host_profile = registry.host_profiles.get(&host);
         let cached_probe =
             host_profile.and_then(|profile| fresh_probe_capabilities(profile, &scope_key, now));
-        let max_connections =
-            effective_connection_target(settings.default_max_connections, &settings, host_profile);
+        let max_connections = effective_connection_target_for_scope(
+            settings.default_max_connections,
+            &settings,
+            host_profile,
+            Some(&scope_key),
+        );
         let target_path = join_target_path(&save_path, &name);
         let available_space = query_available_space(Path::new(&save_path));
         let cached_range = cached_probe
@@ -537,7 +543,7 @@ impl EngineState {
             cached_recent_probe.is_some(),
             live_probe.is_some(),
         );
-        if let Some(warning) = profile_warning(host_profile) {
+        if let Some(warning) = profile_warning_for_scope(host_profile, Some(&scope_key)) {
             warnings.push(warning);
         }
         append_probe_cache_warning(
@@ -583,7 +589,13 @@ impl EngineState {
             && capabilities.resumable
             && planned_size.unwrap_or(0) > 0
         {
-            initial_target_connections(max_connections, &settings, host_profile, planned_size)
+            initial_target_connections_for_scope(
+                max_connections,
+                &settings,
+                host_profile,
+                Some(&scope_key),
+                planned_size,
+            )
         } else {
             1
         };
@@ -601,7 +613,9 @@ impl EngineState {
             build_segment_plan(
                 planned_size.unwrap_or(0),
                 starting_connections,
-                settings.min_segment_size_bytes,
+                &settings,
+                effective_average_throughput_bytes_per_second(host_profile, Some(&scope_key)),
+                effective_average_ttfb_ms(host_profile, Some(&scope_key)),
             )
         } else {
             Vec::new()
@@ -642,14 +656,14 @@ impl EngineState {
             host_max_connections: host_profile.and_then(|profile| profile.max_connections),
             custom_max_connections: None,
             host_cooldown_until: host_profile.and_then(|profile| profile.cooldown_until),
-            host_average_ttfb_ms: host_profile.and_then(|profile| profile.average_ttfb_ms),
-            host_average_throughput_bytes_per_second: host_profile
-                .and_then(|profile| profile.average_throughput_bytes_per_second),
+            host_average_ttfb_ms: effective_average_ttfb_ms(host_profile, Some(&scope_key)),
+            host_average_throughput_bytes_per_second:
+                effective_average_throughput_bytes_per_second(host_profile, Some(&scope_key)),
             host_protocol: probe
                 .as_ref()
                 .and_then(|value| value.negotiated_protocol.clone())
                 .or_else(|| host_profile.and_then(|profile| profile.negotiated_protocol.clone())),
-            host_diagnostics: host_diagnostics_summary(host_profile),
+            host_diagnostics: host_diagnostics_summary_for_scope(host_profile, Some(&scope_key)),
             traffic_mode: settings.traffic_mode.clone(),
             speed_limit_bytes_per_second: None,
             open_folder_on_completion: false,
@@ -869,12 +883,11 @@ impl EngineState {
         self.abort_integrity_task(id);
         let mut registry = self.registry_guard()?;
 
-        if delete_file {
-            if let Some(download) = registry.downloads.iter().find(|d| d.id == id) {
+        if delete_file
+            && let Some(download) = registry.downloads.iter().find(|d| d.id == id) {
                 let _ = std::fs::remove_file(&download.temp_path);
                 let _ = std::fs::remove_file(&download.target_path);
             }
-        }
 
         let starting_len = registry.downloads.len();
         registry.downloads.retain(|download| download.id != id);
@@ -1169,8 +1182,22 @@ impl EngineState {
 
         let dispatch_plan = plan_runtime_dispatch(&mut registry);
         let min_interval_ms = registry.settings.segment_checkpoint_min_interval_ms;
+        let limiter_updates: Vec<(String, Option<u64>)> = registry
+            .downloads
+            .iter()
+            .map(|download| {
+                (
+                    download.id.clone(),
+                    effective_download_speed_limit(download, &sanitized),
+                )
+            })
+            .collect();
         self.persist_registry(&registry)?;
         drop(registry);
+        for (download_id, rate_bytes_per_second) in limiter_updates {
+            self.reconfigure_download_rate_limiter(&download_id, rate_bytes_per_second);
+        }
+        self.emit_engine_settings(&sanitized);
         self.apply_runtime_dispatch_plan(dispatch_plan, min_interval_ms);
         Ok(sanitized)
     }

@@ -3,10 +3,82 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+
+#[derive(Debug)]
+pub(super) struct TempTransferLockGuard {
+    file: Option<Arc<std::fs::File>>,
+    temp_path: String,
+    pub warning: Option<String>,
+}
+
+impl TempTransferLockGuard {
+    pub(super) fn release(&mut self) -> Option<String> {
+        let file = self.file.take()?;
+
+        #[cfg(target_os = "windows")]
+        {
+            fs2::FileExt::unlock(&*file).err().map(|error| {
+                format!(
+                    "VDM finished writing '{}' but could not release the temp-file transfer lock cleanly before finalize: {error}",
+                    Path::new(&self.temp_path).display()
+                )
+            })
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = file;
+            None
+        }
+    }
+}
+
+impl Drop for TempTransferLockGuard {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
 
 pub(super) struct FinalizeDownloadResult {
     pub used_copy_fallback: bool,
     pub warnings: Vec<String>,
+}
+
+pub(super) fn acquire_temp_transfer_lock(
+    file: Arc<std::fs::File>,
+    temp_path: &str,
+) -> TempTransferLockGuard {
+    #[cfg(target_os = "windows")]
+    {
+        let path = Path::new(temp_path);
+        match fs2::FileExt::try_lock_exclusive(&*file) {
+            Ok(()) => TempTransferLockGuard {
+                file: Some(file),
+                temp_path: temp_path.to_string(),
+                warning: None,
+            },
+            Err(error) => TempTransferLockGuard {
+                file: None,
+                temp_path: temp_path.to_string(),
+                warning: Some(format!(
+                    "VDM could not keep an exclusive write lock on the temp file '{}' during transfer: {error}. Real-time antivirus or another process may still slow disk writes on this volume.",
+                    path.display()
+                )),
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = file;
+        let _ = temp_path;
+        TempTransferLockGuard {
+            file: None,
+            temp_path: temp_path.to_string(),
+            warning: None,
+        }
+    }
 }
 
 pub(super) fn reset_temp_file_path(temp_path: &str) -> Result<(), String> {

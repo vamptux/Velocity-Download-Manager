@@ -64,7 +64,12 @@ pub(super) fn attempt_runtime_queue_expansion(
             .iter()
             .map(|segment| (segment.id, segment.end))
             .collect();
-        let stolen = scheduler.attempt_work_steal(&mut download.segments, download.size.max(0) as u64, 1);
+        let stolen = scheduler.attempt_work_steal(
+            &mut download.segments,
+            runtime_samples,
+            download.size.max(0) as u64,
+            1,
+        );
         if stolen.is_some() {
             for segment in &download.segments {
                 if before_ends.get(&segment.id).copied() != Some(segment.end) {

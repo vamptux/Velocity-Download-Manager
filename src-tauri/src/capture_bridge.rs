@@ -25,8 +25,6 @@ const CAPTURE_BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const MAX_BODY_LEN: usize = 64 * 1024;
 
-const RECENT_RING_CAP: usize = 50;
-
 const PAIRING_SECRET_BYTES: usize = 20;
 const SESSION_NONCE_BYTES: usize = 16;
 const AUTH_REQUEST_NONCE_TTL_MS: i64 = 5 * 60 * 1000;
@@ -36,8 +34,9 @@ const AUTH_HEADER_CLIENT: &str = "x-vdm-client";
 const AUTH_HEADER_TIMESTAMP: &str = "x-vdm-timestamp";
 const AUTH_HEADER_REQUEST_NONCE: &str = "x-vdm-request-nonce";
 const AUTH_HEADER_SIGNATURE: &str = "x-vdm-auth";
+const AUTH_HEADER_EXTENSION_ORIGIN: &str = "x-vdm-extension-origin";
 const CORS_ALLOW_HEADERS: &str =
-    "Content-Type, X-VDM-Client, X-VDM-Timestamp, X-VDM-Request-Nonce, X-VDM-Auth";
+    "Content-Type, X-VDM-Client, X-VDM-Extension-Origin, X-VDM-Timestamp, X-VDM-Request-Nonce, X-VDM-Auth";
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -109,18 +108,6 @@ struct CaptureBridgeAuthRuntime {
 #[derive(Debug, Clone)]
 pub struct CaptureBridgeState {
     inner: Arc<Mutex<CaptureBridgeAuthRuntime>>,
-}
-
-#[derive(Default)]
-struct RecentCaptures(VecDeque<CapturePayload>);
-
-impl RecentCaptures {
-    fn push(&mut self, payload: CapturePayload) {
-        if self.0.len() >= RECENT_RING_CAP {
-            self.0.pop_front();
-        }
-        self.0.push_back(payload);
-    }
 }
 
 struct HttpRequest<'a> {
@@ -284,8 +271,6 @@ async fn run_capture_server(app: AppHandle, state: CaptureBridgeState) {
 
     eprintln!("[VDM] capture bridge: listening on {addr}");
 
-    let recent: Arc<Mutex<RecentCaptures>> = Arc::new(Mutex::new(RecentCaptures::default()));
-
     loop {
         let Ok((socket, peer)) = listener.accept().await else {
             break;
@@ -296,10 +281,9 @@ async fn run_capture_server(app: AppHandle, state: CaptureBridgeState) {
         }
 
         let app = app.clone();
-        let recent = recent.clone();
         let state = state.clone();
         tauri::async_runtime::spawn(async move {
-            handle_connection(socket, app, recent, state).await;
+            handle_connection(socket, app, state).await;
         });
     }
 }
@@ -307,7 +291,6 @@ async fn run_capture_server(app: AppHandle, state: CaptureBridgeState) {
 async fn handle_connection(
     mut socket: TcpStream,
     app: AppHandle,
-    recent: Arc<Mutex<RecentCaptures>>,
     state: CaptureBridgeState,
 ) {
     let mut buf = Vec::with_capacity(4096);
@@ -393,28 +376,10 @@ async fn handle_connection(
                 return;
             }
 
-            if let Ok(mut ring) = recent.lock() {
-                ring.push(payload.clone());
-            }
             show_capture_window(&app, &payload);
 
             let body = serde_json::to_vec(&CaptureBridgeOkResponse { ok: true })
                 .unwrap_or_else(|_| b"{}".to_vec());
-            let _ = write_json_response(&mut socket, 200, "OK", &body).await;
-        }
-
-        ("GET", "/recent") => {
-            if !authorized {
-                log_unauthorized_request(&request, auth_result.err());
-                let _ = write_unauthorized_response(&mut socket, &state).await;
-                return;
-            }
-
-            let list: Vec<CapturePayload> = recent
-                .lock()
-                .map(|ring| ring.0.iter().cloned().collect())
-                .unwrap_or_default();
-            let body = serde_json::to_vec(&list).unwrap_or_else(|_| b"[]".to_vec());
             let _ = write_json_response(&mut socket, 200, "OK", &body).await;
         }
 
@@ -559,12 +524,20 @@ fn allowed_extension_origin(request: &HttpRequest<'_>) -> Option<String> {
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())?;
 
+    let matches_client = |value: &str| {
+        let (origin, host) = parse_extension_origin(value)?;
+        (host == client).then_some(origin)
+    };
+
     ["origin", "referer"]
         .into_iter()
         .filter_map(|header| request.headers.get(header))
-        .find_map(|value| {
-            let (origin, host) = parse_extension_origin(value)?;
-            (host == client).then_some(origin)
+        .find_map(|value| matches_client(value))
+        .or_else(|| {
+            request
+                .headers
+                .get(AUTH_HEADER_EXTENSION_ORIGIN)
+                .and_then(|value| matches_client(value))
         })
 }
 
@@ -579,11 +552,11 @@ fn parse_extension_origin(value: &str) -> Option<(String, String)> {
 }
 
 fn prune_seen_request_nonces(entries: &mut VecDeque<(String, i64)>, now: i64) {
-    while let Some((_, seen_at)) = entries.front() {
-        if now - *seen_at <= AUTH_REQUEST_NONCE_TTL_MS {
-            break;
-        }
-        entries.pop_front();
+    while entries
+        .front()
+        .is_some_and(|(_, seen_at)| now.saturating_sub(*seen_at) > AUTH_REQUEST_NONCE_TTL_MS)
+    {
+        let _ = entries.pop_front();
     }
 }
 
@@ -698,7 +671,8 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
 fn extract_content_length(headers: &str) -> Option<usize> {
     for line in headers.lines() {
         if line.to_ascii_lowercase().starts_with("content-length:") {
-            return line.split(':').nth(1)?.trim().parse().ok();
+            let (_, value) = line.split_once(':')?;
+            return value.trim().parse().ok();
         }
     }
     None
@@ -944,5 +918,29 @@ mod tests {
         };
 
         assert!(allowed_extension_origin(&request).is_none());
+    }
+
+    #[test]
+    fn allows_explicit_extension_origin_header_when_origin_is_absent() {
+        let request = HttpRequest {
+            method: "GET",
+            path: "/pair",
+            headers: BTreeMap::from([
+                (
+                    AUTH_HEADER_CLIENT.to_string(),
+                    "abcdefghijklmnop".to_string(),
+                ),
+                (
+                    AUTH_HEADER_EXTENSION_ORIGIN.to_string(),
+                    "chrome-extension://abcdefghijklmnop".to_string(),
+                ),
+            ]),
+            body: &[][..],
+        };
+
+        assert_eq!(
+            allowed_extension_origin(&request).as_deref(),
+            Some("chrome-extension://abcdefghijklmnop")
+        );
     }
 }

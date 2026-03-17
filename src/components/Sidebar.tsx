@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   LayoutGrid,
   Archive,
@@ -14,6 +14,11 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { SidebarCategory, Download } from "@/types/download";
+
+const SIDEBAR_DEFAULT_W = 182;
+const SIDEBAR_MIN_W = 135;
+const SIDEBAR_MAX_W = 268;
+const SIDEBAR_SNAP_RANGE = 16;
 
 interface SidebarItem {
   id: SidebarCategory;
@@ -67,11 +72,11 @@ function SectionHeader({
         size={9}
         strokeWidth={2.4}
         className={cn(
-          "shrink-0 text-muted-foreground/30 transition-transform duration-150",
+          "shrink-0 text-muted-foreground/44 transition-transform duration-150",
           !open && "-rotate-90",
         )}
       />
-      <span className="text-[9px] font-semibold uppercase tracking-[0.13em] text-muted-foreground/30 group-hover:text-muted-foreground/50 transition-colors">
+      <span className="text-[9px] font-semibold uppercase tracking-[0.13em] text-muted-foreground/52 group-hover:text-muted-foreground/70 transition-colors">
         {label}
       </span>
     </button>
@@ -103,7 +108,7 @@ function NavItem({
       {active && (
         <span className="absolute left-0 top-1.5 bottom-1.5 w-[3px] rounded-full bg-primary" />
       )}
-      <Icon size={14} className={cn("shrink-0", active ? "text-primary" : "opacity-45")} />
+      <Icon size={14} className={cn("shrink-0", active ? "text-primary" : "opacity-60")} />
       <span className="flex-1 truncate text-left">{item.label}</span>
       {count > 0 && (
         <span
@@ -124,11 +129,42 @@ function NavItem({
 export function Sidebar({ activeCategory, onCategoryChange, downloads }: SidebarProps) {
   const [catOpen, setCatOpen] = useState(true);
   const [statusOpen, setStatusOpen] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_W);
+  const isDragging = useRef(false);
+
+  function startResize(e: React.MouseEvent) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sidebarWidth;
+    isDragging.current = true;
+
+    function onMove(ev: MouseEvent) {
+      const delta = ev.clientX - startX;
+      const raw = startW + delta;
+      setSidebarWidth(Math.max(SIDEBAR_MIN_W, Math.min(SIDEBAR_MAX_W, raw)));
+    }
+
+    function onUp() {
+      isDragging.current = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      setSidebarWidth((w) =>
+        Math.abs(w - SIDEBAR_DEFAULT_W) <= SIDEBAR_SNAP_RANGE ? SIDEBAR_DEFAULT_W : w,
+      );
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    }
+
+    document.body.style.cursor = "ew-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
 
   return (
     <aside
-      className="flex w-[182px] shrink-0 flex-col overflow-hidden border-r border-border/50"
-      style={{ background: "hsl(var(--sidebar))" }}
+      className="relative flex shrink-0 flex-col overflow-hidden border-r border-border/50"
+      style={{ width: sidebarWidth, background: "hsl(var(--sidebar))" }}
     >
       <nav className="flex flex-1 flex-col overflow-y-auto px-1.5 pb-3">
         <SectionHeader label="Categories" open={catOpen} onToggle={() => setCatOpen((v) => !v)} />
@@ -165,7 +201,7 @@ export function Sidebar({ activeCategory, onCategoryChange, downloads }: Sidebar
       <div className="shrink-0 border-t border-border/30 px-3 py-2.5 flex items-center gap-2">
         <div
           className="flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[3px]"
-          style={{ background: "linear-gradient(135deg, hsl(24,62%,54%), hsl(12,52%,34%))" }}
+          style={{ background: "linear-gradient(135deg, hsl(var(--accent-h) 25% 38%), hsl(var(--accent-h) 18% 26%))" }}
         >
           <svg width="8" height="8" viewBox="0 0 12 12" fill="none">
             <path d="M2 2L7 6L2 10" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
@@ -176,6 +212,15 @@ export function Sidebar({ activeCategory, onCategoryChange, downloads }: Sidebar
           Velocity <span className="text-[hsl(var(--primary)/0.5)]">DM</span>
         </span>
       </div>
+
+      {/* Right-edge resize handle – drag to resize sidebar width, snaps to default */}
+      <div
+        role="separator"
+        aria-label="Drag to resize sidebar"
+        onMouseDown={startResize}
+        className="absolute right-0 top-0 bottom-0 w-[5px] cursor-ew-resize z-10 group transition-colors hover:bg-primary/14 active:bg-primary/24"
+        title="Drag to resize"
+      />
     </aside>
   );
 }

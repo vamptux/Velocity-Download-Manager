@@ -700,8 +700,8 @@ fn select_html_app_direct_download(
 ) -> Option<HtmlApiResolvedDownload> {
     let cookies = Some(account_cookie.to_string());
 
-    if content.kind.as_deref() != Some("folder") {
-        if let Some(direct_download_url) = content
+    if content.kind.as_deref() != Some("folder")
+        && let Some(direct_download_url) = content
             .link
             .as_deref()
             .and_then(normalize_html_app_direct_download_url)
@@ -712,7 +712,6 @@ fn select_html_app_direct_download(
                 request_cookies: cookies,
             });
         }
-    }
 
     let child = if content.children.len() == 1 {
         content.children.values().next()

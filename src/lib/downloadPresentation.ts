@@ -41,6 +41,27 @@ export const CATEGORY_ICONS: Record<DownloadCategory, LucideIcon> = {
   documents: FileText,
 };
 
+export const CATEGORY_ICON_COLORS: Record<DownloadCategory, string> = {
+  all: "text-muted-foreground/50",
+  compressed: "text-[hsl(38,68%,52%)]",
+  programs: "text-[hsl(205,62%,52%)]",
+  videos: "text-[hsl(270,52%,62%)]",
+  music: "text-[hsl(152,46%,44%)]",
+  pictures: "text-[hsl(188,58%,48%)]",
+  documents: "text-[hsl(220,48%,58%)]",
+};
+
+/** Subtle gradient backgrounds for the download row category icon badge */
+export const CATEGORY_ICON_BG: Record<DownloadCategory, string> = {
+  all:        "linear-gradient(135deg, hsl(0 0% 20% / 0.6), hsl(0 0% 14% / 0.4))",
+  compressed: "linear-gradient(135deg, hsl(38 60% 24% / 0.55), hsl(38 48% 14% / 0.35))",
+  programs:   "linear-gradient(135deg, hsl(205 55% 22% / 0.55), hsl(205 45% 13% / 0.35))",
+  videos:     "linear-gradient(135deg, hsl(270 45% 22% / 0.55), hsl(270 38% 13% / 0.35))",
+  music:      "linear-gradient(135deg, hsl(152 40% 18% / 0.55), hsl(152 34% 11% / 0.35))",
+  pictures:   "linear-gradient(135deg, hsl(188 50% 20% / 0.55), hsl(188 42% 12% / 0.35))",
+  documents:  "linear-gradient(135deg, hsl(220 42% 22% / 0.55), hsl(220 36% 13% / 0.35))",
+};
+
 export const CATEGORY_LABELS: Record<DownloadCategory, string> = {
   all: "General",
   compressed: "Compressed",

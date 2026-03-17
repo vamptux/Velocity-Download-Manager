@@ -1,4 +1,8 @@
-use crate::model::{EngineSettings, HostDiagnosticsSummary, HostProfile, HostTelemetryArgs};
+use crate::model::{
+    EngineSettings, HostDiagnosticsSummary, HostProfile, HostTelemetryArgs, ProbeScopeCache,
+};
+
+use super::probe::normalize_protocol_label;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_STABLE_HOST_CAP: u32 = 20;
@@ -15,6 +19,7 @@ const MAX_COOLDOWN_SECONDS: i64 = 300;
 const HOST_CAP_RECOVERY_STABLE_SAMPLES: u32 = 4;
 const HOST_CAP_RECOVERY_MIN_THROUGHPUT_BYTES_PER_SECOND: u64 = 4 * 1024 * 1024;
 const PROBE_FAILURE_LOCK_WINDOW_MS: i64 = 10 * 60 * 1_000;
+const RAMP_NO_GAIN_LOCK_WINDOW_MS: i64 = 15 * 60 * 1_000;
 const PROTOCOL_MULTIPLEX_MAX_CONNECTIONS: u32 = 8;
 const PROTOCOL_DEGRADED_MAX_CONNECTIONS: u32 = 2;
 const PROTOCOL_MULTIPLEX_CONFIDENCE_MIN_SAMPLES: u32 = 6;
@@ -34,6 +39,15 @@ pub fn effective_connection_target(
     settings: &EngineSettings,
     profile: Option<&HostProfile>,
 ) -> u32 {
+    effective_connection_target_for_scope(requested_connections, settings, profile, None)
+}
+
+pub fn effective_connection_target_for_scope(
+    requested_connections: u32,
+    settings: &EngineSettings,
+    profile: Option<&HostProfile>,
+    scope_key: Option<&str>,
+) -> u32 {
     let host_hard_cap = if settings.experimental_uncapped_mode {
         EXPERIMENTAL_HOST_CAP
     } else {
@@ -49,18 +63,17 @@ pub fn effective_connection_target(
         if let Some(host_limit) = profile.max_connections {
             target = target.min(host_limit.max(1));
         }
-        if cooldown_active(profile.cooldown_until) {
-            if let Some(locked) = profile.locked_connections {
+        if cooldown_active(effective_cooldown_until(profile, scope_key)) {
+            if let Some(locked) = effective_locked_connections(profile, scope_key) {
                 target = target.min(locked.max(1));
             } else {
                 target = target.min(1);
             }
         }
-        if should_apply_concurrency_lock(profile) {
-            if let Some(locked) = profile.locked_connections {
+        if should_apply_concurrency_lock_for_scope(profile, scope_key)
+            && let Some(locked) = effective_locked_connections(profile, scope_key) {
                 target = target.min(locked.max(1).min(host_hard_cap));
             }
-        }
         if protocol_is_multiplexed(profile.negotiated_protocol.as_deref()) {
             let reused = profile.protocol_reuse_events;
             let opened = profile.protocol_new_connection_events;
@@ -79,10 +92,11 @@ pub fn effective_connection_target(
     target
 }
 
-pub fn initial_target_connections(
+pub fn initial_target_connections_for_scope(
     max_connections: u32,
     settings: &EngineSettings,
     profile: Option<&HostProfile>,
+    scope_key: Option<&str>,
     planned_size: Option<u64>,
 ) -> u32 {
     let max_connections = max_connections.max(1);
@@ -95,21 +109,21 @@ pub fn initial_target_connections(
         return target;
     };
 
-    if cooldown_active(profile.cooldown_until) {
+    if cooldown_active(effective_cooldown_until(profile, scope_key)) {
         return 1;
     }
 
-    if should_apply_concurrency_lock(profile) {
-        if let Some(locked) = profile.locked_connections {
+    if should_apply_concurrency_lock_for_scope(profile, scope_key)
+        && let Some(locked) = effective_locked_connections(profile, scope_key) {
             return locked.max(1).min(max_connections);
         }
-    }
 
-    if profile.telemetry_samples < WARM_START_CONFIDENCE_SAMPLES {
+    if effective_telemetry_samples(profile, scope_key) < WARM_START_CONFIDENCE_SAMPLES {
         return target;
     }
 
-    if let Some(throughput) = profile.average_throughput_bytes_per_second {
+    if let Some(throughput) = effective_average_throughput_bytes_per_second(Some(profile), scope_key)
+    {
         if throughput <= WARM_START_SLOW_HOST_BYTES_PER_SECOND {
             target = 1;
         } else if protocol_is_multiplexed(profile.negotiated_protocol.as_deref())
@@ -121,6 +135,40 @@ pub fn initial_target_connections(
     }
 
     target.min(max_connections).max(1)
+}
+
+pub fn effective_average_ttfb_ms(
+    profile: Option<&HostProfile>,
+    scope_key: Option<&str>,
+) -> Option<u64> {
+    let profile = profile?;
+    let Some(scope) = scope_entry(profile, scope_key) else {
+        return profile.average_ttfb_ms;
+    };
+
+    if scope_has_telemetry(scope) {
+        scope.average_ttfb_ms.or(profile.average_ttfb_ms)
+    } else {
+        profile.average_ttfb_ms
+    }
+}
+
+pub fn effective_average_throughput_bytes_per_second(
+    profile: Option<&HostProfile>,
+    scope_key: Option<&str>,
+) -> Option<u64> {
+    let profile = profile?;
+    let Some(scope) = scope_entry(profile, scope_key) else {
+        return profile.average_throughput_bytes_per_second;
+    };
+
+    if scope_has_telemetry(scope) {
+        scope
+            .average_throughput_bytes_per_second
+            .or(profile.average_throughput_bytes_per_second)
+    } else {
+        profile.average_throughput_bytes_per_second
+    }
 }
 
 fn warm_start_seed_connections(
@@ -187,24 +235,17 @@ pub fn ramp_gain_threshold_bytes_per_second(reference_throughput: u64) -> i64 {
 pub fn apply_host_telemetry(profile: &mut HostProfile, payload: &HostTelemetryArgs) {
     let now = unix_epoch_millis();
     maybe_release_stale_probe_failure_lock(profile, now);
-    if payload.range_validation_failed {
-        apply_range_validation_downgrade(profile, now);
-    }
-    let mut cooldown_base_seconds = 0_i64;
-    let mut soft_reset_penalty = false;
+    maybe_release_stale_ramp_lock(profile, now);
+    let scope_key = payload.scope_key.as_deref();
+
     if payload.throttle_event {
         profile.throttle_events = profile.throttle_events.saturating_add(1);
-        cooldown_base_seconds = cooldown_base_seconds.max(4);
     }
     if payload.timeout_event {
         profile.timeout_events = profile.timeout_events.saturating_add(1);
-        cooldown_base_seconds = cooldown_base_seconds.max(2);
     }
     if payload.reset_event {
         profile.reset_events = profile.reset_events.saturating_add(1);
-        if !payload.throttle_event && !payload.timeout_event {
-            soft_reset_penalty = true;
-        }
     }
     if payload.throttle_event || payload.timeout_event || payload.reset_event {
         profile.stable_recovery_samples = 0;
@@ -240,60 +281,102 @@ pub fn apply_host_telemetry(profile: &mut HostProfile, payload: &HostTelemetryAr
         }
     }
 
+    profile.last_telemetry_at = Some(now);
     profile.telemetry_samples = profile.telemetry_samples.saturating_add(1);
 
-    if let Some(gain) = payload.sustained_gain_bytes_per_second {
-        let gain_threshold = ramp_gain_threshold_bytes_per_second(
-            payload.throughput_bytes_per_second.unwrap_or_default(),
-        );
-        if gain <= gain_threshold {
-            profile.ramp_attempts_without_gain =
-                profile.ramp_attempts_without_gain.saturating_add(1);
-        } else {
-            profile.ramp_attempts_without_gain = 0;
+    if scope_key.is_none() {
+        if payload.range_validation_failed {
+            apply_range_validation_downgrade(profile, now);
+        }
+        let mut cooldown_base_seconds = 0_i64;
+        let mut soft_reset_penalty = false;
+        if payload.throttle_event {
+            cooldown_base_seconds = cooldown_base_seconds.max(4);
+        }
+        if payload.timeout_event {
+            cooldown_base_seconds = cooldown_base_seconds.max(2);
+        }
+        if payload.reset_event && !payload.throttle_event && !payload.timeout_event {
+            soft_reset_penalty = true;
+        }
+
+        if let Some(gain) = payload.sustained_gain_bytes_per_second {
+            let gain_threshold = ramp_gain_threshold_bytes_per_second(
+                payload.throughput_bytes_per_second.unwrap_or_default(),
+            );
+            if gain <= gain_threshold {
+                profile.ramp_attempts_without_gain =
+                    profile.ramp_attempts_without_gain.saturating_add(1);
+            } else {
+                profile.ramp_attempts_without_gain = 0;
+                profile.concurrency_locked = false;
+                profile.locked_connections = None;
+                profile.lock_reason = None;
+            }
+        }
+
+        if profile.ramp_attempts_without_gain >= NO_GAIN_LOCK_ATTEMPTS {
+            profile.concurrency_locked = true;
+            profile.locked_connections = payload
+                .attempted_connections
+                .map(reduced_no_gain_lock_connections);
+            profile.lock_reason = Some("ramp-no-gain".to_string());
+        }
+
+        if cooldown_base_seconds > 0 {
+            apply_penalty_cooldown(profile, payload, cooldown_base_seconds, now);
+        } else if soft_reset_penalty {
+            apply_soft_reset_penalty(profile, payload);
+        } else if !cooldown_active(profile.cooldown_until)
+            && profile.lock_reason.as_deref() == Some("cooldown-active")
+        {
             profile.concurrency_locked = false;
+            profile.locked_connections = None;
             profile.lock_reason = None;
         }
     }
 
-    if profile.ramp_attempts_without_gain >= NO_GAIN_LOCK_ATTEMPTS {
-        profile.concurrency_locked = true;
-        profile.locked_connections = payload
-            .attempted_connections
-            .map(reduced_no_gain_lock_connections);
-        profile.lock_reason = Some("ramp-no-gain".to_string());
-    }
-
-    if cooldown_base_seconds > 0 {
-        apply_penalty_cooldown(profile, payload, cooldown_base_seconds, now);
-    } else if soft_reset_penalty {
-        apply_soft_reset_penalty(profile, payload);
-    } else if !cooldown_active(profile.cooldown_until)
-        && profile.lock_reason.as_deref() == Some("cooldown-active")
-    {
-        profile.concurrency_locked = false;
-        profile.locked_connections = None;
-        profile.lock_reason = None;
-    }
-
     maybe_recover_host_max_connections(profile, payload);
+
+    if let Some(scope_key) = scope_key {
+        let scope = profile.probe_scopes.entry(scope_key.to_string()).or_default();
+        apply_scope_telemetry(scope, payload, now);
+    }
 }
 
-pub fn profile_warning(profile: Option<&HostProfile>) -> Option<String> {
+pub fn profile_warning_for_scope(
+    profile: Option<&HostProfile>,
+    scope_key: Option<&str>,
+) -> Option<String> {
     let profile = profile?;
-    if let Some(seconds) = cooldown_remaining_seconds(profile.cooldown_until) {
+    if let Some(seconds) = cooldown_remaining_seconds(effective_cooldown_until(profile, scope_key))
+    {
+        if scope_entry(profile, scope_key).is_some() {
+            return Some(format!(
+                "This request shape is cooling down for about {seconds}s after throttling or unstable responses on the same replay context."
+            ));
+        }
         return Some(format!(
             "Host cooldown active for about {seconds}s due to throttling or network instability."
         ));
     }
 
-    if profile.concurrency_locked {
-        if profile.lock_reason.as_deref() == Some("probe-failures") {
-            return None;
+    if should_apply_concurrency_lock_for_scope(profile, scope_key) {
+        if scope_entry(profile, scope_key).is_some() {
+            return Some(
+                "This request shape is temporarily ramp-locked after repeated low-gain connection increases."
+                    .to_string(),
+            );
         }
         return Some("Host concurrency is temporarily locked due to low ramp-up gain.".to_string());
     }
-    if profile.throttle_events > 0 {
+    if effective_throttle_events(profile, scope_key) > 0 {
+        if scope_entry(profile, scope_key).is_some() {
+            return Some(
+                "This request shape previously throttled parallel requests; conservative concurrency is applied only to this replay context."
+                    .to_string(),
+            );
+        }
         return Some(
             "Host previously throttled parallel requests; conservative concurrency applied."
                 .to_string(),
@@ -309,21 +392,31 @@ pub fn profile_warning(profile: Option<&HostProfile>) -> Option<String> {
     None
 }
 
-pub fn host_diagnostics_summary(profile: Option<&HostProfile>) -> HostDiagnosticsSummary {
+pub fn host_diagnostics_summary_for_scope(
+    profile: Option<&HostProfile>,
+    scope_key: Option<&str>,
+) -> HostDiagnosticsSummary {
     let Some(profile) = profile else {
         return HostDiagnosticsSummary::default();
     };
+    let concurrency_locked = should_apply_concurrency_lock_for_scope(profile, scope_key);
 
     HostDiagnosticsSummary {
         hard_no_range: false,
-        concurrency_locked: profile.concurrency_locked && should_apply_concurrency_lock(profile),
-        lock_reason: if profile.lock_reason.as_deref() == Some("probe-failures") {
+        concurrency_locked,
+        lock_reason: if !concurrency_locked
+            || effective_lock_reason(profile, scope_key) == Some("probe-failures")
+        {
             None
         } else {
-            profile.lock_reason.clone()
+            effective_lock_reason(profile, scope_key).map(str::to_string)
         },
-        cooldown_until: profile.cooldown_until,
-        negotiated_protocol: profile.negotiated_protocol.clone(),
+        cooldown_until: effective_cooldown_until(profile, scope_key),
+        negotiated_protocol: profile
+            .negotiated_protocol
+            .as_deref()
+            .map(normalize_protocol_label)
+            .map(str::to_string),
         reuse_connections: host_reuse_preference(profile),
     }
 }
@@ -342,6 +435,192 @@ fn host_reuse_preference(profile: &HostProfile) -> Option<bool> {
         return Some(false);
     }
     None
+}
+
+fn scope_entry<'a>(profile: &'a HostProfile, scope_key: Option<&str>) -> Option<&'a ProbeScopeCache> {
+    scope_key.and_then(|key| profile.probe_scopes.get(key))
+}
+
+fn scope_has_telemetry(scope: &ProbeScopeCache) -> bool {
+    scope.telemetry_samples > 0
+        || scope.average_ttfb_ms.is_some()
+        || scope.average_throughput_bytes_per_second.is_some()
+}
+
+fn effective_telemetry_samples(profile: &HostProfile, scope_key: Option<&str>) -> u32 {
+    scope_entry(profile, scope_key)
+        .filter(|scope| scope_has_telemetry(scope))
+        .map(|scope| scope.telemetry_samples)
+        .unwrap_or(profile.telemetry_samples)
+}
+
+fn effective_cooldown_until(profile: &HostProfile, scope_key: Option<&str>) -> Option<i64> {
+    scope_entry(profile, scope_key)
+        .map(|scope| scope.cooldown_until)
+        .unwrap_or(profile.cooldown_until)
+}
+
+fn effective_locked_connections(profile: &HostProfile, scope_key: Option<&str>) -> Option<u32> {
+    scope_entry(profile, scope_key)
+        .and_then(|scope| scope.locked_connections)
+        .or(profile.locked_connections)
+}
+
+fn effective_lock_reason<'a>(profile: &'a HostProfile, scope_key: Option<&str>) -> Option<&'a str> {
+    scope_entry(profile, scope_key)
+        .and_then(|scope| scope.lock_reason.as_deref())
+        .or(profile.lock_reason.as_deref())
+}
+
+fn effective_throttle_events(profile: &HostProfile, scope_key: Option<&str>) -> u32 {
+    scope_entry(profile, scope_key)
+        .map(|scope| scope.throttle_events)
+        .unwrap_or(profile.throttle_events)
+}
+
+fn should_apply_concurrency_lock_for_scope(
+    profile: &HostProfile,
+    scope_key: Option<&str>,
+) -> bool {
+    let Some(scope) = scope_entry(profile, scope_key) else {
+        return should_apply_concurrency_lock(profile);
+    };
+    if !scope.concurrency_locked {
+        return false;
+    }
+
+    match scope.lock_reason.as_deref() {
+        Some("cooldown-active") => cooldown_active(scope.cooldown_until),
+        Some("ramp-no-gain") => scope_ramp_no_gain_lock_active(scope, unix_epoch_millis()),
+        _ => true,
+    }
+}
+
+fn scope_ramp_no_gain_lock_active(scope: &ProbeScopeCache, now_millis: i64) -> bool {
+    scope
+        .last_telemetry_at
+        .is_some_and(|value| now_millis.saturating_sub(value) <= RAMP_NO_GAIN_LOCK_WINDOW_MS)
+}
+
+fn clear_scope_lock(scope: &mut ProbeScopeCache) {
+    scope.concurrency_locked = false;
+    scope.locked_connections = None;
+    scope.lock_reason = None;
+}
+
+fn maybe_release_stale_scope_ramp_lock(scope: &mut ProbeScopeCache, now_millis: i64) {
+    if scope.lock_reason.as_deref() != Some("ramp-no-gain") {
+        return;
+    }
+    if scope_ramp_no_gain_lock_active(scope, now_millis) {
+        return;
+    }
+
+    scope.ramp_attempts_without_gain = 0;
+    clear_scope_lock(scope);
+}
+
+fn apply_range_validation_downgrade_to_scope(scope: &mut ProbeScopeCache, now_millis: i64) {
+    scope.range_supported = Some(false);
+    scope.resumable = Some(false);
+    scope.hard_no_range = true;
+    scope.last_probe_at = Some(now_millis);
+    scope.last_instability_at = Some(now_millis);
+}
+
+fn apply_scope_telemetry(scope: &mut ProbeScopeCache, payload: &HostTelemetryArgs, now: i64) {
+    maybe_release_stale_scope_ramp_lock(scope, now);
+    if !cooldown_active(scope.cooldown_until) && scope.lock_reason.as_deref() == Some("cooldown-active") {
+        clear_scope_lock(scope);
+    }
+    if payload.range_validation_failed {
+        apply_range_validation_downgrade_to_scope(scope, now);
+    }
+
+    let mut cooldown_base_seconds = 0_i64;
+    if payload.throttle_event {
+        scope.throttle_events = scope.throttle_events.saturating_add(1);
+        scope.last_instability_at = Some(now);
+        cooldown_base_seconds = cooldown_base_seconds.max(4);
+    }
+    if payload.timeout_event {
+        scope.timeout_events = scope.timeout_events.saturating_add(1);
+        scope.last_instability_at = Some(now);
+        cooldown_base_seconds = cooldown_base_seconds.max(2);
+    }
+    if payload.reset_event {
+        scope.reset_events = scope.reset_events.saturating_add(1);
+        scope.last_instability_at = Some(now);
+    }
+
+    if let Some(ttfb_ms) = payload.ttfb_ms {
+        scope.average_ttfb_ms = moving_average(
+            scope.average_ttfb_ms,
+            ttfb_ms,
+            scope.telemetry_samples.saturating_add(1),
+        );
+    }
+    if let Some(throughput) = payload.throughput_bytes_per_second {
+        scope.average_throughput_bytes_per_second = moving_average(
+            scope.average_throughput_bytes_per_second,
+            throughput,
+            scope.telemetry_samples.saturating_add(1),
+        );
+    }
+
+    scope.last_telemetry_at = Some(now);
+    scope.telemetry_samples = scope.telemetry_samples.saturating_add(1);
+
+    if let Some(gain) = payload.sustained_gain_bytes_per_second {
+        let gain_threshold = ramp_gain_threshold_bytes_per_second(
+            payload.throughput_bytes_per_second.unwrap_or_default(),
+        );
+        if gain <= gain_threshold {
+            scope.ramp_attempts_without_gain = scope.ramp_attempts_without_gain.saturating_add(1);
+            scope.last_instability_at = Some(now);
+        } else {
+            scope.ramp_attempts_without_gain = 0;
+            if scope.lock_reason.as_deref() == Some("ramp-no-gain") {
+                clear_scope_lock(scope);
+            }
+        }
+    }
+
+    if scope.ramp_attempts_without_gain >= NO_GAIN_LOCK_ATTEMPTS {
+        scope.concurrency_locked = true;
+        scope.locked_connections = payload
+            .attempted_connections
+            .map(reduced_no_gain_lock_connections);
+        scope.lock_reason = Some("ramp-no-gain".to_string());
+        scope.last_instability_at = Some(now);
+    }
+
+    if cooldown_base_seconds > 0 {
+        apply_penalty_cooldown_to_scope(scope, payload, cooldown_base_seconds, now);
+    } else if payload.reset_event && !payload.throttle_event && !payload.timeout_event {
+        apply_penalty_cooldown_to_scope(scope, payload, 1, now);
+    }
+}
+
+fn apply_penalty_cooldown_to_scope(
+    scope: &mut ProbeScopeCache,
+    payload: &HostTelemetryArgs,
+    base_seconds: i64,
+    now_millis: i64,
+) {
+    let event_count = scope.throttle_events.saturating_add(scope.timeout_events);
+    let multiplier_shift = event_count.min(6).saturating_sub(1);
+    let multiplier = 1_i64.checked_shl(multiplier_shift).unwrap_or(64);
+    let jitter = i64::from(scope.telemetry_samples % 7);
+    let cooldown_seconds = base_seconds
+        .saturating_mul(multiplier)
+        .saturating_add(jitter)
+        .clamp(base_seconds, MAX_COOLDOWN_SECONDS);
+    scope.cooldown_until = Some(now_millis.saturating_add(cooldown_seconds.saturating_mul(1_000)));
+    scope.concurrency_locked = true;
+    scope.locked_connections = Some(cooldown_lock_connections(payload));
+    scope.lock_reason = Some("cooldown-active".to_string());
+    scope.last_instability_at = Some(now_millis);
 }
 
 fn apply_soft_reset_penalty(profile: &mut HostProfile, payload: &HostTelemetryArgs) {
@@ -367,7 +646,8 @@ fn apply_range_validation_downgrade(profile: &mut HostProfile, now_millis: i64) 
 }
 
 fn observe_negotiated_protocol(profile: &mut HostProfile, protocol: &str) {
-    let is_multiplexed = protocol_is_multiplexed(Some(protocol));
+    let normalized = normalize_protocol_label(protocol);
+    let is_multiplexed = protocol_is_multiplexed(Some(normalized));
     let downgrade_observed = match profile.negotiated_protocol.as_deref() {
         Some(previous) => protocol_is_multiplexed(Some(previous)) && !is_multiplexed,
         None => !is_multiplexed,
@@ -376,7 +656,7 @@ fn observe_negotiated_protocol(profile: &mut HostProfile, protocol: &str) {
         profile.protocol_downgrade_events = profile.protocol_downgrade_events.saturating_add(1);
     }
 
-    profile.negotiated_protocol = Some(protocol.to_string());
+    profile.negotiated_protocol = Some(normalized.to_string());
     profile.protocol_samples = profile.protocol_samples.saturating_add(1);
 
     if is_multiplexed {
@@ -524,10 +804,25 @@ fn maybe_recover_host_max_connections(profile: &mut HostProfile, payload: &HostT
     profile.max_connections = Some(current_cap.saturating_add(1).min(EXPERIMENTAL_HOST_CAP));
     profile.stable_recovery_samples = 0;
     if profile.lock_reason.as_deref() == Some("ramp-no-gain") {
+        profile.ramp_attempts_without_gain = 0;
         profile.concurrency_locked = false;
         profile.locked_connections = None;
         profile.lock_reason = None;
     }
+}
+
+fn maybe_release_stale_ramp_lock(profile: &mut HostProfile, now_millis: i64) {
+    if profile.lock_reason.as_deref() != Some("ramp-no-gain") {
+        return;
+    }
+    if ramp_no_gain_lock_active(profile, now_millis) {
+        return;
+    }
+
+    profile.ramp_attempts_without_gain = 0;
+    profile.concurrency_locked = false;
+    profile.locked_connections = None;
+    profile.lock_reason = None;
 }
 
 fn maybe_release_stale_probe_failure_lock(profile: &mut HostProfile, now_millis: i64) {
@@ -571,19 +866,29 @@ fn cooldown_active(cooldown_until: Option<i64>) -> bool {
 }
 
 fn should_apply_concurrency_lock(profile: &HostProfile) -> bool {
-    profile.concurrency_locked && profile.lock_reason.as_deref() != Some("probe-failures")
+    if !profile.concurrency_locked {
+        return false;
+    }
+
+    match profile.lock_reason.as_deref() {
+        Some("probe-failures") => false,
+        Some("cooldown-active") => cooldown_active(profile.cooldown_until),
+        Some("ramp-no-gain") => ramp_no_gain_lock_active(profile, unix_epoch_millis()),
+        _ => true,
+    }
+}
+
+fn ramp_no_gain_lock_active(profile: &HostProfile, now_millis: i64) -> bool {
+    profile
+        .last_telemetry_at
+        .is_some_and(|value| now_millis.saturating_sub(value) <= RAMP_NO_GAIN_LOCK_WINDOW_MS)
 }
 
 fn protocol_is_multiplexed(protocol: Option<&str>) -> bool {
-    let Some(protocol) = protocol.map(str::trim) else {
-        return false;
-    };
-    protocol.eq_ignore_ascii_case("http2")
-        || protocol.eq_ignore_ascii_case("http/2")
-        || protocol.eq_ignore_ascii_case("h2")
-        || protocol.eq_ignore_ascii_case("http3")
-        || protocol.eq_ignore_ascii_case("http/3")
-        || protocol.eq_ignore_ascii_case("h3")
+    matches!(
+        protocol.map(normalize_protocol_label),
+        Some("http2") | Some("http3")
+    )
 }
 
 fn unix_epoch_millis() -> i64 {
@@ -596,10 +901,13 @@ fn unix_epoch_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_host_telemetry, effective_connection_target, initial_target_connections,
-        ramp_gain_threshold_bytes_per_second, NO_GAIN_LOCK_ATTEMPTS,
+        apply_host_telemetry, effective_connection_target,
+        initial_target_connections_for_scope, ramp_gain_threshold_bytes_per_second,
+        NO_GAIN_LOCK_ATTEMPTS,
     };
-    use crate::model::{EngineSettings, HostProfile, HostTelemetryArgs, TrafficMode};
+    use crate::model::{
+        EngineSettings, HostProfile, HostTelemetryArgs, ProbeScopeCache, TrafficMode,
+    };
 
     #[test]
     fn recovers_host_cap_after_stable_samples() {
@@ -613,6 +921,7 @@ mod tests {
                 &mut profile,
                 &HostTelemetryArgs {
                     host: "example.com".to_string(),
+                    scope_key: None,
                     attempted_connections: Some(4),
                     sustained_gain_bytes_per_second: Some(0),
                     throughput_bytes_per_second: Some(8 * 1024 * 1024),
@@ -649,9 +958,15 @@ mod tests {
     fn warm_start_starts_low_for_unknown_or_slow_hosts() {
         let settings = EngineSettings::default();
 
-        assert_eq!(initial_target_connections(8, &settings, None, None), 2);
+        assert_eq!(initial_target_connections_for_scope(8, &settings, None, None, None), 2);
         assert_eq!(
-            initial_target_connections(8, &settings, None, Some(128 * 1024 * 1024)),
+            initial_target_connections_for_scope(
+                8,
+                &settings,
+                None,
+                None,
+                Some(128 * 1024 * 1024),
+            ),
             3
         );
 
@@ -662,7 +977,13 @@ mod tests {
         };
 
         assert_eq!(
-            initial_target_connections(8, &settings, Some(&slow_profile), Some(128 * 1024 * 1024)),
+            initial_target_connections_for_scope(
+                8,
+                &settings,
+                Some(&slow_profile),
+                None,
+                Some(128 * 1024 * 1024),
+            ),
             1
         );
     }
@@ -678,8 +999,104 @@ mod tests {
         };
 
         assert_eq!(
-            initial_target_connections(8, &settings, Some(&profile), Some(128 * 1024 * 1024)),
+            initial_target_connections_for_scope(
+                8,
+                &settings,
+                Some(&profile),
+                None,
+                Some(128 * 1024 * 1024),
+            ),
             3
+        );
+    }
+
+    #[test]
+    fn scoped_cooldown_stays_local_to_the_request_shape() {
+        let settings = EngineSettings::default();
+        let scope_key = "post|https://example.com/wrapper".to_string();
+        let mut profile = HostProfile::default();
+
+        apply_host_telemetry(
+            &mut profile,
+            &HostTelemetryArgs {
+                host: "example.com".to_string(),
+                scope_key: Some(scope_key.clone()),
+                attempted_connections: Some(8),
+                sustained_gain_bytes_per_second: None,
+                throughput_bytes_per_second: Some(48 * 1024 * 1024),
+                ttfb_ms: Some(80),
+                negotiated_protocol: Some("h2".to_string()),
+                connection_reused: Some(true),
+                throttle_event: true,
+                timeout_event: false,
+                reset_event: false,
+                range_validation_failed: false,
+            },
+        );
+
+        assert!(profile.cooldown_until.is_none());
+        let scope = profile
+            .probe_scopes
+            .get(&scope_key)
+            .unwrap_or_else(|| unreachable!());
+        assert!(scope.cooldown_until.is_some());
+        assert_eq!(
+            super::effective_connection_target_for_scope(
+                8,
+                &settings,
+                Some(&profile),
+                Some(&scope_key),
+            ),
+            4,
+        );
+        assert_eq!(
+            super::effective_connection_target_for_scope(
+                8,
+                &settings,
+                Some(&profile),
+                Some("get|https://example.com/direct"),
+            ),
+            8,
+        );
+    }
+
+    #[test]
+    fn warm_start_prefers_scope_telemetry_over_a_slow_host_default() {
+        let settings = EngineSettings::default();
+        let scope_key = "get|https://example.com/direct".to_string();
+        let profile = HostProfile {
+            telemetry_samples: 8,
+            average_throughput_bytes_per_second: Some(2 * 1024 * 1024),
+            probe_scopes: std::collections::BTreeMap::from([(
+                scope_key.clone(),
+                ProbeScopeCache {
+                    telemetry_samples: 8,
+                    average_throughput_bytes_per_second: Some(160 * 1024 * 1024),
+                    ..ProbeScopeCache::default()
+                },
+            )]),
+            ..HostProfile::default()
+        };
+
+        assert_eq!(
+            initial_target_connections_for_scope(
+                8,
+                &settings,
+                Some(&profile),
+                None,
+                Some(128 * 1024 * 1024),
+            ),
+            1,
+        );
+        assert_eq!(
+            initial_target_connections_for_scope(
+                8,
+                &settings,
+                Some(&profile),
+                Some(&scope_key),
+                Some(128 * 1024 * 1024),
+            ),
+            3,
         );
     }
 
@@ -706,6 +1123,7 @@ mod tests {
                 &mut profile,
                 &HostTelemetryArgs {
                     host: "example.com".to_string(),
+                    scope_key: None,
                     attempted_connections: Some(4),
                     sustained_gain_bytes_per_second: None,
                     throughput_bytes_per_second: Some(8 * 1024 * 1024),
@@ -735,10 +1153,16 @@ mod tests {
         };
 
         assert!(
-            initial_target_connections(8, &fast_settings, None, Some(128 * 1024 * 1024))
-                > initial_target_connections(
+            initial_target_connections_for_scope(
+                8,
+                &fast_settings,
+                None,
+                None,
+                Some(128 * 1024 * 1024),
+            ) > initial_target_connections_for_scope(
                     8,
                     &conservative_settings,
+                    None,
                     None,
                     Some(128 * 1024 * 1024)
                 )
@@ -760,6 +1184,7 @@ mod tests {
                 &mut profile,
                 &HostTelemetryArgs {
                     host: "example.com".to_string(),
+                    scope_key: None,
                     attempted_connections: Some(8),
                     sustained_gain_bytes_per_second: Some(2 * 1024 * 1024),
                     throughput_bytes_per_second: Some(600 * 1024 * 1024),
@@ -787,6 +1212,7 @@ mod tests {
             &mut profile,
             &HostTelemetryArgs {
                 host: "example.com".to_string(),
+                scope_key: None,
                 attempted_connections: Some(8),
                 sustained_gain_bytes_per_second: None,
                 throughput_bytes_per_second: Some(60 * 1024 * 1024),
@@ -827,6 +1253,7 @@ mod tests {
             &mut profile,
             &HostTelemetryArgs {
                 host: "example.com".to_string(),
+                scope_key: None,
                 attempted_connections: Some(8),
                 sustained_gain_bytes_per_second: None,
                 throughput_bytes_per_second: Some(240 * 1024 * 1024),
@@ -870,15 +1297,80 @@ mod tests {
         };
 
         assert_eq!(
-            initial_target_connections(
+            initial_target_connections_for_scope(
                 8,
                 &EngineSettings::default(),
                 Some(&profile),
+                None,
                 Some(128 * 1024 * 1024)
             ),
             3
         );
-        assert_eq!(super::profile_warning(Some(&profile)), None);
+        assert_eq!(super::profile_warning_for_scope(Some(&profile), None), None);
+    }
+
+    #[test]
+    fn stale_ramp_lock_does_not_limit_warm_start_or_warning() {
+        let stale = super::unix_epoch_millis()
+            .saturating_sub(super::RAMP_NO_GAIN_LOCK_WINDOW_MS + 1);
+        let profile = HostProfile {
+            concurrency_locked: true,
+            locked_connections: Some(1),
+            lock_reason: Some("ramp-no-gain".to_string()),
+            last_telemetry_at: Some(stale),
+            ..HostProfile::default()
+        };
+
+        assert_eq!(
+            initial_target_connections_for_scope(
+                8,
+                &EngineSettings::default(),
+                Some(&profile),
+                None,
+                Some(128 * 1024 * 1024)
+            ),
+            3
+        );
+        assert_eq!(super::profile_warning_for_scope(Some(&profile), None), None);
+        assert!(!super::host_diagnostics_summary_for_scope(Some(&profile), None).concurrency_locked);
+    }
+
+    #[test]
+    fn stale_ramp_lock_is_cleared_when_fresh_telemetry_arrives() {
+        let stale = super::unix_epoch_millis()
+            .saturating_sub(super::RAMP_NO_GAIN_LOCK_WINDOW_MS + 1);
+        let mut profile = HostProfile {
+            ramp_attempts_without_gain: NO_GAIN_LOCK_ATTEMPTS,
+            concurrency_locked: true,
+            locked_connections: Some(2),
+            lock_reason: Some("ramp-no-gain".to_string()),
+            last_telemetry_at: Some(stale),
+            ..HostProfile::default()
+        };
+
+        apply_host_telemetry(
+            &mut profile,
+            &HostTelemetryArgs {
+                host: "example.com".to_string(),
+                scope_key: None,
+                attempted_connections: Some(2),
+                sustained_gain_bytes_per_second: None,
+                throughput_bytes_per_second: Some(24 * 1024 * 1024),
+                ttfb_ms: None,
+                negotiated_protocol: None,
+                connection_reused: None,
+                throttle_event: false,
+                timeout_event: false,
+                reset_event: false,
+                range_validation_failed: false,
+            },
+        );
+
+        assert_eq!(profile.ramp_attempts_without_gain, 0);
+        assert!(!profile.concurrency_locked);
+        assert_eq!(profile.locked_connections, None);
+        assert_eq!(profile.lock_reason, None);
+        assert!(profile.last_telemetry_at.is_some());
     }
 
     #[test]
@@ -890,6 +1382,7 @@ mod tests {
             &mut profile,
             &HostTelemetryArgs {
                 host: "example.com".to_string(),
+                scope_key: None,
                 attempted_connections: Some(6),
                 sustained_gain_bytes_per_second: None,
                 throughput_bytes_per_second: Some(24 * 1024 * 1024),
@@ -906,6 +1399,7 @@ mod tests {
         assert_eq!(profile.range_supported, Some(false));
         assert_eq!(profile.resumable, Some(false));
         assert!(profile.hard_no_range);
+        assert_eq!(profile.negotiated_protocol.as_deref(), Some("http2"));
         assert_eq!(effective_connection_target(8, &settings, Some(&profile)), 8);
     }
 }

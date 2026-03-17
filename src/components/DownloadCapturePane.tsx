@@ -1,14 +1,14 @@
-import { useEffect } from "react";
 import * as Label from "@radix-ui/react-label";
 import * as Select from "@radix-ui/react-select";
-import { downloadDir } from "@tauri-apps/api/path";
 import { AlertTriangle, Check, ChevronDown, FolderOpen, Loader2, X } from "lucide-react";
+import { InlineNotice } from "@/components/ui/inline-notice";
 import { formatBytes } from "@/lib/format";
 import { formatCooldownLabel, hostLockLabel } from "@/lib/downloadPresentation";
+import { getVisibleProbeWarnings, simplifyUserMessage } from "@/lib/userFacingMessages";
 import { cn } from "@/lib/utils";
 import type { DownloadContentCategory, DownloadProbe } from "@/types/download";
 
-export const DOWNLOAD_CAPTURE_CATEGORIES: Array<{
+const DOWNLOAD_CAPTURE_CATEGORIES: Array<{
 	value: DownloadContentCategory;
 	label: string;
 }> = [
@@ -21,59 +21,6 @@ export const DOWNLOAD_CAPTURE_CATEGORIES: Array<{
 ];
 
 const PROBE_BYTE_FORMAT = { unknownLabel: "Unknown", integerAbove: 100 } as const;
-
-export function getCaptureErrorMessage(error: unknown): string {
-	if (error instanceof Error && error.message) {
-		return error.message;
-	}
-
-	if (typeof error === "string" && error.trim()) {
-		return error;
-	}
-
-	return "The operation failed before VDM could explain why.";
-}
-
-export function guessCaptureCategory(
-	mime: string | null,
-	name: string,
-): DownloadContentCategory {
-	const ext = name.split(".").pop()?.toLowerCase() ?? "";
-	if (["zip", "rar", "7z", "tar", "gz", "bz2", "xz"].includes(ext)) return "compressed";
-	if (["exe", "msi", "dmg", "pkg", "deb", "rpm", "apk"].includes(ext)) return "programs";
-	if (["mp4", "mkv", "mov", "avi", "webm", "m4v"].includes(ext)) return "videos";
-	if (["mp3", "flac", "wav", "ogg", "m4a", "aac"].includes(ext)) return "music";
-	if (["jpg", "jpeg", "png", "gif", "bmp", "webp"].includes(ext)) return "pictures";
-	if (mime?.startsWith("video/")) return "videos";
-	if (mime?.startsWith("audio/")) return "music";
-	if (mime?.startsWith("image/")) return "pictures";
-	return "documents";
-}
-
-export function useDefaultCaptureSavePath(
-	active: boolean,
-	savePath: string,
-	onChange: (path: string) => void,
-) {
-	useEffect(() => {
-		if (!active || savePath.trim()) {
-			return;
-		}
-
-		let cancelled = false;
-		void downloadDir()
-			.then((path) => {
-				if (!cancelled) {
-					onChange(path);
-				}
-			})
-			.catch(() => null);
-
-		return () => {
-			cancelled = true;
-		};
-	}, [active, onChange, savePath]);
-}
 
 export function DialogFormField({
 	label,
@@ -222,7 +169,9 @@ function CapabilityBadge({ probe }: { probe: DownloadProbe }) {
 				"inline-flex items-center rounded px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-wide",
 				probe.segmented || probe.resumable
 					? "bg-[hsl(var(--status-downloading)/0.14)] text-[hsl(var(--status-downloading))]"
-					: "bg-[hsl(var(--status-queued)/0.12)] text-[hsl(var(--status-queued))]",
+					: probe.rangeSupported
+						? "bg-[hsl(var(--status-paused)/0.14)] text-[hsl(var(--status-paused))]"
+						: "bg-[hsl(var(--status-error)/0.12)] text-[hsl(var(--status-error)/0.80)]",
 			)}
 		>
 			{label}
@@ -243,7 +192,7 @@ function MetaBadge({
 				"inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium tracking-wide",
 				tone === "good" && "bg-[hsl(var(--status-downloading)/0.12)] text-[hsl(var(--status-downloading))]",
 				tone === "warn" && "bg-[hsl(var(--status-paused)/0.14)] text-[hsl(var(--status-paused))]",
-				tone === "neutral" && "bg-white/[0.05] text-muted-foreground/52",
+				tone === "neutral" && "bg-white/[0.08] text-foreground/65",
 			)}
 		>
 			{label}
@@ -274,9 +223,9 @@ function isGuardedProbeWarning(message: string): boolean {
 
 function conciseProbeWarning(message: string): string {
 	if (isGuardedProbeWarning(message)) {
-		return "Guarded mode keeps this transfer single-stream until byte-range support is proven for this exact request replay.";
+		return "VDM is keeping this transfer on one connection until resume support is proven for this exact request.";
 	}
-	return message;
+	return simplifyUserMessage(message);
 }
 
 function probeMetaBadges(probe: DownloadProbe): Array<{
@@ -284,29 +233,20 @@ function probeMetaBadges(probe: DownloadProbe): Array<{
 	tone: "neutral" | "good" | "warn";
 }> {
 	const rows: Array<{ label: string; tone: "neutral" | "good" | "warn" }> = [];
-	const probeSource = detectProbeSource(probe.warnings);
-	if (probeSource === "live") {
-		rows.push({ label: "Probe: live", tone: "good" });
-	} else if (probeSource === "cached") {
-		rows.push({ label: "Probe: cached", tone: "neutral" });
-	} else if (probeSource === "fallback") {
+	// Only show fallback probe source — live/cached are internal implementation details
+	if (detectProbeSource(probe.warnings) === "fallback") {
 		rows.push({ label: "Probe: fallback", tone: "warn" });
-	}
-	if (probe.warnings.some((warning) => isGuardedProbeWarning(warning))) {
-		rows.push({ label: "Guarded replay", tone: "warn" });
 	}
 	if (probe.compatibility.directUrlRecovered) {
 		rows.push({ label: "Wrapper recovered", tone: "good" });
 	} else if (probe.compatibility.browserInterstitialOnly) {
 		rows.push({ label: "Browser interstitial", tone: "warn" });
 	}
-	if (probe.compatibility.requestReferer) {
-		rows.push({ label: "Wrapper referer", tone: "neutral" });
-	}
-	if (probe.availableSpace !== null) {
+	// Only show free-space badge when space is actually insufficient
+	if (probe.availableSpace !== null && probe.size !== null && probe.availableSpace < probe.size) {
 		rows.push({
-			label: `${formatBytes(probe.availableSpace, PROBE_BYTE_FORMAT)} free`,
-			tone: probe.size !== null && probe.availableSpace < probe.size ? "warn" : "neutral",
+			label: `${formatBytes(probe.availableSpace, PROBE_BYTE_FORMAT)} free – may not fit`,
+			tone: "warn",
 		});
 	}
 	if (probe.hostDiagnostics.hardNoRange || !probe.rangeSupported) {
@@ -319,29 +259,7 @@ function probeMetaBadges(probe: DownloadProbe): Array<{
 	if (probe.hostDiagnostics.concurrencyLocked) {
 		rows.push({ label: hostLockLabel(probe.hostDiagnostics.lockReason), tone: "warn" });
 	}
-	if (probe.hostDiagnostics.negotiatedProtocol) {
-		rows.push({ label: probe.hostDiagnostics.negotiatedProtocol.toUpperCase(), tone: "neutral" });
-	}
-	if (probe.hostDiagnostics.reuseConnections !== null) {
-		rows.push({
-			label: probe.hostDiagnostics.reuseConnections ? "Keep-alive reuse" : "Fresh sockets",
-			tone: probe.hostDiagnostics.reuseConnections ? "good" : "neutral",
-		});
-	}
-	return rows.slice(0, 5);
-}
-
-function isInternalProbeWarning(message: string): boolean {
-	const lower = message.toLowerCase();
-	return (
-		lower.includes("host capability cache") ||
-		lower.includes("probe failed") ||
-		lower.includes("network probe unavailable") ||
-		lower.includes("probe request failed") ||
-		lower.includes("probe metadata source:") ||
-		lower.includes("planning with local hints") ||
-		lower.includes("planning.")
-	);
+	return rows.slice(0, 4);
 }
 
 export function ProbeSummaryStrip({
@@ -357,11 +275,9 @@ export function ProbeSummaryStrip({
 		return null;
 	}
 
-	const visibleWarnings = (probe?.warnings ?? [])
-		.filter((warning) => !isInternalProbeWarning(warning))
-		.map(conciseProbeWarning)
-		.slice(0, 2);
+	const visibleWarnings = getVisibleProbeWarnings(probe?.warnings ?? [], 2).map(conciseProbeWarning);
 	const metaBadges = probe ? probeMetaBadges(probe) : [];
+	const simplifiedError = error ? simplifyUserMessage(error) : null;
 
 	return (
 		<div
@@ -377,10 +293,10 @@ export function ProbeSummaryStrip({
 					<Loader2 size={11} className="animate-spin text-muted-foreground/35" />
 					<span>Detecting…</span>
 				</div>
-			) : error ? (
-				<div className="flex items-center gap-1.5 text-[11.5px] text-[hsl(var(--status-error))]">
+			) : simplifiedError ? (
+				<div className="flex items-center gap-1.5 text-[11.5px] text-[hsl(var(--status-error))]" title={error ?? undefined}>
 					<AlertTriangle size={11} className="shrink-0" />
-					<span>{error}</span>
+					<span>{simplifiedError}</span>
 				</div>
 			) : probe ? (
 				<div className="flex flex-col gap-1.5">
@@ -388,12 +304,12 @@ export function ProbeSummaryStrip({
 						<div className="flex items-center gap-2 min-w-0">
 							<CapabilityBadge probe={probe} />
 							{probe.size !== null ? (
-								<span className="text-[11px] text-muted-foreground/50 tabular-nums shrink-0">
+								<span className="text-[11px] text-foreground/55 tabular-nums shrink-0">
 									{formatBytes(probe.size, PROBE_BYTE_FORMAT)}
 								</span>
 							) : null}
 							{probe.host ? (
-								<span className="text-[10.5px] text-muted-foreground/32 max-w-[140px] truncate">
+								<span className="text-[10.5px] text-foreground/55 max-w-[150px] truncate font-medium">
 									{probe.host}
 								</span>
 							) : null}
@@ -450,6 +366,8 @@ interface DownloadCapturePaneProps {
 	sizeLabel?: string | null;
 	warningMessage?: string | null;
 	errorMessage?: string | null;
+	onWarningDismiss?: () => void;
+	onErrorDismiss?: () => void;
 	duplicateActions?: DuplicateActions;
 	hideWarningWhenDuplicate?: boolean;
 	filenameResetVisible?: boolean;
@@ -474,6 +392,8 @@ export function DownloadCapturePane({
 	sizeLabel,
 	warningMessage,
 	errorMessage,
+	onWarningDismiss,
+	onErrorDismiss,
 	duplicateActions,
 	hideWarningWhenDuplicate = false,
 	filenameResetVisible = false,
@@ -485,6 +405,8 @@ export function DownloadCapturePane({
 		savePath: variant === "compact" ? "capture-savepath" : "download-savepath",
 		filename: variant === "compact" ? "capture-filename" : "download-filename",
 	};
+	const resolvedWarningMessage = warningMessage ? simplifyUserMessage(warningMessage) : null;
+	const resolvedErrorMessage = errorMessage ? simplifyUserMessage(errorMessage) : null;
 
 	if (variant === "dialog") {
 		return (
@@ -542,17 +464,20 @@ export function DownloadCapturePane({
 					</DialogFormField>
 				</div>
 
-				{errorMessage ? (
-					<div className="rounded-md border border-[hsl(var(--status-error)/0.26)] bg-[hsl(var(--status-error)/0.08)] px-3 py-2 text-[11.5px] text-[hsl(var(--status-error))]">
-						{errorMessage}
-					</div>
+				{resolvedErrorMessage ? (
+					<InlineNotice
+						tone="error"
+						message={resolvedErrorMessage}
+						onDismiss={onErrorDismiss}
+						className="text-[11.5px]"
+					/>
 				) : null}
 			</>
 		);
 	}
 
 	const duplicateActive = duplicateActions?.active ?? false;
-	const showWarning = Boolean(warningMessage) && !(duplicateActive && hideWarningWhenDuplicate);
+	const showWarning = Boolean(resolvedWarningMessage) && !(duplicateActive && hideWarningWhenDuplicate);
 
 	return (
 		<>
@@ -607,10 +532,12 @@ export function DownloadCapturePane({
 			</div>
 
 			{showWarning ? (
-				<div className="flex items-start gap-1.5 rounded-[3px] border border-yellow-500/20 bg-yellow-500/5 px-2 py-1.5">
-					<AlertTriangle size={10} className="mt-px shrink-0 text-yellow-500/65" />
-					<span className="text-[10.5px] text-yellow-500/75 leading-relaxed">{warningMessage}</span>
-				</div>
+				<InlineNotice
+					tone="warning"
+					message={resolvedWarningMessage}
+					onDismiss={onWarningDismiss}
+					className="rounded-[3px] px-2 py-1.5 text-[10.5px]"
+				/>
 			) : null}
 
 			{duplicateActive ? (
@@ -639,8 +566,13 @@ export function DownloadCapturePane({
 				</div>
 			) : null}
 
-			{errorMessage && !duplicateActive ? (
-				<div className="text-[10.5px] text-[hsl(var(--status-error))] leading-relaxed">{errorMessage}</div>
+			{resolvedErrorMessage && !duplicateActive ? (
+				<InlineNotice
+					tone="error"
+					message={resolvedErrorMessage}
+					onDismiss={onErrorDismiss}
+					className="rounded-[3px] px-2 py-1.5 text-[10.5px]"
+				/>
 			) : null}
 		</>
 	);

@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+          components: clippy, rustfmt
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Validate workspace
+        run: bun run validate
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tauriScript: bun run tauri
+          tagName: v__VERSION__
+          releaseName: Velocity Download Manager v__VERSION__
+          releaseBody: |
+            Windows release for Velocity Download Manager.
+
+            Install the NSIS .exe bundle for first-time setup.
+            The attached latest.json metadata is used by the in-app updater.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: --bundles nsis

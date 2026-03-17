@@ -45,7 +45,8 @@ use download_identity::{
 };
 use engine_log::append_download_log;
 use file_ops::{
-    finalize_download_file, open_in_file_manager, query_available_space, reset_temp_file_path,
+    acquire_temp_transfer_lock, finalize_download_file, open_in_file_manager,
+    query_available_space, reset_temp_file_path,
 };
 use helpers::{
     clear_download_terminal_state, format_bytes_compact, next_queue_position, non_empty,
@@ -53,8 +54,10 @@ use helpers::{
     reset_download_transient_state, unix_epoch_millis,
 };
 use host_planner::{
-    apply_host_telemetry, effective_connection_target, host_diagnostics_summary,
-    initial_target_connections, profile_warning,
+    apply_host_telemetry, effective_average_throughput_bytes_per_second,
+    effective_average_ttfb_ms, effective_connection_target,
+    effective_connection_target_for_scope, host_diagnostics_summary_for_scope,
+    initial_target_connections_for_scope, profile_warning_for_scope,
 };
 use integrity::{
     apply_integrity_result, compute_checksum, mark_integrity_failure, mark_integrity_verifying,
@@ -62,7 +65,7 @@ use integrity::{
 };
 use persistence::{load_registry_snapshot, snapshot_path};
 use persistence_queue::{PersistPriority, SnapshotPersistQueue};
-use probe::probe_download_headers_with_context;
+use probe::{normalize_protocol_label, probe_download_headers_with_context};
 use probe_cache::{
     append_probe_cache_warning, apply_scope_range_validation_failure,
     cached_probe_to_download_probe, fresh_probe_capabilities, fresh_recent_probe,
@@ -72,7 +75,7 @@ use probe_cache::{
 use runtime_state::clear_runtime_checkpoint;
 use runtime_dispatch::{plan_runtime_dispatch, RuntimeDispatchPlan};
 use runtime_transfer::TokenBucketRateLimiter;
-use segmentation::compute_segments;
+use segmentation::{compute_segments_with_hints, SegmentPlanningHints};
 use settings_policy::sanitize_engine_settings;
 use wake_lock::WakeLockController;
 
@@ -92,10 +95,13 @@ const DOWNLOAD_REMOVE_EVENT: &str = "downloads://remove";
 const DOWNLOAD_PROGRESS_DIFF_EVENT: &str = "downloads://progress-diff";
 const DOWNLOAD_COMPLETED_EVENT: &str = "downloads://completed";
 const ENGINE_BOOTSTRAP_EVENT: &str = "engine://bootstrap";
+const ENGINE_SETTINGS_EVENT: &str = "engine://settings";
 const TRAFFIC_MODE_LOW_BUFFER_BYTES: usize = 512 * 1024;
 const TRAFFIC_MODE_MEDIUM_BUFFER_BYTES: usize = 1024 * 1024;
 const TRAFFIC_MODE_HIGH_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 const TRAFFIC_MODE_MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const RUNTIME_CHUNK_BUFFER_FLOOR_BYTES: usize = 256 * 1024;
+const RUNTIME_CHUNK_BUFFER_CEILING_BYTES: usize = 8 * 1024 * 1024;
 const RATE_LIMITER_MIN_BURST_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone)]
@@ -162,6 +168,7 @@ pub struct DownloadDetailSnapshot {
 struct BootstrapRuntimeState {
     ready: bool,
     error: Option<String>,
+    running: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -252,32 +259,36 @@ fn apply_host_feedback_to_registry(
     }
 }
 
+pub(super) fn download_scope_key(download: &DownloadRecord) -> String {
+    probe_scope_key(
+        &download.url,
+        &download.compatibility.request_method,
+        &download.compatibility.request_form_fields,
+    )
+}
+
 pub(super) fn apply_download_host_profile(
     download: &mut DownloadRecord,
     settings: &EngineSettings,
     host_profile: Option<&HostProfile>,
 ) {
-    download.host_average_ttfb_ms = host_profile.and_then(|profile| profile.average_ttfb_ms);
+    let scope_key = download_scope_key(download);
+    download.host_average_ttfb_ms = effective_average_ttfb_ms(host_profile, Some(&scope_key));
     download.host_average_throughput_bytes_per_second =
-        host_profile.and_then(|profile| profile.average_throughput_bytes_per_second);
+        effective_average_throughput_bytes_per_second(host_profile, Some(&scope_key));
     download.host_max_connections = host_profile.and_then(|profile| profile.max_connections);
     download.host_cooldown_until = host_profile.and_then(|profile| profile.cooldown_until);
     let now = unix_epoch_millis();
-    let scope_key = probe_scope_key(
-        &download.url,
-        &download.compatibility.request_method,
-        &download.compatibility.request_form_fields,
-    );
     let hard_no_range = scoped_hard_no_range(host_profile, &scope_key, now);
     if hard_no_range && !has_live_transfer_state(download) {
         download.capabilities.range_supported = false;
         download.capabilities.resumable = false;
         download.capabilities.segmented = false;
     }
-    if let Some(protocol) = host_profile.and_then(|profile| profile.negotiated_protocol.clone()) {
-        download.host_protocol = Some(protocol);
+    if let Some(protocol) = host_profile.and_then(|profile| profile.negotiated_protocol.as_deref()) {
+        download.host_protocol = Some(normalize_protocol_label(protocol).to_string());
     }
-    download.host_diagnostics = host_diagnostics_summary(host_profile);
+    download.host_diagnostics = host_diagnostics_summary_for_scope(host_profile, Some(&scope_key));
     download.host_diagnostics.hard_no_range = hard_no_range;
     if download.host_diagnostics.lock_reason.is_none()
         && scoped_probe_failures(host_profile, &scope_key, now) > 0
@@ -287,7 +298,8 @@ pub(super) fn apply_download_host_profile(
     let requested = download
         .custom_max_connections
         .unwrap_or(settings.default_max_connections);
-    download.max_connections = effective_connection_target(requested, settings, host_profile);
+    download.max_connections =
+        effective_connection_target_for_scope(requested, settings, host_profile, Some(&scope_key));
     download.target_connections = reconcile_download_target_connections(
         download,
         settings,
@@ -332,17 +344,64 @@ fn host_token_bucket_rate(profile: Option<&HostProfile>) -> Option<u64> {
     Some(adapted)
 }
 
+pub(super) fn effective_download_speed_limit(
+    download: &DownloadRecord,
+    settings: &EngineSettings,
+) -> Option<u64> {
+    download
+        .speed_limit_bytes_per_second
+        .filter(|value| *value > 0)
+        .or(settings.speed_limit_bytes_per_second.filter(|value| *value > 0))
+}
+
 fn planned_download_size(size: i64) -> Option<u64> {
     u64::try_from(size).ok().filter(|value| *value > 0)
 }
 
-pub(super) fn runtime_chunk_buffer_size(traffic_mode: &TrafficMode) -> usize {
+pub(super) fn runtime_chunk_buffer_size_with_pressure(
+    traffic_mode: &TrafficMode,
+    throughput_bytes_per_second: u64,
+    queue_utilization_percent: usize,
+) -> usize {
+    let base = runtime_chunk_buffer_base_size(traffic_mode);
+    let floor = runtime_chunk_buffer_floor(base);
+    let ceiling = runtime_chunk_buffer_ceiling(base);
+
+    if throughput_bytes_per_second == 0 {
+        return base.clamp(floor, ceiling);
+    }
+
+    let target_window_ms = match queue_utilization_percent {
+        85..=100 => 16_u64,
+        70..=84 => 24_u64,
+        55..=69 => 40_u64,
+        0..=34 => 72_u64,
+        _ => 56_u64,
+    };
+    let target = throughput_bytes_per_second
+        .saturating_mul(target_window_ms)
+        .div_ceil(1_000);
+    usize::try_from(target)
+        .unwrap_or(usize::MAX)
+        .clamp(floor, ceiling)
+}
+
+fn runtime_chunk_buffer_base_size(traffic_mode: &TrafficMode) -> usize {
     match traffic_mode {
         TrafficMode::Low => TRAFFIC_MODE_LOW_BUFFER_BYTES,
         TrafficMode::Medium => TRAFFIC_MODE_MEDIUM_BUFFER_BYTES,
         TrafficMode::High => TRAFFIC_MODE_HIGH_BUFFER_BYTES,
         TrafficMode::Max => TRAFFIC_MODE_MAX_BUFFER_BYTES,
     }
+}
+
+fn runtime_chunk_buffer_floor(base: usize) -> usize {
+    base.saturating_div(4).max(RUNTIME_CHUNK_BUFFER_FLOOR_BYTES)
+}
+
+fn runtime_chunk_buffer_ceiling(base: usize) -> usize {
+    base.saturating_mul(2)
+        .clamp(runtime_chunk_buffer_floor(base), RUNTIME_CHUNK_BUFFER_CEILING_BYTES)
 }
 
 pub(super) fn compatibility_request_context_supports_segmented_transfer(
@@ -382,10 +441,12 @@ pub(super) fn reconcile_download_target_connections(
             .min(effective_max_connections);
     }
 
-    initial_target_connections(
+    let scope_key = download_scope_key(download);
+    initial_target_connections_for_scope(
         effective_max_connections,
         settings,
         host_profile,
+        Some(&scope_key),
         planned_download_size(download.size),
     )
 }
@@ -401,13 +462,20 @@ fn should_use_segmented_mode(download: &DownloadRecord) -> bool {
 fn build_segment_plan(
     size: u64,
     target_connections: u32,
-    min_segment_size_bytes: u64,
+    settings: &EngineSettings,
+    throughput_hint_bytes_per_second: Option<u64>,
+    ttfb_hint_ms: Option<u64>,
 ) -> Vec<DownloadSegment> {
-    compute_segments(
+    compute_segments_with_hints(
         size,
         target_connections.max(1),
-        min_segment_size_bytes.max(1),
+        settings.min_segment_size_bytes.max(1),
         RUNTIME_SEGMENT_RETRY_BUDGET,
+        SegmentPlanningHints {
+            throughput_bytes_per_second: throughput_hint_bytes_per_second,
+            ttfb_ms: ttfb_hint_ms,
+            target_chunk_time_seconds: settings.target_chunk_time_seconds,
+        },
     )
 }
 
@@ -431,7 +499,9 @@ pub(super) fn ensure_segment_plan(download: &mut DownloadRecord, settings: &Engi
     download.segments = build_segment_plan(
         size,
         download.target_connections,
-        settings.min_segment_size_bytes,
+        settings,
+        download.host_average_throughput_bytes_per_second,
+        download.host_average_ttfb_ms,
     );
 }
 
@@ -521,6 +591,26 @@ impl EngineState {
     }
 
     pub fn spawn_bootstrap(&self) {
+        let bootstrap_state = match self.inner.bootstrap.lock() {
+            Ok(mut bootstrap) => {
+                if bootstrap.running {
+                    return;
+                }
+                bootstrap.ready = false;
+                bootstrap.error = None;
+                bootstrap.running = true;
+                EngineBootstrapState {
+                    ready: false,
+                    error: None,
+                }
+            }
+            Err(_) => {
+                return;
+            }
+        };
+
+        let _ = self.inner.app.emit(ENGINE_BOOTSTRAP_EVENT, bootstrap_state);
+
         let engine = self.clone();
         tauri::async_runtime::spawn(async move {
             let snapshot_path = engine.inner.snapshot_path.clone();
@@ -567,33 +657,43 @@ impl EngineState {
         let mut bootstrap_error = None;
         match snapshot {
             Ok(snapshot) => {
-                if let Ok(mut registry) = self.inner.registry.lock() {
-                    *registry = snapshot;
-                } else {
-                    bootstrap_error =
-                        Some("Engine state lock was poisoned during bootstrap.".to_string());
+                match self.inner.registry.lock() {
+                    Ok(mut registry) => {
+                        *registry = snapshot;
+                    }
+                    Err(_) => {
+                        bootstrap_error = Some(
+                            "Engine state lock was poisoned during bootstrap.".to_string(),
+                        );
+                    }
                 }
             }
             Err(error) => bootstrap_error = Some(error),
         }
 
-        let state = if let Ok(mut bootstrap) = self.inner.bootstrap.lock() {
-            bootstrap.ready = true;
-            bootstrap.error = bootstrap_error.clone();
-            EngineBootstrapState {
-                ready: bootstrap.ready,
-                error: bootstrap.error.clone(),
+        let state = match self.inner.bootstrap.lock() {
+            Ok(mut bootstrap) => {
+                bootstrap.ready = true;
+                bootstrap.error = bootstrap_error.clone();
+                bootstrap.running = false;
+                EngineBootstrapState {
+                    ready: bootstrap.ready,
+                    error: bootstrap.error.clone(),
+                }
             }
-        } else {
-            EngineBootstrapState {
+            Err(_) => EngineBootstrapState {
                 ready: true,
-                error: bootstrap_error
-                    .or_else(|| Some("Engine bootstrap state lock was poisoned.".to_string())),
+                error: bootstrap_error.or_else(|| {
+                    Some("Engine bootstrap state lock was poisoned.".to_string())
+                }),
             }
         };
 
         self.inner.bootstrap_notify.notify_waiters();
         let _ = self.inner.app.emit(ENGINE_BOOTSTRAP_EVENT, state);
+        if let Ok(registry) = self.inner.registry.lock() {
+            self.emit_engine_settings(&registry.settings);
+        }
     }
 
     fn registry_guard(&self) -> Result<MutexGuard<'_, RegistrySnapshot>, String> {
@@ -689,11 +789,10 @@ impl EngineState {
     ) {
         let rate = rate_bytes_per_second.unwrap_or(0);
         let burst = token_bucket_burst_bytes(rate);
-        if let Ok(limiters) = self.inner.download_limiters.lock() {
-            if let Some(existing) = limiters.get(download_id) {
+        if let Ok(limiters) = self.inner.download_limiters.lock()
+            && let Some(existing) = limiters.get(download_id) {
                 existing.reconfigure(rate, burst);
             }
-        }
     }
 
     fn clear_download_rate_limiter(&self, download_id: &str) {
@@ -713,6 +812,10 @@ impl EngineState {
         let _ = self.inner.app.emit(DOWNLOAD_UPSERT_EVENT, download);
         let row = Self::compact_download_for_row(download);
         let _ = self.inner.app.emit(DOWNLOAD_UPSERT_ROW_EVENT, row);
+    }
+
+    fn emit_engine_settings(&self, settings: &EngineSettings) {
+        let _ = self.inner.app.emit(ENGINE_SETTINGS_EVENT, settings);
     }
 
     fn emit_download_progress_diff_if_due(&self, download: &DownloadRecord, min_interval_ms: u32) {
@@ -998,19 +1101,17 @@ impl EngineState {
     }
 
     fn abort_integrity_task(&self, id: &str) {
-        if let Ok(mut tasks) = self.inner.integrity_tasks.lock() {
-            if let Some(handle) = tasks.remove(id) {
+        if let Ok(mut tasks) = self.inner.integrity_tasks.lock()
+            && let Some(handle) = tasks.remove(id) {
                 handle.abort();
             }
-        }
     }
 
     fn abort_runtime_task(&self, id: &str) {
-        if let Ok(mut tasks) = self.inner.runtime_tasks.lock() {
-            if let Some(handle) = tasks.remove(id) {
+        if let Ok(mut tasks) = self.inner.runtime_tasks.lock()
+            && let Some(handle) = tasks.remove(id) {
                 handle.abort();
             }
-        }
     }
 
     fn abort_all_runtime_tasks(&self) {
@@ -1022,11 +1123,10 @@ impl EngineState {
     }
 
     fn spawn_checksum_verification(&self, id: String) {
-        if let Ok(tasks) = self.inner.integrity_tasks.lock() {
-            if tasks.contains_key(&id) {
+        if let Ok(tasks) = self.inner.integrity_tasks.lock()
+            && tasks.contains_key(&id) {
                 return;
             }
-        }
 
         let engine = self.clone();
         let task_id = id.clone();
@@ -1036,17 +1136,21 @@ impl EngineState {
                 tasks.remove(&task_id);
             }
         });
-        if let Ok(mut tasks) = self.inner.integrity_tasks.lock() {
-            tasks.insert(id, handle);
+        match self.inner.integrity_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks.insert(id, handle);
+            }
+            Err(_) => {
+                drop(handle);
+            }
         }
     }
 
     fn spawn_download_runtime(&self, id: String) {
-        if let Ok(tasks) = self.inner.runtime_tasks.lock() {
-            if tasks.contains_key(&id) {
+        if let Ok(tasks) = self.inner.runtime_tasks.lock()
+            && tasks.contains_key(&id) {
                 return;
             }
-        }
         let engine = self.clone();
         let task_id = id.clone();
         let handle = tokio::spawn(async move {
@@ -1058,8 +1162,13 @@ impl EngineState {
             }
             engine.clear_download_rate_limiter(&task_id);
         });
-        if let Ok(mut tasks) = self.inner.runtime_tasks.lock() {
-            tasks.insert(id, handle);
+        match self.inner.runtime_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks.insert(id, handle);
+            }
+            Err(_) => {
+                drop(handle);
+            }
         }
     }
 }
@@ -1140,6 +1249,7 @@ mod tests {
         };
         let payload = HostTelemetryArgs {
             host: "cdn.example.test".to_string(),
+            scope_key: None,
             attempted_connections: Some(6),
             sustained_gain_bytes_per_second: Some(3 * 1024 * 1024),
             throughput_bytes_per_second: Some(64 * 1024 * 1024),
@@ -1159,7 +1269,7 @@ mod tests {
             .get("cdn.example.test")
             .unwrap_or_else(|| unreachable!());
         assert_eq!(profile.average_ttfb_ms, Some(42));
-        assert_eq!(profile.negotiated_protocol.as_deref(), Some("h2"));
+        assert_eq!(profile.negotiated_protocol.as_deref(), Some("http2"));
 
         let mut updated = registry
             .downloads
@@ -1169,8 +1279,8 @@ mod tests {
         let second = updated.next().unwrap_or_else(|| unreachable!());
         assert_eq!(first.host_average_ttfb_ms, Some(42));
         assert_eq!(second.host_average_ttfb_ms, Some(42));
-        assert_eq!(first.host_protocol.as_deref(), Some("h2"));
-        assert_eq!(second.host_protocol.as_deref(), Some("h2"));
+        assert_eq!(first.host_protocol.as_deref(), Some("http2"));
+        assert_eq!(second.host_protocol.as_deref(), Some("http2"));
 
         let untouched = registry
             .downloads
@@ -1220,6 +1330,7 @@ mod tests {
             "cdn.example.test",
             &HostTelemetryArgs {
                 host: "cdn.example.test".to_string(),
+                scope_key: None,
                 attempted_connections: Some(8),
                 sustained_gain_bytes_per_second: None,
                 throughput_bytes_per_second: Some(48 * 1024 * 1024),
