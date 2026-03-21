@@ -28,7 +28,7 @@ export function TitleBar({ onSearch }: { onSearch?: (q: string) => void }) {
         <img
           src="/veloicon.ico"
           alt="Velocity DM"
-          className="mr-2 h-[18px] w-[18px] shrink-0 object-contain select-none pointer-events-none"
+          className="mr-2 h-[22px] w-[22px] shrink-0 object-contain select-none pointer-events-none"
         />
         {MENU_ITEMS.map((item) => (
           <button

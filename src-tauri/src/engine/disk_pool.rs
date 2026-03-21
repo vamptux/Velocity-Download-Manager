@@ -2,7 +2,6 @@ use std::fs::File;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tokio::sync::mpsc;
 
 use crate::engine::disk::write_at_offset;
 
@@ -27,7 +26,7 @@ pub struct WriteBlock {
 }
 
 pub struct DiskPool {
-    sender: mpsc::Sender<WriteBlock>,
+    sender: flume::Sender<WriteBlock>,
     capacity: usize,
     queue_depth: Arc<AtomicUsize>,
     pending_writes: Arc<AtomicUsize>,
@@ -36,8 +35,7 @@ pub struct DiskPool {
 
 impl DiskPool {
     pub fn new(capacity: usize) -> Self {
-        let (sender, receiver) = mpsc::channel::<WriteBlock>(capacity);
-        let receiver = Arc::new(Mutex::new(receiver));
+        let (sender, receiver) = flume::bounded::<WriteBlock>(capacity);
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let pending_writes = Arc::new(AtomicUsize::new(0));
         let write_error = Arc::new(Mutex::new(None));
@@ -46,18 +44,14 @@ impl DiskPool {
             .unwrap_or(2);
 
         for worker_index in 0..worker_count {
-            let receiver = Arc::clone(&receiver);
+            let receiver = receiver.clone();
             let depth = Arc::clone(&queue_depth);
             let pending = Arc::clone(&pending_writes);
             let write_error = Arc::clone(&write_error);
             thread::Builder::new()
                 .name(format!("disk-io-worker-{worker_index}"))
                 .spawn(move || loop {
-                    let next_block = {
-                        let mut receiver = receiver.lock().expect("disk receiver poisoned");
-                        receiver.blocking_recv()
-                    };
-                    let Some(block) = next_block else {
+                    let Ok(block) = receiver.recv() else {
                         break;
                     };
                     depth.fetch_sub(1, Ordering::Relaxed);
@@ -121,10 +115,10 @@ impl DiskPool {
     pub async fn enqueue_write(
         &self,
         block: WriteBlock,
-    ) -> Result<(), mpsc::error::SendError<WriteBlock>> {
+    ) -> Result<(), flume::SendError<WriteBlock>> {
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
         self.pending_writes.fetch_add(1, Ordering::Relaxed);
-        let result = self.sender.send(block).await;
+        let result = self.sender.send_async(block).await;
         if result.is_err() {
             self.queue_depth.fetch_sub(1, Ordering::Relaxed);
             self.pending_writes.fetch_sub(1, Ordering::Relaxed);
