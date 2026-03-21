@@ -2,8 +2,8 @@ use crate::engine::segmentation::{pending_segment, split_segment};
 use crate::model::{DownloadSegment, DownloadSegmentStatus};
 use std::collections::BTreeMap;
 
-const STEAL_MIN_DONOR_AGE_MS_FLOOR: u64 = 250;
-const STEAL_MIN_DONOR_AGE_MS_CEILING: u64 = 1_500;
+const STEAL_MIN_DONOR_AGE_MS_FLOOR: u64 = 150;
+const STEAL_MIN_DONOR_AGE_MS_CEILING: u64 = 1_000;
 const STEAL_MIN_ETA_GAIN_PERCENT: u64 = 10;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
