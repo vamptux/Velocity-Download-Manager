@@ -12,17 +12,18 @@
   "app": {
     "withGlobalTauri": false,
     "windows": [
-      {
-        "label": "main",
-        "title": "Velocity Download Manager",
-        "width": 1060,
-        "height": 540,
-        "minWidth": 820,
-        "minHeight": 430,
-        "decorations": false,
-        "center": true
-      }
-    ],
+        {
+          "label": "main",
+          "title": "Velocity Download Manager",
+          "width": 1060,
+          "height": 540,
+          "minWidth": 820,
+          "minHeight": 430,
+          "decorations": false,
+          "transparent": true,
+          "center": true
+        }
+      ],
     "security": {
       "csp": null
     }

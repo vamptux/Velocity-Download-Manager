@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, X, Search, Maximize2 } from "lucide-react";
-
-const MENU_ITEMS = ["File", "Tasks", "Tools", "Help"] as const;
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { readText } from "@tauri-apps/plugin-clipboard-manager";
 
 function tauriWindow() {
   try {
@@ -12,11 +12,42 @@ function tauriWindow() {
   }
 }
 
-export function TitleBar({ onSearch }: { onSearch?: (q: string) => void }) {
+interface TitleBarProps {
+  onSearch?: (q: string) => void;
+  onNewDownload?: (url?: string) => void;
+  onOpenSettings?: () => void;
+  onStartQueue?: () => void;
+  onStopQueue?: () => void;
+  onBatchDownload?: () => void;
+  queueRunning?: boolean;
+}
+
+export function TitleBar({ 
+  onSearch,
+  onNewDownload,
+  onOpenSettings,
+  onStartQueue,
+  onStopQueue,
+  onBatchDownload,
+  queueRunning
+}: TitleBarProps) {
   const [search, setSearch] = useState("");
   const minimize = async () => tauriWindow()?.minimize();
   const maximize = async () => tauriWindow()?.toggleMaximize();
   const close = async () => tauriWindow()?.close();
+
+  const handlePasteAndAdd = async () => {
+    try {
+      const text = await readText();
+      if (text && onNewDownload) {
+        onNewDownload(text);
+      }
+    } catch (err) {
+      console.error("Failed to read clipboard:", err);
+    }
+  };
+
+  const itemClass = "relative flex cursor-default select-none items-center rounded-sm px-2 py-1.5 text-xs outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 transition-colors";
 
   return (
     <header
@@ -24,20 +55,82 @@ export function TitleBar({ onSearch }: { onSearch?: (q: string) => void }) {
       className="flex h-9 shrink-0 items-center border-b border-border/60 select-none"
       style={{ background: "hsl(var(--toolbar))" }}
     >
-      <div className="flex items-center pl-2.5">
+      <div className="flex items-center pl-2.5 z-50">
         <img
           src="/veloicon.ico"
           alt="Velocity DM"
           className="mr-2 h-[20px] w-[20px] shrink-0 object-contain select-none pointer-events-none"
         />
-        {MENU_ITEMS.map((item) => (
-          <button
-            key={item}
-            className="h-9 px-2.5 text-[11px] text-muted-foreground/55 hover:bg-white/[0.055] hover:text-foreground/85 transition-colors"
-          >
-            {item}
-          </button>
-        ))}
+        
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <button className="h-9 px-2.5 text-[11px] text-muted-foreground/55 hover:bg-white/[0.055] hover:text-foreground/85 transition-colors data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85 outline-none">
+              File
+            </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content className="z-50 min-w-[180px] overflow-hidden rounded-md border bg-popover/90 backdrop-blur-md p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2" sideOffset={0} align="start">
+              <DropdownMenu.Item className={itemClass} onClick={() => onNewDownload?.()}>
+                New Download...
+              </DropdownMenu.Item>
+              <DropdownMenu.Item className={itemClass} onClick={handlePasteAndAdd}>
+                Paste Link from Clipboard
+              </DropdownMenu.Item>
+              <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border/50" />
+              <DropdownMenu.Item className={itemClass} onClick={close}>
+                Exit
+              </DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
+
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <button className="h-9 px-2.5 text-[11px] text-muted-foreground/55 hover:bg-white/[0.055] hover:text-foreground/85 transition-colors data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85 outline-none">
+              Tasks
+            </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content className="z-50 min-w-[180px] overflow-hidden rounded-md border bg-popover/90 backdrop-blur-md p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2" sideOffset={0} align="start">
+              <DropdownMenu.Item className={itemClass} onClick={() => queueRunning ? onStopQueue?.() : onStartQueue?.()}>
+                {queueRunning ? "Stop Main Queue" : "Start Main Queue"}
+              </DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
+
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <button className="h-9 px-2.5 text-[11px] text-muted-foreground/55 hover:bg-white/[0.055] hover:text-foreground/85 transition-colors data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85 outline-none">
+              Tools
+            </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content className="z-50 min-w-[180px] overflow-hidden rounded-md border bg-popover/90 backdrop-blur-md p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2" sideOffset={0} align="start">
+              <DropdownMenu.Item className={itemClass} onClick={() => onOpenSettings?.()}>
+                Settings
+              </DropdownMenu.Item>
+              <DropdownMenu.Item className={itemClass} onClick={() => onBatchDownload?.()}>
+                Batch Download
+              </DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
+
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <button className="h-9 px-2.5 text-[11px] text-muted-foreground/55 hover:bg-white/[0.055] hover:text-foreground/85 transition-colors data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85 outline-none">
+              Help
+            </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content className="z-50 min-w-[180px] overflow-hidden rounded-md border bg-popover/90 backdrop-blur-md p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2" sideOffset={0} align="start">
+              <DropdownMenu.Item className={itemClass} onClick={() => window.open("https://github.com/vamptux/Velocity-Download-Manager", "_blank")}>
+                GitHub Repository
+              </DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
       </div>
 
       <div data-tauri-drag-region className="flex flex-1 items-center justify-center gap-2">

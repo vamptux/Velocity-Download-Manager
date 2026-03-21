@@ -223,6 +223,7 @@ fn take_pending_capture_payload() -> Option<capture_bridge::CapturePayload> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
@@ -246,6 +247,18 @@ pub fn run() {
             engine.spawn_bootstrap();
             // Start the browser-extension capture bridge.
             capture_bridge::spawn_capture_server(app_handle, capture_bridge_state);
+
+            #[cfg(target_os = "windows")]
+            {
+                use window_vibrancy::{apply_mica, apply_acrylic};
+                if let Some(window) = app.get_webview_window("main") {
+                    // Try mica first, fallback to acrylic if unsupported
+                    if apply_mica(&window, Some(true)).is_err() {
+                        let _ = apply_acrylic(&window, Some((18, 18, 18, 125)));
+                    }
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

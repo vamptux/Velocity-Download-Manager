@@ -328,6 +328,9 @@ const NewDownloadDialog = lazy(() =>
 const DeleteConfirmationDialog = lazy(() =>
   import("@/components/DeleteConfirmationDialog").then((module) => ({ default: module.DeleteConfirmationDialog })),
 );
+const BatchDownloadDialog = lazy(() =>
+  import("@/components/BatchDownloadDialog").then((module) => ({ default: module.BatchDownloadDialog })),
+);
 
 function warmDeferredUi() {
   void import("@/components/DownloadDetailsPanel");
@@ -340,6 +343,7 @@ export function App() {
   const [activeCategory, setActiveCategory] = useState<SidebarCategory>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [newDownloadOpen, setNewDownloadOpen] = useState(false);
+  const [batchDownloadOpen, setBatchDownloadOpen] = useState(false);
   const [newDownloadPrefillUrl, setNewDownloadPrefillUrl] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [downloads, setDownloads] = useState<Download[]>([]);
@@ -1254,7 +1258,18 @@ export function App() {
   return (
     <TooltipProvider delayDuration={400}>
       <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
-        <TitleBar onSearch={setSearchQuery} />
+        <TitleBar 
+          onSearch={setSearchQuery} 
+          onNewDownload={openNewDownload}
+          onOpenSettings={() => {
+            setSettingsError(null);
+            setSettingsOpen(true);
+          }}
+          onBatchDownload={() => setBatchDownloadOpen(true)}
+          onStartQueue={() => void handleStartQueue()}
+          onStopQueue={() => void handleStopQueue()}
+          queueRunning={queueState.running}
+        />
         <div id="vdm-content" className="flex flex-1 overflow-hidden">
           <Sidebar activeCategory={activeCategory} onCategoryChange={setActiveCategory} downloads={downloads} />
           <main className="flex flex-1 flex-col overflow-hidden">
@@ -1355,6 +1370,22 @@ export function App() {
               upsertDownload(download);
               setNewDownloadPrefillUrl("");
               setSelectedIds(new Set([download.id]));
+            }}
+          />
+        </Suspense>
+      ) : null}
+      {batchDownloadOpen ? (
+        <Suspense fallback={null}>
+          <BatchDownloadDialog
+            open={batchDownloadOpen}
+            onOpenChange={setBatchDownloadOpen}
+            onDownloadsAdded={(addedDownloads) => {
+              for (const download of addedDownloads) {
+                upsertDownload(download);
+              }
+              if (addedDownloads.length > 0) {
+                setSelectedIds(new Set([addedDownloads[addedDownloads.length - 1].id]));
+              }
             }}
           />
         </Suspense>
