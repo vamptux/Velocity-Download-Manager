@@ -1,9 +1,0 @@
--  Keep the codebase clean, modern, efficient, and organized.
-- ensure there arent monolothic code file sizes, for example 2k+, if needed segment the file structure a bit to make it production level and easy to scale. for example transfer.rs, segment.rs etc (or better)
--  Prefer clear module boundaries over quick hacks.
--  Ensure Production Level Code-Notes, dont over-note and bog down the codebase.
--  If test files are made, delete them on success
--  Enforce linting and static analysis before merge. (clippy, oxlint, etc)
--  Keep performance regressions visible and measurable.
--  Document major architectural decisions in short notes.
--  No unstable shortcuts that hurt long-term maintainability.

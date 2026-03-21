@@ -198,21 +198,6 @@ export function Sidebar({ activeCategory, onCategoryChange, downloads }: Sidebar
         )}
       </nav>
 
-      <div className="shrink-0 border-t border-border/30 px-3 py-2.5 flex items-center gap-2">
-        <div
-          className="flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[3px]"
-          style={{ background: "linear-gradient(135deg, hsl(var(--accent-h) 25% 38%), hsl(var(--accent-h) 18% 26%))" }}
-        >
-          <svg width="8" height="8" viewBox="0 0 12 12" fill="none">
-            <path d="M2 2L7 6L2 10" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
-            <path d="M7 6H11" stroke="white" strokeWidth="2.2" strokeLinecap="round"/>
-          </svg>
-        </div>
-        <span className="text-[9.5px] font-medium tracking-wide text-muted-foreground/28 select-none">
-          Velocity <span className="text-[hsl(var(--primary)/0.5)]">DM</span>
-        </span>
-      </div>
-
       {/* Right-edge resize handle – drag to resize sidebar width, snaps to default */}
       <div
         role="separator"

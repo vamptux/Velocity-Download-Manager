@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Minus, X, ArrowDownToLine, Search, Maximize2 } from "lucide-react";
+import { Minus, X, Search, Maximize2 } from "lucide-react";
 
 const MENU_ITEMS = ["File", "Tasks", "Tools", "Help"] as const;
 
@@ -25,12 +25,11 @@ export function TitleBar({ onSearch }: { onSearch?: (q: string) => void }) {
       style={{ background: "hsl(var(--toolbar))" }}
     >
       <div className="flex items-center pl-2.5">
-        <div
-          className="mr-2 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-[4px]"
-          style={{ background: "linear-gradient(135deg, hsl(var(--accent-h) 25% 38%), hsl(var(--accent-h) 18% 24%))" }}
-        >
-          <ArrowDownToLine size={9} className="text-white" strokeWidth={2.5} />
-        </div>
+        <img
+          src="/veloicon.ico"
+          alt="Velocity DM"
+          className="mr-2 h-[18px] w-[18px] shrink-0 object-contain select-none pointer-events-none"
+        />
         {MENU_ITEMS.map((item) => (
           <button
             key={item}
