@@ -162,5 +162,7 @@ fn recommended_parallelism_for_pressure(
 }
 
 fn disk_worker_count_from_parallelism(parallelism: usize) -> usize {
-    (parallelism / 2).clamp(2, 16)
+    // Limit disk workers to 4 to prevent I/O thrashing and severe fragmentation on HDDs,
+    // while still allowing sufficient parallelism for fast NVMe drives.
+    (parallelism / 4).clamp(1, 4)
 }

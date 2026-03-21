@@ -268,12 +268,14 @@ fn adaptive_chunk_buffer_target(
         return base_chunk_buffer_size.clamp(floor, ceiling);
     }
 
+    // When the disk queue is under pressure, increase the buffer size (target_window_ms).
+    // This results in fewer, larger I/O operations, reducing lock contention and I/O thrashing.
     let target_window_ms = match queue_utilization_percent {
-        85..=100 => 16_u64,
-        70..=84 => 24_u64,
-        55..=69 => 40_u64,
-        0..=34 => 72_u64,
-        _ => 56_u64,
+        85..=100 => 128_u64,
+        70..=84 => 96_u64,
+        55..=69 => 64_u64,
+        0..=34 => 32_u64,
+        _ => 48_u64,
     };
     let target = observed_throughput_bytes_per_second
         .saturating_mul(target_window_ms)
