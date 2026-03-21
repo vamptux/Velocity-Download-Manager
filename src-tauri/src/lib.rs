@@ -169,14 +169,13 @@ async fn set_download_checksum(
 #[tauri::command]
 async fn set_download_transfer_options(
     id: String,
-    max_connections: Option<u32>,
     speed_limit_bytes_per_second: Option<u64>,
     app: AppHandle,
     state: State<'_, EngineState>,
 ) -> CommandResult<DownloadRecord> {
     state
         .inner()
-        .set_download_transfer_options(&app, &id, max_connections, speed_limit_bytes_per_second)
+        .set_download_transfer_options(&app, &id, speed_limit_bytes_per_second)
         .await
 }
 

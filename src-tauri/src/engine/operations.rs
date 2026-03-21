@@ -318,7 +318,7 @@ impl EngineState {
         let cached_probe =
             host_profile.and_then(|profile| fresh_probe_capabilities(profile, &scope_key, now));
         let effective_connections = effective_connection_target_for_scope(
-            registry.settings.default_max_connections,
+            16,
             &registry.settings,
             host_profile,
             Some(&scope_key),
@@ -502,7 +502,7 @@ impl EngineState {
         let cached_probe =
             host_profile.and_then(|profile| fresh_probe_capabilities(profile, &scope_key, now));
         let max_connections = effective_connection_target_for_scope(
-            settings.default_max_connections,
+            16,
             &settings,
             host_profile,
             Some(&scope_key),
@@ -654,7 +654,6 @@ impl EngineState {
             queue_position: next_queue_position(&registry.downloads),
             max_connections,
             host_max_connections: host_profile.and_then(|profile| profile.max_connections),
-            custom_max_connections: None,
             host_cooldown_until: host_profile.and_then(|profile| profile.cooldown_until),
             host_average_ttfb_ms: effective_average_ttfb_ms(host_profile, Some(&scope_key)),
             host_average_throughput_bytes_per_second:
@@ -1062,7 +1061,6 @@ impl EngineState {
         &self,
         _app: &AppHandle,
         id: &str,
-        max_connections: Option<u32>,
         speed_limit_bytes_per_second: Option<u64>,
     ) -> Result<DownloadRecord, String> {
         self.await_bootstrap().await;
@@ -1079,10 +1077,6 @@ impl EngineState {
         let host_profile = registry.host_profiles.get(&host).cloned();
         let download = &mut registry.downloads[download_index];
 
-        let requested_connections = max_connections.unwrap_or(settings.default_max_connections);
-        download.custom_max_connections = max_connections;
-        download.max_connections =
-            effective_connection_target(requested_connections, &settings, host_profile.as_ref());
         apply_download_host_profile(download, &settings, host_profile.as_ref());
         download.speed_limit_bytes_per_second =
             speed_limit_bytes_per_second.filter(|value| *value > 0);

@@ -50,10 +50,10 @@ export function TitleBar({ onSearch }: { onSearch?: (q: string) => void }) {
         </span>
       </div>
 
-      <div className="relative mr-3" data-tauri-drag-region={undefined}>
+      <div className="relative mr-4 flex items-center">
         <Search
-          size={11}
-          className="absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground/30 pointer-events-none"
+          size={12}
+          className="absolute left-2.5 text-muted-foreground/40 pointer-events-none"
         />
         <input
           type="text"
@@ -62,9 +62,17 @@ export function TitleBar({ onSearch }: { onSearch?: (q: string) => void }) {
             setSearch(e.target.value);
             onSearch?.(e.target.value);
           }}
-          placeholder="Search…"
-          className="h-[22px] w-[130px] rounded-[5px] border border-border/35 bg-background/35 pl-[22px] pr-2 text-[11px] text-foreground placeholder:text-muted-foreground/28 outline-none focus:w-[175px] focus:border-primary/50 focus:bg-muted/50 transition-[width,border-color,background-color] duration-150 ease-out"
+          placeholder="Search downloads…"
+          className="h-[24px] w-[140px] rounded-[6px] border border-white/[0.08] bg-black/20 pl-7 pr-2.5 text-[11.5px] text-foreground placeholder:text-muted-foreground/35 outline-none focus:w-[200px] focus:border-primary/50 focus:bg-black/40 transition-all duration-200 ease-out shadow-inner"
         />
+        {search && (
+          <button 
+            onClick={() => { setSearch(""); onSearch?.(""); }}
+            className="absolute right-1.5 flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground/50 hover:bg-white/10 hover:text-foreground transition-colors"
+          >
+            <X size={10} strokeWidth={2.5} />
+          </button>
+        )}
       </div>
 
       <div className="flex items-stretch self-stretch border-l border-white/[0.06]">

@@ -1,20 +1,10 @@
 use crate::model::EngineSettings;
 
-const MAX_CONNECTIONS_LIMIT: u32 = 20;
-const EXPERIMENTAL_MAX_CONNECTIONS_LIMIT: u32 = 64;
 const MAX_ACTIVE_DOWNLOADS_LIMIT: u32 = 10;
 const RUNTIME_CHECKPOINT_MIN_INTERVAL_MS: i64 = 400;
 const RUNTIME_CHECKPOINT_MAX_INTERVAL_MS: i64 = 12_000;
 
 pub(super) fn sanitize_engine_settings(mut settings: EngineSettings) -> EngineSettings {
-    let max_connections_cap = if settings.experimental_uncapped_mode {
-        EXPERIMENTAL_MAX_CONNECTIONS_LIMIT
-    } else {
-        MAX_CONNECTIONS_LIMIT
-    };
-    settings.default_max_connections = settings
-        .default_max_connections
-        .clamp(1, max_connections_cap);
     settings.max_active_downloads = settings
         .max_active_downloads
         .clamp(1, MAX_ACTIVE_DOWNLOADS_LIMIT);

@@ -482,7 +482,6 @@ export function CompactCaptureWindow() {
     try {
       const updated = await ipcSetDownloadTransferOptions(
         monitorDownload.id,
-        monitorDownload.customMaxConnections ?? null,
         parsed.limitBytesPerSecond,
       );
       mergeMonitorDownload(updated);
@@ -506,7 +505,6 @@ export function CompactCaptureWindow() {
     try {
       const updated = await ipcSetDownloadTransferOptions(
         monitorDownload.id,
-        monitorDownload.customMaxConnections ?? null,
         limitBytesPerSecond,
       );
       mergeMonitorDownload(updated);
@@ -528,7 +526,6 @@ export function CompactCaptureWindow() {
     try {
       const updated = await ipcSetDownloadTransferOptions(
         monitorDownload.id,
-        monitorDownload.customMaxConnections ?? null,
         null,
       );
       mergeMonitorDownload(updated);

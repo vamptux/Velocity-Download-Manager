@@ -111,8 +111,6 @@ pub struct DownloadRequestField {
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineSettings {
-    #[serde(default = "default_max_connections")]
-    pub default_max_connections: u32,
     #[serde(default = "default_active_downloads")]
     pub max_active_downloads: u32,
     #[serde(default = "default_target_chunk_time_seconds")]
@@ -144,7 +142,6 @@ pub struct QueueState {
 impl Default for EngineSettings {
     fn default() -> Self {
         Self {
-            default_max_connections: default_max_connections(),
             max_active_downloads: default_active_downloads(),
             target_chunk_time_seconds: default_target_chunk_time_seconds(),
             min_segment_size_bytes: default_min_segment_size_bytes(),
@@ -453,11 +450,9 @@ pub struct DownloadRecord {
     pub queue: String,
     #[serde(default)]
     pub queue_position: u32,
-    #[serde(default = "default_max_connections")]
+    #[serde(default = "default_max_connections_fallback")]
     pub max_connections: u32,
     pub host_max_connections: Option<u32>,
-    #[serde(default)]
-    pub custom_max_connections: Option<u32>,
     pub host_cooldown_until: Option<i64>,
     #[serde(default)]
     pub host_average_ttfb_ms: Option<u64>,
@@ -656,8 +651,8 @@ impl Default for RegistrySnapshot {
     }
 }
 
-fn default_max_connections() -> u32 {
-    8
+fn default_max_connections_fallback() -> u32 {
+    16
 }
 
 fn default_active_downloads() -> u32 {

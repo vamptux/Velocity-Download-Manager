@@ -51,7 +51,6 @@ import type {
 } from "@/types/download";
 
 const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
-  defaultMaxConnections: 8,
   maxActiveDownloads: 3,
   targetChunkTimeSeconds: 2,
   minSegmentSizeBytes: 512 * 1024,

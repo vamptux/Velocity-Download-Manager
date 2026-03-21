@@ -48,10 +48,9 @@ fn dispatch_sort_key(download: &DownloadRecord) -> (u8, u32, i64, String) {
     )
 }
 
-fn requested_connection_cap(download: &DownloadRecord, settings: &EngineSettings) -> u32 {
+fn requested_connection_cap(download: &DownloadRecord, _settings: &EngineSettings) -> u32 {
     download
-        .custom_max_connections
-        .unwrap_or(settings.default_max_connections)
+        .max_connections
         .max(1)
 }
 
@@ -96,7 +95,7 @@ fn rebalance_host_active_targets(
     let requested_connections =
         active_indices
             .iter()
-            .fold(settings.default_max_connections.max(1), |current, index| {
+            .fold(16u32, |current, index| {
                 current.max(requested_connection_cap(
                     &registry.downloads[*index],
                     settings,
@@ -231,7 +230,7 @@ pub(super) fn plan_runtime_dispatch(registry: &mut RegistrySnapshot) -> RuntimeD
         let next_requested = requested_by_host
             .get(&download.host)
             .copied()
-            .unwrap_or(settings.default_max_connections.max(1))
+            .unwrap_or(16u32)
             .max(requested_connection_cap(download, &settings));
         let host_cap = scheduler_host_connection_budget(
             next_requested,

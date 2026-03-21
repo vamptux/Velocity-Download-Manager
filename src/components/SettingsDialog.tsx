@@ -144,7 +144,6 @@ function AccentSwatch({ accent, selected, onClick }: {
     </button>
   );
 }
-const CONNECTION_OPTIONS = [1, 2, 4, 6, 8, 10, 12, 16, 20] as const;
 const ACTIVE_OPTIONS = [1, 2, 3, 4, 5, 6] as const;
 
 const CHECKPOINT_PRESETS = [
@@ -205,16 +204,16 @@ function PillToggle({ checked, onChange }: { checked: boolean; onChange: (v: boo
       aria-checked={checked}
       onClick={() => onChange(!checked)}
       className={cn(
-        "relative h-[22px] w-10 shrink-0 rounded-full border transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+        "relative h-[22px] w-10 shrink-0 rounded-full border shadow-inner transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background",
         checked
-          ? "border-[hsl(var(--primary)/0.45)] bg-[hsl(var(--primary)/0.22)]"
-          : "border-border/60 bg-black/20",
+          ? "border-[hsl(var(--primary)/0.6)] bg-[hsl(var(--primary)/0.3)] shadow-[inset_0_1px_2px_rgba(0,0,0,0.2)]"
+          : "border-border/60 bg-black/30 shadow-[inset_0_1px_2px_rgba(0,0,0,0.15)]",
       )}
     >
       <span
         className={cn(
-          "absolute top-[3px] h-3.5 w-3.5 rounded-full transition-all duration-200",
-          checked ? "left-[19px] bg-[hsl(var(--primary))]" : "left-[3px] bg-muted-foreground/30",
+          "absolute top-[2px] h-4 w-4 rounded-full transition-all duration-200 shadow-[0_1px_2px_rgba(0,0,0,0.25)]",
+          checked ? "left-[19px] bg-[hsl(var(--primary))] shadow-[0_0_8px_hsl(var(--primary)/0.5)]" : "left-[3px] bg-muted-foreground/40",
         )}
       />
     </button>
@@ -452,31 +451,8 @@ export function SettingsDialog({
                 <div className="flex flex-col gap-5">
                   {/* Connections */}
                   <div>
-                    <SectionTitle>Connections</SectionTitle>
+                    <SectionTitle>Queue & Concurrency</SectionTitle>
                     <div className="rounded-md border border-border/40 bg-black/[0.12] p-3.5 flex flex-col gap-4">
-                      <div>
-                        <div className="mb-0.5 text-[12px] font-medium text-foreground/80">Max connections per file</div>
-                        <div className="mb-2.5 text-[10.5px] text-muted-foreground/50">
-                          VDM opens this many parallel HTTP connections per download.
-                        </div>
-                        <div className="grid grid-cols-9 gap-1.5">
-                          {CONNECTION_OPTIONS.map((value) => (
-                            <Chip
-                              key={value}
-                              active={draft.defaultMaxConnections === value}
-                              onClick={() => setDraft((prev) => ({ ...prev, defaultMaxConnections: value }))}
-                            >
-                              {value}
-                            </Chip>
-                          ))}
-                        </div>
-                        {draft.defaultMaxConnections > 8 && (
-                          <div className="mt-2.5 flex items-start gap-2 rounded-md border border-[hsl(var(--status-paused)/0.22)] bg-[hsl(var(--status-paused)/0.07)] px-2.5 py-1.5 text-[11px] text-foreground/70">
-                            <AlertTriangle size={11} strokeWidth={2} className="mt-[1px] shrink-0 text-[hsl(var(--status-paused))]" />
-                            <span>VDM downscales aggressively when a host throttles above 8.</span>
-                          </div>
-                        )}
-                      </div>
                       <div>
                         <div className="mb-0.5 text-[12px] font-medium text-foreground/80">Concurrent downloads</div>
                         <div className="mb-2.5 text-[10.5px] text-muted-foreground/50">

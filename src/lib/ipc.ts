@@ -256,12 +256,10 @@ export async function ipcSetDownloadChecksum(id: string, checksum: ChecksumSpec 
 
 export async function ipcSetDownloadTransferOptions(
   id: string,
-  maxConnections: number | null,
   speedLimitBytesPerSecond: number | null,
 ): Promise<Download> {
   const raw = await invoke<RawDownload>("set_download_transfer_options", {
     id,
-    maxConnections,
     speedLimitBytesPerSecond,
   });
   return fromRawDownload(raw);

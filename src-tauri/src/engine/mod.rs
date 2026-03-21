@@ -58,8 +58,7 @@ use helpers::{
 };
 use host_planner::{
     apply_host_telemetry, effective_average_throughput_bytes_per_second,
-    effective_average_ttfb_ms, effective_connection_target,
-    effective_connection_target_for_scope, host_diagnostics_summary_for_scope,
+    effective_average_ttfb_ms, effective_connection_target_for_scope, host_diagnostics_summary_for_scope,
     initial_target_connections_for_scope, profile_warning_for_scope,
 };
 use integrity::{
@@ -298,9 +297,7 @@ pub(super) fn apply_download_host_profile(
     {
         download.host_diagnostics.lock_reason = Some("probe-failures".to_string());
     }
-    let requested = download
-        .custom_max_connections
-        .unwrap_or(settings.default_max_connections);
+    let requested = 16;
     download.max_connections =
         effective_connection_target_for_scope(requested, settings, host_profile, Some(&scope_key));
     download.target_connections = reconcile_download_target_connections(
