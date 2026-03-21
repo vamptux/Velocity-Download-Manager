@@ -10,7 +10,7 @@ pub(super) struct RuntimeErrorResolution {
     pub(super) range_validation_failed: bool,
 }
 
-fn push_unique_diagnostic(values: &mut Vec<String>, message: impl Into<String>) {
+pub(super) fn push_unique_diagnostic(values: &mut Vec<String>, message: impl Into<String>) {
     let message = message.into();
     if !values.iter().any(|value| value == &message) {
         values.push(message);
