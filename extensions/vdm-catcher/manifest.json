@@ -26,13 +26,20 @@
     "https://*/*"
   ],
   "background": {
+    "scripts": ["background/service-worker.js"],
     "service_worker": "background/service-worker.js",
     "type": "module"
   },
   "content_scripts": [
     {
-      "matches": ["http://*/*", "https://*/*"],
-      "js": ["shared/download-rules.js", "content/interceptor.js"],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "shared/download-rules.js",
+        "content/interceptor.js"
+      ],
       "run_at": "document_start",
       "all_frames": false
     }
@@ -48,5 +55,11 @@
     }
   },
   "options_page": "options/options.html",
-  "minimum_chrome_version": "102"
+  "minimum_chrome_version": "102",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "catcher@velocitydownloadmanager.com",
+      "strict_min_version": "109.0"
+    }
+  }
 }
