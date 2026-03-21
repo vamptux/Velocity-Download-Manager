@@ -227,6 +227,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // Clean up old update files to prevent infinite size growth
+            if let Ok(path) = app.path().app_local_data_dir() {
+                let updates_dir = path.join("updates");
+                if updates_dir.exists() {
+                    let _ = std::fs::remove_dir_all(&updates_dir);
+                }
+            }
+
             let app_handle = app.handle().clone();
             let engine = EngineState::new(app_handle.clone());
             let capture_bridge_state = capture_bridge::initialize_capture_bridge_state(&app_handle)

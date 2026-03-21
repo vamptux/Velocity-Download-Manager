@@ -883,11 +883,14 @@ impl EngineState {
         self.abort_integrity_task(id);
         let mut registry = self.registry_guard()?;
 
-        if delete_file
-            && let Some(download) = registry.downloads.iter().find(|d| d.id == id) {
+        if let Some(download) = registry.downloads.iter().find(|d| d.id == id) {
+            if delete_file || download.status != DownloadStatus::Finished {
                 let _ = std::fs::remove_file(&download.temp_path);
+            }
+            if delete_file {
                 let _ = std::fs::remove_file(&download.target_path);
             }
+        }
 
         let starting_len = registry.downloads.len();
         registry.downloads.retain(|download| download.id != id);
