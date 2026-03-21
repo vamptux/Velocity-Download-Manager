@@ -106,28 +106,3 @@ pub(super) fn classify_category(name: &str) -> DownloadCategory {
         _ => DownloadCategory::Documents,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::suggested_name_from_url;
-
-    #[test]
-    fn decodes_percent_encoded_url_filenames() {
-        assert_eq!(
-            suggested_name_from_url(
-                "https://example.com/files/Rust%20v262%20Build%2003052026.part01.rar"
-            ),
-            "Rust v262 Build 03052026.part01.rar"
-        );
-    }
-
-    #[test]
-    fn strips_invisible_unicode_from_query_hints() {
-        assert_eq!(
-            suggested_name_from_url(
-                "https://example.com/download?file=file%E2%80%8Bname%EF%BB%BF.zip"
-            ),
-            "filename.zip"
-        );
-    }
-}

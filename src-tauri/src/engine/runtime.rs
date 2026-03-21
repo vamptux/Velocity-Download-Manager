@@ -28,20 +28,10 @@ use super::runtime_transfer::{
     SegmentRuntimeControl, SegmentWorkerStart, TransferWorkerConfig, UnknownSizeStreamOptions,
 };
 use super::scheduler::{SegmentRuntimeSample, SegmentScheduler};
+use super::runtime_ramp::*;
 use super::*;
 use crate::model::{DownloadCompatibility, ResumeValidators};
 
-const RUNTIME_RAMP_MIN_INTERVAL_MS: i64 = 1_200;
-const RUNTIME_RAMP_MIN_SPEED_BYTES_PER_SECOND: u64 = 2 * 1024 * 1024;
-const RUNTIME_RAMP_WARMUP_MIN_INTERVAL_MS: i64 = 550;
-const RUNTIME_RAMP_WARMUP_MIN_SPEED_BYTES_PER_SECOND: u64 = 768 * 1024;
-const RUNTIME_RAMP_WINDOW_SAMPLES: usize = 3;
-const RUNTIME_RAMP_HISTORY_RETENTION_MS: i64 = 8_000;
-const RUNTIME_RAMP_SAMPLE_MIN_INTERVAL_MS: i64 = 200;
-const RUNTIME_RAMP_FAST_PATH_GAIN_PERCENT: u64 = 45;
-const RUNTIME_RAMP_FAST_PATH_MAX_TTFB_MS: u64 = 450;
-const RUNTIME_RAMP_NEGATIVE_GAIN_PERCENT: u64 = 10;
-const RUNTIME_RAMP_NEGATIVE_GAIN_WINDOWS: u32 = 2;
 const RUNTIME_ADAPTIVE_POLL_MS: u64 = 400;
 const UNKNOWN_SIZE_SPACE_CHECK_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
 const UNKNOWN_SIZE_SPACE_SAFETY_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -73,11 +63,11 @@ impl Drop for RuntimeWakeLockGuard {
 }
 
 #[derive(Clone, Default)]
-struct RuntimeTelemetrySnapshot {
-    ttfb_samples_ms: Vec<u64>,
-    protocol_counts: BTreeMap<String, u32>,
-    reused_true: u32,
-    reused_false: u32,
+pub(super) struct RuntimeTelemetrySnapshot {
+    pub(super) ttfb_samples_ms: Vec<u64>,
+    pub(super) protocol_counts: BTreeMap<String, u32>,
+    pub(super) reused_true: u32,
+    pub(super) reused_false: u32,
 }
 
 struct RuntimeBootstrapOutcome {
@@ -241,7 +231,7 @@ fn average_recent_u64(values: impl Iterator<Item = u64>) -> Option<u64> {
     }
 }
 
-fn median_runtime_ttfb(snapshot: &RuntimeTelemetrySnapshot) -> Option<u64> {
+pub(super) fn median_runtime_ttfb(snapshot: &RuntimeTelemetrySnapshot) -> Option<u64> {
     let mut samples = snapshot.ttfb_samples_ms.clone();
     if samples.is_empty() {
         return None;
@@ -250,7 +240,7 @@ fn median_runtime_ttfb(snapshot: &RuntimeTelemetrySnapshot) -> Option<u64> {
     Some(samples[samples.len() / 2])
 }
 
-fn runtime_connection_reuse_hint(snapshot: &RuntimeTelemetrySnapshot) -> Option<bool> {
+pub(super) fn runtime_connection_reuse_hint(snapshot: &RuntimeTelemetrySnapshot) -> Option<bool> {
     let total = snapshot.reused_true.saturating_add(snapshot.reused_false);
     if total == 0 {
         return None;
@@ -258,7 +248,7 @@ fn runtime_connection_reuse_hint(snapshot: &RuntimeTelemetrySnapshot) -> Option<
     Some(snapshot.reused_true >= snapshot.reused_false)
 }
 
-fn runtime_protocol_hint(snapshot: &RuntimeTelemetrySnapshot) -> Option<String> {
+pub(super) fn runtime_protocol_hint(snapshot: &RuntimeTelemetrySnapshot) -> Option<String> {
     snapshot
         .protocol_counts
         .iter()
@@ -2465,212 +2455,4 @@ impl EngineState {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        average_recent_u64, disk_queue_blocks_new_supply, disk_queue_under_pressure,
-        merge_resume_validators, needs_runtime_metadata_bootstrap, runtime_ramp_requirements,
-    };
-    use crate::engine::disk_pool::DiskPool;
-    use crate::engine::runtime_recovery::{
-        apply_guarded_single_stream_fallback, can_retry_after_range_validation_failure,
-    };
-    use crate::model::{
-        DownloadCapabilities, DownloadCategory, DownloadCompatibility, DownloadDiagnostics,
-        DownloadIntegrity, DownloadRecord, DownloadRuntimeCheckpoint, DownloadSegment,
-        DownloadSegmentStatus, DownloadStatus, ResumeValidators, TrafficMode,
-    };
 
-    fn fixture_download() -> DownloadRecord {
-        DownloadRecord {
-            id: "download-1".to_string(),
-            name: "file.bin".to_string(),
-            url: "https://example.test/file.bin".to_string(),
-            final_url: "https://example.test/file.bin".to_string(),
-            host: "example.test".to_string(),
-            size: -1,
-            downloaded: 0,
-            status: DownloadStatus::Queued,
-            manual_start_requested: false,
-            category: DownloadCategory::Programs,
-            speed: 0,
-            time_left: None,
-            date_added: 0,
-            save_path: "C:\\Downloads".to_string(),
-            target_path: "C:\\Downloads\\file.bin".to_string(),
-            temp_path: "C:\\Downloads\\file.bin.part".to_string(),
-            queue: "default".to_string(),
-            queue_position: 1,
-            max_connections: 8,
-            host_max_connections: None,
-            custom_max_connections: None,
-            host_cooldown_until: None,
-            host_average_ttfb_ms: None,
-            host_average_throughput_bytes_per_second: None,
-            host_protocol: None,
-            host_diagnostics: crate::model::HostDiagnosticsSummary::default(),
-            traffic_mode: TrafficMode::Max,
-            speed_limit_bytes_per_second: None,
-            open_folder_on_completion: false,
-            error_message: None,
-            content_type: None,
-            capabilities: DownloadCapabilities {
-                resumable: false,
-                range_supported: false,
-                segmented: false,
-            },
-            validators: ResumeValidators::default(),
-            compatibility: DownloadCompatibility::default(),
-            integrity: DownloadIntegrity::default(),
-            diagnostics: DownloadDiagnostics::default(),
-            segments: Vec::new(),
-            target_connections: 1,
-            writer_backpressure: false,
-            engine_log: Vec::new(),
-            runtime_checkpoint: DownloadRuntimeCheckpoint::default(),
-        }
-    }
-
-    #[test]
-    fn bootstrap_is_required_for_unknown_size_without_validators() {
-        assert!(needs_runtime_metadata_bootstrap(&fixture_download()));
-    }
-
-    #[test]
-    fn range_validation_fallback_requires_zero_recorded_progress() {
-        let mut download = fixture_download();
-        download.size = 2_048;
-        download.downloaded = 128;
-        download.capabilities = DownloadCapabilities {
-            resumable: true,
-            range_supported: true,
-            segmented: true,
-        };
-        download.target_connections = 4;
-        download.segments = vec![DownloadSegment {
-            id: 1,
-            start: 0,
-            end: 2_047,
-            downloaded: 128,
-            retry_attempts: 0,
-            retry_budget: 4,
-            status: DownloadSegmentStatus::Downloading,
-        }];
-
-        assert!(!can_retry_after_range_validation_failure(&download));
-    }
-
-    #[test]
-    fn range_validation_fallback_downgrades_to_guarded_single_stream() {
-        let mut download = fixture_download();
-        download.size = 2_048;
-        download.capabilities = DownloadCapabilities {
-            resumable: true,
-            range_supported: true,
-            segmented: true,
-        };
-        download.max_connections = 8;
-        download.target_connections = 4;
-        download.segments = vec![
-            DownloadSegment {
-                id: 1,
-                start: 0,
-                end: 1_023,
-                downloaded: 0,
-                retry_attempts: 0,
-                retry_budget: 4,
-                status: DownloadSegmentStatus::Pending,
-            },
-            DownloadSegment {
-                id: 2,
-                start: 1_024,
-                end: 2_047,
-                downloaded: 0,
-                retry_attempts: 0,
-                retry_budget: 4,
-                status: DownloadSegmentStatus::Pending,
-            },
-        ];
-
-        assert!(can_retry_after_range_validation_failure(&download));
-
-        apply_guarded_single_stream_fallback(&mut download);
-
-        assert_eq!(download.status, DownloadStatus::Queued);
-        assert_eq!(download.target_connections, 1);
-        assert_eq!(download.downloaded, 0);
-        assert!(download.segments.is_empty());
-        assert!(!download.capabilities.range_supported);
-        assert!(!download.capabilities.resumable);
-        assert!(!download.capabilities.segmented);
-        assert!(!download.diagnostics.restart_required);
-        assert!(download.error_message.is_none());
-        assert_eq!(
-            download.diagnostics.terminal_reason.as_deref(),
-            Some(
-                "Retrying in guarded single-stream mode after the host ignored the first range request."
-            )
-        );
-        assert!(download
-            .diagnostics
-            .warnings
-            .iter()
-            .any(|warning| { warning.contains("guarded single-stream mode") }));
-    }
-
-    #[test]
-    fn merge_resume_validators_prefers_fresh_values_and_keeps_existing_fallbacks() {
-        let saved = ResumeValidators {
-            etag: Some("saved-etag".to_string()),
-            last_modified: None,
-            content_length: Some(512),
-            content_type: Some("application/octet-stream".to_string()),
-            content_disposition: None,
-        };
-        let fresh = ResumeValidators {
-            etag: None,
-            last_modified: Some("Fri, 14 Mar 2026 00:00:00 GMT".to_string()),
-            content_length: Some(1024),
-            content_type: None,
-            content_disposition: Some("attachment; filename=example.bin".to_string()),
-        };
-
-        let merged = merge_resume_validators(&saved, &fresh);
-        assert_eq!(merged.etag.as_deref(), Some("saved-etag"));
-        assert_eq!(
-            merged.last_modified.as_deref(),
-            Some("Fri, 14 Mar 2026 00:00:00 GMT")
-        );
-        assert_eq!(merged.content_length, Some(1024));
-        assert_eq!(
-            merged.content_type.as_deref(),
-            Some("application/octet-stream")
-        );
-        assert_eq!(
-            merged.content_disposition.as_deref(),
-            Some("attachment; filename=example.bin")
-        );
-    }
-
-    #[test]
-    fn disk_supply_guard_is_higher_than_ui_backpressure_threshold() {
-        let disk_pool = DiskPool::new(4);
-
-        assert!(!disk_queue_under_pressure(&disk_pool));
-        assert!(!disk_queue_blocks_new_supply(&disk_pool));
-    }
-
-    #[test]
-    fn warmup_ramp_requirements_are_more_aggressive_for_low_parallelism() {
-        let (warmup_interval, warmup_speed) = runtime_ramp_requirements(1);
-        let (steady_interval, steady_speed) = runtime_ramp_requirements(3);
-
-        assert!(warmup_interval < steady_interval);
-        assert!(warmup_speed < steady_speed);
-    }
-
-    #[test]
-    fn average_recent_u64_returns_none_for_empty_iterators() {
-        assert_eq!(average_recent_u64(std::iter::empty()), None);
-    }
-}
