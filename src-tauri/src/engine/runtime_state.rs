@@ -59,14 +59,16 @@ pub(super) fn upsert_runtime_segment_health(
         existing.terminal_failure_reason = terminal_failure_reason;
         return;
     }
-    checkpoint.segment_samples.push(DownloadRuntimeSegmentSample {
-        segment_id,
-        remaining_bytes: 0,
-        eta_seconds: None,
-        throughput_bytes_per_second: None,
-        retry_attempts,
-        terminal_failure_reason,
-    });
+    checkpoint
+        .segment_samples
+        .push(DownloadRuntimeSegmentSample {
+            segment_id,
+            remaining_bytes: 0,
+            eta_seconds: None,
+            throughput_bytes_per_second: None,
+            retry_attempts,
+            terminal_failure_reason,
+        });
 }
 
 pub(super) fn persist_runtime_races(

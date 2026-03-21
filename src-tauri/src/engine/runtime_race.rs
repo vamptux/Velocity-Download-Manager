@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use super::engine_log::append_download_log;
 use super::runtime_state::{
-    persist_runtime_races, resolve_runtime_race, restore_runtime_races, RuntimeRaceState,
+    RuntimeRaceState, persist_runtime_races, resolve_runtime_race, restore_runtime_races,
 };
 use super::scheduler::{SegmentRuntimeSample, SegmentScheduler};
 use crate::model::{DownloadLogLevel, DownloadRecord, DownloadSegment};

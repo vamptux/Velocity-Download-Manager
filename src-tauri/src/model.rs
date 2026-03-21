@@ -593,9 +593,13 @@ pub struct AppUpdateInfo {
 #[serde(rename_all = "camelCase", tag = "event", content = "data")]
 pub enum AppUpdateProgressEvent {
     #[serde(rename_all = "camelCase")]
-    Started { content_length: Option<u64> },
+    Started {
+        content_length: Option<u64>,
+    },
     #[serde(rename_all = "camelCase")]
-    Progress { chunk_length: u64 },
+    Progress {
+        chunk_length: u64,
+    },
     Finished,
 }
 

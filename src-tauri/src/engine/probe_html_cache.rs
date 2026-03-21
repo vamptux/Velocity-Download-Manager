@@ -50,10 +50,11 @@ pub(super) fn cache_html_app_guest_token(api_base_url: &str, token: &str) {
 
 pub(super) fn invalidate_html_app_guest_token(api_base_url: &str) {
     if let Ok(mut cache) = HTML_APP_GUEST_TOKEN_CACHE.lock()
-        && let Some(entry) = cache.get_mut(api_base_url) {
-            entry.token = None;
-            entry.token_expires_at = None;
-        }
+        && let Some(entry) = cache.get_mut(api_base_url)
+    {
+        entry.token = None;
+        entry.token_expires_at = None;
+    }
 }
 
 pub(super) fn record_html_app_api_failure(api_base_url: &str) {

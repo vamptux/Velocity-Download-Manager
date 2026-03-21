@@ -62,7 +62,8 @@ pub async fn install_update(app: &AppHandle) -> Result<AppUpdateInfo, String> {
                 );
             },
             move || {
-                let _ = finished_app.emit(APP_UPDATE_PROGRESS_EVENT, AppUpdateProgressEvent::Finished);
+                let _ =
+                    finished_app.emit(APP_UPDATE_PROGRESS_EVENT, AppUpdateProgressEvent::Finished);
             },
         )
         .await

@@ -1,9 +1,8 @@
 use std::time::{Duration, Instant};
 
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, ACCEPT_RANGES, CACHE_CONTROL,
-    CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, PRAGMA,
-    RANGE,
+    ACCEPT, ACCEPT_LANGUAGE, ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH,
+    CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue, LAST_MODIFIED, PRAGMA, RANGE,
 };
 
 use super::http_helpers::{
@@ -15,8 +14,8 @@ use super::probe_filename::{
     query_response_content_type, resolve_suggested_name,
 };
 use super::probe_html::{
-    is_html_interstitial_response, read_html_resolution_hint, resolve_html_app_api_download_url,
-    urls_match_after_normalization, HtmlFollowUpMethod, HtmlFollowUpRequest, HtmlResolutionHint,
+    HtmlFollowUpMethod, HtmlFollowUpRequest, HtmlResolutionHint, is_html_interstitial_response,
+    read_html_resolution_hint, resolve_html_app_api_download_url, urls_match_after_normalization,
 };
 use crate::model::{
     DownloadCompatibility, DownloadRequestField, DownloadRequestMethod, ResumeValidators,
@@ -25,8 +24,7 @@ use crate::model::{
 const HTTP_REDIRECT_LIMIT: usize = 10;
 const PROBE_TIMEOUT_SECONDS: u64 = 12;
 const PROBE_CONNECT_TIMEOUT_SECONDS: u64 = 6;
-const PROBE_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
+const PROBE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
 const PROBE_PRIMARY_LANGUAGE: &str = "en-US";
 const PROBE_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 const PROBE_DOWNLOAD_ACCEPT: &str = "*/*";
@@ -155,7 +153,9 @@ impl ProbeAttemptState {
     fn ordered_stages(&self) -> [Option<&ProbeStageMetadata>; 3] {
         [
             self.range_stage.as_ref().map(|stage| &stage.metadata),
-            self.standard_get_stage.as_ref().map(|stage| &stage.metadata),
+            self.standard_get_stage
+                .as_ref()
+                .map(|stage| &stage.metadata),
             self.head_stage.as_ref().map(|stage| &stage.metadata),
         ]
     }
@@ -288,7 +288,10 @@ async fn probe_download_headers_internal(
                         request_state.resolved_wrapper_page = true;
                     }
                     if !stage.metadata.html_interstitial
-                        && !urls_match_after_normalization(&request_state.url, &stage.metadata.final_url)
+                        && !urls_match_after_normalization(
+                            &request_state.url,
+                            &stage.metadata.final_url,
+                        )
                     {
                         request_state.retarget_to_direct_download(
                             &stage.metadata.final_url,
@@ -311,11 +314,12 @@ async fn probe_download_headers_internal(
         {
             if request_state.can_resolve_wrapper_hop()
                 && let Some(direct_download_url) = hint.direct_download_url.as_deref()
-                    && !urls_match_after_normalization(&request_state.url, direct_download_url) {
-                        request_state
-                            .retarget_to_direct_download(direct_download_url, hint.request_referer.clone());
-                        continue;
-                    }
+                && !urls_match_after_normalization(&request_state.url, direct_download_url)
+            {
+                request_state
+                    .retarget_to_direct_download(direct_download_url, hint.request_referer.clone());
+                continue;
+            }
 
             let all_stages_html = attempts
                 .ordered_stages()
@@ -325,36 +329,37 @@ async fn probe_download_headers_internal(
             if request_state.can_resolve_wrapper_hop()
                 && all_stages_html
                 && hint.direct_download_url.is_none()
-                && let Some(app_api_hint) = hint.app_api.as_ref() {
-                    let api_resolution_result = resolve_html_app_api_download_url(
-                        client,
-                        &request_state.url,
-                        app_api_hint,
-                        PROBE_USER_AGENT,
-                        PROBE_PRIMARY_LANGUAGE,
-                        PROBE_ACCEPT_LANGUAGE,
-                    )
-                    .await;
-                    if let Err(error) = api_resolution_result {
-                        attempts.app_api_resolution_failure = Some(error);
-                    } else if let Ok(Some(api_resolution)) = api_resolution_result {
-                        let _ = api_resolution.suggested_name.as_deref();
-                        if api_resolution.request_cookies.is_some() {
-                            request_state.cookies = api_resolution.request_cookies.clone();
-                        }
+                && let Some(app_api_hint) = hint.app_api.as_ref()
+            {
+                let api_resolution_result = resolve_html_app_api_download_url(
+                    client,
+                    &request_state.url,
+                    app_api_hint,
+                    PROBE_USER_AGENT,
+                    PROBE_PRIMARY_LANGUAGE,
+                    PROBE_ACCEPT_LANGUAGE,
+                )
+                .await;
+                if let Err(error) = api_resolution_result {
+                    attempts.app_api_resolution_failure = Some(error);
+                } else if let Ok(Some(api_resolution)) = api_resolution_result {
+                    let _ = api_resolution.suggested_name.as_deref();
+                    if api_resolution.request_cookies.is_some() {
+                        request_state.cookies = api_resolution.request_cookies.clone();
+                    }
 
-                        if !urls_match_after_normalization(
-                            &request_state.url,
+                    if !urls_match_after_normalization(
+                        &request_state.url,
+                        &api_resolution.direct_download_url,
+                    ) {
+                        request_state.retarget_to_direct_download(
                             &api_resolution.direct_download_url,
-                        ) {
-                            request_state.retarget_to_direct_download(
-                                &api_resolution.direct_download_url,
-                                hint.request_referer.clone(),
-                            );
-                            continue;
-                        }
+                            hint.request_referer.clone(),
+                        );
+                        continue;
                     }
                 }
+            }
 
             let same_url_wrapper_hint = hint.suggested_name.is_some()
                 || hint
@@ -387,7 +392,8 @@ async fn run_probe_attempts(
     capture_stream: bool,
 ) -> ProbeAttemptState {
     let mut failures = Vec::new();
-    let exact_request_shape_allows_segmentation = request_state.exact_request_shape_allows_segmentation();
+    let exact_request_shape_allows_segmentation =
+        request_state.exact_request_shape_allows_segmentation();
     let head_stage = if exact_request_shape_allows_segmentation {
         match send_probe_request(
             client,
@@ -414,8 +420,7 @@ async fn run_probe_attempts(
         && should_try_range_probe(
             &request_state.url,
             head_stage.as_ref().map(|stage| &stage.metadata),
-        )
-    {
+        ) {
         match send_probe_request(
             client,
             &request_state.url,
@@ -627,8 +632,8 @@ fn finalize_probe_result(
     if !exact_request_shape_allows_segmentation {
         range_observation = RangeObservation::Unknown;
     }
-    let range_supported =
-        matches!(range_observation, RangeObservation::Supported) && exact_request_shape_allows_segmentation;
+    let range_supported = matches!(range_observation, RangeObservation::Supported)
+        && exact_request_shape_allows_segmentation;
     let resumable = range_supported && size.is_some_and(|value| value > 0);
 
     if recovered_wrapper_response {
@@ -677,7 +682,9 @@ fn finalize_probe_result(
     }
 
     if original_url != final_url {
-        warnings.push("Probe redirected to a different final URL during metadata discovery.".to_string());
+        warnings.push(
+            "Probe redirected to a different final URL during metadata discovery.".to_string(),
+        );
     }
 
     RuntimeBootstrapProbe {
@@ -1031,16 +1038,13 @@ pub fn normalize_protocol_label(protocol: &str) -> &'static str {
         || protocol.eq_ignore_ascii_case("h2")
     {
         "http2"
-    } else if protocol.eq_ignore_ascii_case("http1.1")
-        || protocol.eq_ignore_ascii_case("http/1.1")
+    } else if protocol.eq_ignore_ascii_case("http1.1") || protocol.eq_ignore_ascii_case("http/1.1")
     {
         "http1.1"
-    } else if protocol.eq_ignore_ascii_case("http1.0")
-        || protocol.eq_ignore_ascii_case("http/1.0")
+    } else if protocol.eq_ignore_ascii_case("http1.0") || protocol.eq_ignore_ascii_case("http/1.0")
     {
         "http1.0"
-    } else if protocol.eq_ignore_ascii_case("http0.9")
-        || protocol.eq_ignore_ascii_case("http/0.9")
+    } else if protocol.eq_ignore_ascii_case("http0.9") || protocol.eq_ignore_ascii_case("http/0.9")
     {
         "http0.9"
     } else {

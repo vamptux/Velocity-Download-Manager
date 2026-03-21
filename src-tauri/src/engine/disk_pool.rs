@@ -50,17 +50,21 @@ impl DiskPool {
             let write_error = Arc::clone(&write_error);
             thread::Builder::new()
                 .name(format!("disk-io-worker-{worker_index}"))
-                .spawn(move || loop {
-                    let Ok(block) = receiver.recv() else {
-                        break;
-                    };
-                    depth.fetch_sub(1, Ordering::Relaxed);
-                    if let Err(error) = write_at_offset(&block.file, &block.buffer, block.offset)
-                        && let Ok(mut slot) = write_error.lock()
-                            && slot.is_none() {
-                                *slot = Some(error.to_string());
-                            }
-                    pending.fetch_sub(1, Ordering::Relaxed);
+                .spawn(move || {
+                    loop {
+                        let Ok(block) = receiver.recv() else {
+                            break;
+                        };
+                        depth.fetch_sub(1, Ordering::Relaxed);
+                        if let Err(error) =
+                            write_at_offset(&block.file, &block.buffer, block.offset)
+                            && let Ok(mut slot) = write_error.lock()
+                            && slot.is_none()
+                        {
+                            *slot = Some(error.to_string());
+                        }
+                        pending.fetch_sub(1, Ordering::Relaxed);
+                    }
                 })
                 .expect("Failed to spawn IO worker thread");
         }

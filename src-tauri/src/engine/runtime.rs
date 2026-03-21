@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tokio::task::JoinSet;
 
-use super::probe::{probe_runtime_bootstrap_with_client, DownloadProbeData, RangeObservation};
+use super::probe::{DownloadProbeData, RangeObservation, probe_runtime_bootstrap_with_client};
 use super::progress::{
     aggregate_runtime_throughput, estimate_time_left, recompute_download_speed,
     stabilized_segment_throughput,
@@ -16,6 +16,7 @@ use super::runtime_race::{
     attempt_runtime_queue_expansion, resolve_runtime_race_winner,
     restore_runtime_races_from_checkpoint,
 };
+use super::runtime_ramp::*;
 use super::runtime_recovery::{
     classify_runtime_error, reconcile_runtime_error, runtime_control_flow_error,
     runtime_validation_error,
@@ -24,12 +25,11 @@ use super::runtime_state::{
     persist_runtime_races, upsert_runtime_segment_health, upsert_runtime_segment_sample,
 };
 use super::runtime_transfer::{
-    run_segment_worker, InitialResponseStream,
-    SegmentRuntimeControl, SegmentWorkerStart, TransferWorkerConfig,
+    InitialResponseStream, SegmentRuntimeControl, SegmentWorkerStart, TransferWorkerConfig,
+    run_segment_worker,
 };
 use super::runtime_unknown_size::run_unknown_size_stream_runtime;
 use super::scheduler::{SegmentRuntimeSample, SegmentScheduler};
-use super::runtime_ramp::*;
 use super::*;
 use crate::model::{DownloadCompatibility, ResumeValidators};
 
@@ -259,17 +259,20 @@ pub(super) fn runtime_protocol_hint(snapshot: &RuntimeTelemetrySnapshot) -> Opti
 
 fn resume_validators_compatible(saved: &ResumeValidators, fresh: &ResumeValidators) -> bool {
     if let (Some(left), Some(right)) = (&saved.etag, &fresh.etag)
-        && left != right {
-            return false;
-        }
+        && left != right
+    {
+        return false;
+    }
     if let (Some(left), Some(right)) = (&saved.last_modified, &fresh.last_modified)
-        && left != right {
-            return false;
-        }
+        && left != right
+    {
+        return false;
+    }
     if let (Some(left), Some(right)) = (saved.content_length, fresh.content_length)
-        && left != right {
-            return false;
-        }
+        && left != right
+    {
+        return false;
+    }
     true
 }
 
@@ -492,7 +495,10 @@ pub(super) fn disk_queue_blocks_new_supply(disk_pool: &disk_pool::DiskPool) -> b
     disk_pool.blocks_new_supply()
 }
 
-pub(super) fn disk_queue_parallelism_target(disk_pool: &disk_pool::DiskPool, requested_parallelism: u32) -> u32 {
+pub(super) fn disk_queue_parallelism_target(
+    disk_pool: &disk_pool::DiskPool,
+    requested_parallelism: u32,
+) -> u32 {
     disk_pool.recommended_parallelism(requested_parallelism)
 }
 
@@ -522,7 +528,9 @@ pub(super) fn take_disk_pool_error(disk_pool: &disk_pool::DiskPool) -> Result<()
     Ok(())
 }
 
-pub(super) async fn wait_for_disk_pool_drain(disk_pool: &disk_pool::DiskPool) -> Result<(), String> {
+pub(super) async fn wait_for_disk_pool_drain(
+    disk_pool: &disk_pool::DiskPool,
+) -> Result<(), String> {
     let started = std::time::Instant::now();
     loop {
         take_disk_pool_error(disk_pool)?;
@@ -667,7 +675,6 @@ async fn bootstrap_runtime_metadata(
         probe: Some(probe_snapshot),
     })
 }
-
 
 struct RuntimeSupplyAdjustment {
     desired_parallel: usize,
@@ -922,8 +929,7 @@ fn adjust_runtime_segment_supply(
                         scope_key: Some(download_scope_key(download)),
                         attempted_connections: Some(current_target),
                         sustained_gain_bytes_per_second: sustained_gain,
-                        throughput_bytes_per_second: Some(stable_speed)
-                            .filter(|value| *value > 0),
+                        throughput_bytes_per_second: Some(stable_speed).filter(|value| *value > 0),
                         ttfb_ms: stable_ttfb_ms,
                         negotiated_protocol: download.host_protocol.clone(),
                         connection_reused: None,
@@ -1081,8 +1087,8 @@ impl EngineState {
                 Some(probe)
             } else {
                 let probe_target = runtime_probe_target(&runtime_download);
-                match http_pool.get_client(probe_target.url) { Some(client_lease) => {
-                    probe_runtime_bootstrap_with_client(
+                match http_pool.get_client(probe_target.url) {
+                    Some(client_lease) => probe_runtime_bootstrap_with_client(
                         client_lease.client.as_ref(),
                         probe_target.url,
                         probe_target.request_referer,
@@ -1093,33 +1099,33 @@ impl EngineState {
                     )
                     .await
                     .ok()
-                    .map(|bootstrap| bootstrap.probe)
-                } _ => {
-                    None
-                }}
+                    .map(|bootstrap| bootstrap.probe),
+                    _ => None,
+                }
             };
 
             if let Some(probe) = validation_probe
-                && !resume_validators_compatible(&runtime_download.validators, &probe.validators) {
-                    let mut registry = self.registry_guard()?;
-                    if let Some(download) = registry
-                        .downloads
-                        .iter_mut()
-                        .find(|download| download.id == runtime_download.id)
-                    {
-                        reset_download_progress(download);
-                        clear_runtime_checkpoint(download);
-                        ensure_segment_plan(download, &settings);
-                        download.error_message = None;
-                        download.diagnostics.failure_kind = None;
-                        download.diagnostics.terminal_reason =
-                            Some("Resume validators changed; restarting from zero.".to_string());
-                        runtime_download = download.clone();
-                    }
-                    self.persist_registry(&registry)?;
-                    drop(registry);
-                    reset_temp_file_path(&runtime_download.temp_path)?;
+                && !resume_validators_compatible(&runtime_download.validators, &probe.validators)
+            {
+                let mut registry = self.registry_guard()?;
+                if let Some(download) = registry
+                    .downloads
+                    .iter_mut()
+                    .find(|download| download.id == runtime_download.id)
+                {
+                    reset_download_progress(download);
+                    clear_runtime_checkpoint(download);
+                    ensure_segment_plan(download, &settings);
+                    download.error_message = None;
+                    download.diagnostics.failure_kind = None;
+                    download.diagnostics.terminal_reason =
+                        Some("Resume validators changed; restarting from zero.".to_string());
+                    runtime_download = download.clone();
                 }
+                self.persist_registry(&registry)?;
+                drop(registry);
+                reset_temp_file_path(&runtime_download.temp_path)?;
+            }
         }
 
         if requires_unknown_size_restart(&runtime_download) {
@@ -1267,12 +1273,9 @@ impl EngineState {
         }
         let segment_controls: Arc<Mutex<BTreeMap<u32, SegmentRuntimeControl>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
-        let effective_download_limit =
-            effective_download_speed_limit(&runtime_download, &settings);
-        let per_download_limiter = Some(self.download_rate_limiter(
-            &runtime_download.id,
-            effective_download_limit,
-        ));
+        let effective_download_limit = effective_download_speed_limit(&runtime_download, &settings);
+        let per_download_limiter =
+            Some(self.download_rate_limiter(&runtime_download.id, effective_download_limit));
         let per_host_limiter = self.host_rate_limiter(
             &runtime_download.host,
             host_token_bucket_rate(runtime_host_profile.as_ref()),
@@ -1331,7 +1334,10 @@ impl EngineState {
                             .iter_mut()
                             .find(|download| download.id == runtime_download.id)
                         {
-                            persist_runtime_races(&mut download.runtime_checkpoint, &race_by_segment);
+                            persist_runtime_races(
+                                &mut download.runtime_checkpoint,
+                                &race_by_segment,
+                            );
                             append_download_log(
                                 download,
                                 DownloadLogLevel::Warn,
@@ -1347,24 +1353,25 @@ impl EngineState {
                         let _ = self.persist_registry(&registry);
                     }
                 } else if restored_pairs > 0
-                    && let Ok(mut registry) = self.registry_guard() {
-                        if let Some(download) = registry
-                            .downloads
-                            .iter_mut()
-                            .find(|download| download.id == runtime_download.id)
-                        {
-                            append_download_log(
-                                download,
-                                DownloadLogLevel::Info,
-                                "race.restore-active",
-                                format!(
-                                    "Restored {} active race pair(s) from checkpoint recovery.",
-                                    restored_pairs
-                                ),
-                            );
-                        }
-                        let _ = self.persist_registry(&registry);
+                    && let Ok(mut registry) = self.registry_guard()
+                {
+                    if let Some(download) = registry
+                        .downloads
+                        .iter_mut()
+                        .find(|download| download.id == runtime_download.id)
+                    {
+                        append_download_log(
+                            download,
+                            DownloadLogLevel::Info,
+                            "race.restore-active",
+                            format!(
+                                "Restored {} active race pair(s) from checkpoint recovery.",
+                                restored_pairs
+                            ),
+                        );
                     }
+                    let _ = self.persist_registry(&registry);
+                }
             }
             let mut expected_canceled: BTreeMap<u32, ()> = BTreeMap::new();
             let mut runtime_error: Option<String> = None;
@@ -1527,33 +1534,34 @@ impl EngineState {
                                             progress.terminal_failure_reason.clone(),
                                         );
                                         if let Some(telemetry) = progress.telemetry.as_ref()
-                                            && let Ok(mut snapshot) = runtime_telemetry.lock() {
-                                                if let Some(ttfb_ms) =
-                                                    telemetry.ttfb_ms.filter(|value| *value > 0)
-                                                {
-                                                    snapshot.ttfb_samples_ms.push(ttfb_ms);
-                                                }
-                                                if let Some(reused) = telemetry.connection_reused {
-                                                    if reused {
-                                                        snapshot.reused_true =
-                                                            snapshot.reused_true.saturating_add(1);
-                                                    } else {
-                                                        snapshot.reused_false =
-                                                            snapshot.reused_false.saturating_add(1);
-                                                    }
-                                                }
-                                                if let Some(protocol) = telemetry
-                                                    .negotiated_protocol
-                                                    .as_ref()
-                                                    .filter(|value| !value.is_empty())
-                                                {
-                                                    let counter = snapshot
-                                                        .protocol_counts
-                                                        .entry(protocol.clone())
-                                                        .or_insert(0);
-                                                    *counter = counter.saturating_add(1);
+                                            && let Ok(mut snapshot) = runtime_telemetry.lock()
+                                        {
+                                            if let Some(ttfb_ms) =
+                                                telemetry.ttfb_ms.filter(|value| *value > 0)
+                                            {
+                                                snapshot.ttfb_samples_ms.push(ttfb_ms);
+                                            }
+                                            if let Some(reused) = telemetry.connection_reused {
+                                                if reused {
+                                                    snapshot.reused_true =
+                                                        snapshot.reused_true.saturating_add(1);
+                                                } else {
+                                                    snapshot.reused_false =
+                                                        snapshot.reused_false.saturating_add(1);
                                                 }
                                             }
+                                            if let Some(protocol) = telemetry
+                                                .negotiated_protocol
+                                                .as_ref()
+                                                .filter(|value| !value.is_empty())
+                                            {
+                                                let counter = snapshot
+                                                    .protocol_counts
+                                                    .entry(protocol.clone())
+                                                    .or_insert(0);
+                                                *counter = counter.saturating_add(1);
+                                            }
+                                        }
                                     }
                                     download.downloaded = download
                                         .segments
@@ -1651,13 +1659,14 @@ impl EngineState {
                 )?;
                 desired_parallel = adjustment.desired_parallel;
                 if !adjustment.control_updates.is_empty()
-                    && let Ok(controls) = segment_controls.lock() {
-                        for (segment_id, end) in adjustment.control_updates {
-                            if let Some(control) = controls.get(&segment_id) {
-                                control.set_end(end);
-                            }
+                    && let Ok(controls) = segment_controls.lock()
+                {
+                    for (segment_id, end) in adjustment.control_updates {
+                        if let Some(control) = controls.get(&segment_id) {
+                            control.set_end(end);
                         }
                     }
+                }
                 for next_segment in adjustment.appended_segments {
                     queue.push_back(next_segment);
                 }
@@ -1701,21 +1710,22 @@ impl EngineState {
                             started_at.remove(&segment_id);
                         }
                         if (segment.retry_attempts > 0 || terminal_failure_reason.is_some())
-                            && let Ok(mut registry) = self.registry_guard() {
-                                if let Some(download) = registry
-                                    .downloads
-                                    .iter_mut()
-                                    .find(|download| download.id == runtime_download.id)
-                                {
-                                    upsert_runtime_segment_health(
-                                        &mut download.runtime_checkpoint,
-                                        segment_id,
-                                        segment.retry_attempts,
-                                        terminal_failure_reason,
-                                    );
-                                }
-                                let _ = self.persist_registry(&registry);
+                            && let Ok(mut registry) = self.registry_guard()
+                        {
+                            if let Some(download) = registry
+                                .downloads
+                                .iter_mut()
+                                .find(|download| download.id == runtime_download.id)
+                            {
+                                upsert_runtime_segment_health(
+                                    &mut download.runtime_checkpoint,
+                                    segment_id,
+                                    segment.retry_attempts,
+                                    terminal_failure_reason,
+                                );
                             }
+                            let _ = self.persist_registry(&registry);
+                        }
                         completed_segments.push(segment);
                         if let Err(error) = result {
                             if error == "segment-canceled"
@@ -1739,14 +1749,15 @@ impl EngineState {
                                         download,
                                         winner_id,
                                         &mut race_by_segment,
-                                    ) {
-                                        expected_canceled.insert(race_winner.loser_id, ());
-                                        if let Ok(controls) = segment_controls.lock()
-                                            && let Some(control) = controls.get(&race_winner.loser_id)
-                                            {
-                                                control.cancel();
-                                            }
+                                    )
+                                {
+                                    expected_canceled.insert(race_winner.loser_id, ());
+                                    if let Ok(controls) = segment_controls.lock()
+                                        && let Some(control) = controls.get(&race_winner.loser_id)
+                                    {
+                                        control.cancel();
                                     }
+                                }
                                 let _ = self.persist_registry(&registry);
                             }
                             while join_set.len() < desired_parallel && !queue.is_empty() {
@@ -1760,32 +1771,33 @@ impl EngineState {
                                         .downloads
                                         .iter_mut()
                                         .find(|download| download.id == runtime_download.id)
-                                    {
-                                        let samples = runtime_samples
-                                            .lock()
-                                            .ok()
-                                            .map(|value| value.values().cloned().collect::<Vec<_>>())
-                                            .unwrap_or_default();
-                                        let expansion = attempt_runtime_queue_expansion(
-                                            download,
-                                            &scheduler,
-                                            &samples,
-                                            &mut race_by_segment,
-                                        );
-                                        appended = expansion.appended_segment;
-                                        control_updates = expansion.control_updates;
-                                        if appended.is_some() {
-                                            let _ = self.persist_registry(&registry);
-                                        }
+                                {
+                                    let samples = runtime_samples
+                                        .lock()
+                                        .ok()
+                                        .map(|value| value.values().cloned().collect::<Vec<_>>())
+                                        .unwrap_or_default();
+                                    let expansion = attempt_runtime_queue_expansion(
+                                        download,
+                                        &scheduler,
+                                        &samples,
+                                        &mut race_by_segment,
+                                    );
+                                    appended = expansion.appended_segment;
+                                    control_updates = expansion.control_updates;
+                                    if appended.is_some() {
+                                        let _ = self.persist_registry(&registry);
                                     }
+                                }
                                 if !control_updates.is_empty()
-                                    && let Ok(controls) = segment_controls.lock() {
-                                        for (segment_id, end) in control_updates {
-                                            if let Some(control) = controls.get(&segment_id) {
-                                                control.set_end(end);
-                                            }
+                                    && let Ok(controls) = segment_controls.lock()
+                                {
+                                    for (segment_id, end) in control_updates {
+                                        if let Some(control) = controls.get(&segment_id) {
+                                            control.set_end(end);
                                         }
                                     }
+                                }
                                 if let Some(next_segment) = appended {
                                     queue.push_back(next_segment);
                                     while join_set.len() < desired_parallel && !queue.is_empty() {
@@ -1822,15 +1834,15 @@ impl EngineState {
                     .downloads
                     .iter()
                     .find(|download| download.id == runtime_download.id)
-                {
-                    runtime_download.segments = download.segments.clone();
-                    runtime_download.downloaded = download.downloaded;
-                    runtime_download.runtime_checkpoint = download.runtime_checkpoint.clone();
-                    runtime_download.target_connections = download.target_connections.max(1);
-                    runtime_download.max_connections = download.max_connections.max(1);
-                    runtime_download.host_max_connections = download.host_max_connections;
-                    runtime_download.host_cooldown_until = download.host_cooldown_until;
-                }
+            {
+                runtime_download.segments = download.segments.clone();
+                runtime_download.downloaded = download.downloaded;
+                runtime_download.runtime_checkpoint = download.runtime_checkpoint.clone();
+                runtime_download.target_connections = download.target_connections.max(1);
+                runtime_download.max_connections = download.max_connections.max(1);
+                runtime_download.host_max_connections = download.host_max_connections;
+                runtime_download.host_cooldown_until = download.host_cooldown_until;
+            }
 
             if runtime_error.is_none() {
                 continue;
@@ -2054,5 +2066,3 @@ impl EngineState {
         Ok(())
     }
 }
-
-

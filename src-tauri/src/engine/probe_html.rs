@@ -3,8 +3,8 @@ use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::{
-    header::{ACCEPT, ACCEPT_LANGUAGE, AUTHORIZATION, COOKIE, REFERER},
     Url,
+    header::{ACCEPT, ACCEPT_LANGUAGE, AUTHORIZATION, COOKIE, REFERER},
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -705,13 +705,13 @@ fn select_html_app_direct_download(
             .link
             .as_deref()
             .and_then(normalize_html_app_direct_download_url)
-        {
-            return Some(HtmlApiResolvedDownload {
-                direct_download_url,
-                suggested_name: content.name.as_deref().and_then(sanitize_filename_leaf),
-                request_cookies: cookies,
-            });
-        }
+    {
+        return Some(HtmlApiResolvedDownload {
+            direct_download_url,
+            suggested_name: content.name.as_deref().and_then(sanitize_filename_leaf),
+            request_cookies: cookies,
+        });
+    }
 
     let child = if content.children.len() == 1 {
         content.children.values().next()

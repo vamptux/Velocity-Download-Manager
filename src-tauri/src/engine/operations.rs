@@ -2,8 +2,8 @@ use std::path::Path;
 
 use tauri::AppHandle;
 
-use super::*;
 use super::probe::DownloadProbeData;
+use super::*;
 use crate::model::RecentProbeCacheEntry;
 
 const LOW_SPACE_UNKNOWN_SIZE_WARNING_BYTES: u64 = 512 * 1024 * 1024;
@@ -426,8 +426,10 @@ impl EngineState {
             host,
             host_max_connections: host_profile.and_then(|profile| profile.max_connections),
             host_average_ttfb_ms: effective_average_ttfb_ms(host_profile, Some(&scope_key)),
-            host_average_throughput_bytes_per_second:
-                effective_average_throughput_bytes_per_second(host_profile, Some(&scope_key)),
+            host_average_throughput_bytes_per_second: effective_average_throughput_bytes_per_second(
+                host_profile,
+                Some(&scope_key),
+            ),
             host_diagnostics: host_diagnostics_summary_for_scope(host_profile, Some(&scope_key)),
             suggested_name: suggested_name.clone(),
             target_path,
@@ -501,12 +503,8 @@ impl EngineState {
         let host_profile = registry.host_profiles.get(&host);
         let cached_probe =
             host_profile.and_then(|profile| fresh_probe_capabilities(profile, &scope_key, now));
-        let max_connections = effective_connection_target_for_scope(
-            16,
-            &settings,
-            host_profile,
-            Some(&scope_key),
-        );
+        let max_connections =
+            effective_connection_target_for_scope(16, &settings, host_profile, Some(&scope_key));
         let target_path = join_target_path(&save_path, &name);
         let available_space = query_available_space(Path::new(&save_path));
         let cached_range = cached_probe
@@ -656,8 +654,10 @@ impl EngineState {
             host_max_connections: host_profile.and_then(|profile| profile.max_connections),
             host_cooldown_until: host_profile.and_then(|profile| profile.cooldown_until),
             host_average_ttfb_ms: effective_average_ttfb_ms(host_profile, Some(&scope_key)),
-            host_average_throughput_bytes_per_second:
-                effective_average_throughput_bytes_per_second(host_profile, Some(&scope_key)),
+            host_average_throughput_bytes_per_second: effective_average_throughput_bytes_per_second(
+                host_profile,
+                Some(&scope_key),
+            ),
             host_protocol: probe
                 .as_ref()
                 .and_then(|value| value.negotiated_protocol.clone())

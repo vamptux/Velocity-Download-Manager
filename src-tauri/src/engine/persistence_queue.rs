@@ -40,14 +40,13 @@ impl SnapshotPersistQueue {
         priority: PersistPriority,
     ) -> Result<(), String> {
         match priority {
-            PersistPriority::Deferred => {
-                self.sender
-                    .send(PersistRequest {
-                        snapshot: snapshot.clone(),
-                        ack: None,
-                    })
-                    .map_err(|_| "Snapshot writer is unavailable.".to_string())
-            }
+            PersistPriority::Deferred => self
+                .sender
+                .send(PersistRequest {
+                    snapshot: snapshot.clone(),
+                    ack: None,
+                })
+                .map_err(|_| "Snapshot writer is unavailable.".to_string()),
             PersistPriority::Flush => {
                 let (ack_sender, ack_receiver) = mpsc::channel();
                 self.sender

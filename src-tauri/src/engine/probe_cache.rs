@@ -123,9 +123,9 @@ pub(super) fn fresh_probe_capabilities(
 
 pub(super) fn probe_cache_stale(profile: &HostProfile, scope_key: &str, now: i64) -> bool {
     if let Some(scope) = profile.probe_scopes.get(scope_key) {
-        return scope
-            .last_probe_at
-            .is_some_and(|timestamp| now.saturating_sub(timestamp) > scope_capability_ttl_ms(scope, now));
+        return scope.last_probe_at.is_some_and(|timestamp| {
+            now.saturating_sub(timestamp) > scope_capability_ttl_ms(scope, now)
+        });
     }
 
     false
@@ -159,20 +159,23 @@ pub(super) fn append_probe_cache_warning(
     }
 
     if let Some(scope) = profile.probe_scopes.get(scope_key)
-        && scoped_probe_failure_active(scope, now) {
-            warnings.push(
+        && scoped_probe_failure_active(scope, now)
+    {
+        warnings.push(
                 "Repeated probe failures were seen on this exact request shape; VDM is planning it conservatively until a fresh probe succeeds."
                     .to_string(),
             );
-        }
+    }
 
     if let Some(cached_probe) = cached_probe
-        && cached_probe.hard_no_range && cached_probe.range_supported == Some(false) {
-            warnings.push(
+        && cached_probe.hard_no_range
+        && cached_probe.range_supported == Some(false)
+    {
+        warnings.push(
                 "Saved capability learning for this exact request shape shows the host rejected byte-range requests; segmented mode will stay disabled until a fresh probe proves otherwise."
                     .to_string(),
             );
-        }
+    }
 }
 
 pub(super) fn scoped_hard_no_range(

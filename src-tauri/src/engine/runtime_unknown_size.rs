@@ -3,17 +3,22 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::runtime::{
+    RuntimeTelemetrySnapshot, RuntimeWakeLockGuard, UNKNOWN_SIZE_SPACE_CHECK_INTERVAL_BYTES,
+    UNKNOWN_SIZE_SPACE_SAFETY_MARGIN_BYTES, disk_queue_under_pressure, median_runtime_ttfb,
+    push_unique_diagnostic, record_runtime_warning, runtime_connection_reuse_hint,
+    runtime_protocol_hint, take_disk_pool_error, wait_for_disk_pool_drain,
+};
 use super::runtime_recovery::classify_runtime_error;
 use super::runtime_state::clear_runtime_checkpoint;
-use super::runtime_transfer::{run_unknown_size_stream_worker, TransferWorkerConfig, UnknownSizeStreamOptions, InitialResponseStream};
-use super::runtime::{
-    median_runtime_ttfb, runtime_connection_reuse_hint, runtime_protocol_hint,
-    RuntimeTelemetrySnapshot, RuntimeWakeLockGuard,
-    record_runtime_warning, UNKNOWN_SIZE_SPACE_CHECK_INTERVAL_BYTES, UNKNOWN_SIZE_SPACE_SAFETY_MARGIN_BYTES,
-    take_disk_pool_error, disk_queue_under_pressure, wait_for_disk_pool_drain, push_unique_diagnostic,
+use super::runtime_transfer::{
+    InitialResponseStream, TransferWorkerConfig, UnknownSizeStreamOptions,
+    run_unknown_size_stream_worker,
 };
 use super::*;
-use crate::model::{DownloadFailureKind, DownloadRecord, DownloadStatus, HostProfile, HostTelemetryArgs};
+use crate::model::{
+    DownloadFailureKind, DownloadRecord, DownloadStatus, HostProfile, HostTelemetryArgs,
+};
 
 pub(super) fn classify_unknown_size_failure_kind(error: &str) -> DownloadFailureKind {
     let normalized = error.to_ascii_lowercase();
@@ -69,10 +74,8 @@ pub(super) async fn run_unknown_size_stream_runtime(
     let runtime_settings = engine.get_settings();
     let effective_download_limit =
         effective_download_speed_limit(&*runtime_download, &runtime_settings);
-    let per_download_limiter = Some(engine.download_rate_limiter(
-        &runtime_download.id,
-        effective_download_limit,
-    ));
+    let per_download_limiter =
+        Some(engine.download_rate_limiter(&runtime_download.id, effective_download_limit));
     let per_host_limiter = engine.host_rate_limiter(
         &runtime_download.host,
         host_token_bucket_rate(runtime_host_profile.as_ref()),
@@ -126,29 +129,30 @@ pub(super) async fn run_unknown_size_stream_runtime(
                 };
 
                 if let Some(telemetry) = progress.telemetry.as_ref()
-                    && let Ok(mut snapshot) = runtime_telemetry.lock() {
-                        if let Some(ttfb_ms) = telemetry.ttfb_ms.filter(|value| *value > 0) {
-                            snapshot.ttfb_samples_ms.push(ttfb_ms);
-                        }
-                        if let Some(reused) = telemetry.connection_reused {
-                            if reused {
-                                snapshot.reused_true = snapshot.reused_true.saturating_add(1);
-                            } else {
-                                snapshot.reused_false = snapshot.reused_false.saturating_add(1);
-                            }
-                        }
-                        if let Some(protocol) = telemetry
-                            .negotiated_protocol
-                            .as_ref()
-                            .filter(|value| !value.is_empty())
-                        {
-                            let counter = snapshot
-                                .protocol_counts
-                                .entry(protocol.clone())
-                                .or_insert(0);
-                            *counter = counter.saturating_add(1);
+                    && let Ok(mut snapshot) = runtime_telemetry.lock()
+                {
+                    if let Some(ttfb_ms) = telemetry.ttfb_ms.filter(|value| *value > 0) {
+                        snapshot.ttfb_samples_ms.push(ttfb_ms);
+                    }
+                    if let Some(reused) = telemetry.connection_reused {
+                        if reused {
+                            snapshot.reused_true = snapshot.reused_true.saturating_add(1);
+                        } else {
+                            snapshot.reused_false = snapshot.reused_false.saturating_add(1);
                         }
                     }
+                    if let Some(protocol) = telemetry
+                        .negotiated_protocol
+                        .as_ref()
+                        .filter(|value| !value.is_empty())
+                    {
+                        let counter = snapshot
+                            .protocol_counts
+                            .entry(protocol.clone())
+                            .or_insert(0);
+                        *counter = counter.saturating_add(1);
+                    }
+                }
 
                 download.downloaded = progress.downloaded.max(0);
                 if progress.throughput_bytes_per_second > 0 {
@@ -208,12 +212,13 @@ pub(super) async fn run_unknown_size_stream_runtime(
                 ));
             }
             if let Some(reported) = outcome.reported_content_length
-                && reported != final_len {
-                    return Err(format!(
-                        "Unknown-size transfer reached EOF at {} bytes but the final stream reported Content-Length {}.",
-                        final_len, reported
-                    ));
-                }
+                && reported != final_len
+            {
+                return Err(format!(
+                    "Unknown-size transfer reached EOF at {} bytes but the final stream reported Content-Length {}.",
+                    final_len, reported
+                ));
+            }
             Ok(final_len)
         }
         Err(error) => {

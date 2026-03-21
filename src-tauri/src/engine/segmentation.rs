@@ -37,20 +37,19 @@ pub fn compute_segments_with_hints(
         return Vec::new();
     }
 
-    let segment_sizes = throughput_shaped_segment_sizes(
-        total_size,
-        actual_segments,
-        min_segment_size,
-        hints,
-    )
-    .unwrap_or_else(|| equal_segment_sizes(total_size, actual_segments));
+    let segment_sizes =
+        throughput_shaped_segment_sizes(total_size, actual_segments, min_segment_size, hints)
+            .unwrap_or_else(|| equal_segment_sizes(total_size, actual_segments));
 
     build_segments_from_sizes(&segment_sizes, retry_budget)
 }
 
 fn actual_segment_count(total_size: u64, num_segments: u32, min_segment_size: u64) -> u64 {
     let num_segments = u64::from(num_segments.max(1));
-    std::cmp::min(num_segments, std::cmp::max(1, total_size / min_segment_size.max(1)))
+    std::cmp::min(
+        num_segments,
+        std::cmp::max(1, total_size / min_segment_size.max(1)),
+    )
 }
 
 fn equal_segment_sizes(total_size: u64, actual_segments: u64) -> Vec<u64> {
@@ -77,15 +76,18 @@ fn throughput_shaped_segment_sizes(
     min_segment_size: u64,
     hints: SegmentPlanningHints,
 ) -> Option<Vec<u64>> {
-    let throughput_hint = hints.throughput_bytes_per_second.filter(|value| *value > 0)?;
+    let throughput_hint = hints
+        .throughput_bytes_per_second
+        .filter(|value| *value > 0)?;
     if actual_segments <= 1 {
         return None;
     }
 
     let equal_segment_size = total_size / actual_segments.max(1);
-    let target_chunk_time_ms = u64::from(hints.target_chunk_time_seconds.max(1)).saturating_mul(1_000);
-    let effective_chunk_time_ms = target_chunk_time_ms
-        .saturating_add(hints.ttfb_ms.unwrap_or(0).min(target_chunk_time_ms));
+    let target_chunk_time_ms =
+        u64::from(hints.target_chunk_time_seconds.max(1)).saturating_mul(1_000);
+    let effective_chunk_time_ms =
+        target_chunk_time_ms.saturating_add(hints.ttfb_ms.unwrap_or(0).min(target_chunk_time_ms));
     let per_connection_throughput = throughput_hint.div_ceil(actual_segments);
     let target_window_bytes = per_connection_throughput
         .saturating_mul(effective_chunk_time_ms)
@@ -96,7 +98,8 @@ fn throughput_shaped_segment_sizes(
         return None;
     }
 
-    let mut sizes = vec![target_window_bytes; usize::try_from(actual_segments).unwrap_or(usize::MAX)];
+    let mut sizes =
+        vec![target_window_bytes; usize::try_from(actual_segments).unwrap_or(usize::MAX)];
     let assigned = target_window_bytes.saturating_mul(actual_segments);
     let remaining = total_size.saturating_sub(assigned);
     if remaining == 0 {

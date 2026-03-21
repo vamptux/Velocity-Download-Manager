@@ -20,6 +20,7 @@ pub mod http_pool;
 mod integrity;
 mod operations;
 mod persistence;
+mod persistence_queue;
 mod probe;
 mod probe_cache;
 mod probe_filename;
@@ -27,16 +28,15 @@ mod probe_html;
 mod probe_html_cache;
 mod probe_html_patterns;
 mod progress;
-mod runtime_bootstrap;
-mod runtime_ramp;
-mod runtime_unknown_size;
 mod runtime;
+mod runtime_bootstrap;
 mod runtime_dispatch;
 mod runtime_race;
+mod runtime_ramp;
 mod runtime_recovery;
 mod runtime_state;
-mod persistence_queue;
 pub mod runtime_transfer;
+mod runtime_unknown_size;
 pub mod scheduler;
 pub mod segmentation;
 mod settings_policy;
@@ -57,8 +57,8 @@ use helpers::{
     reset_download_transient_state, unix_epoch_millis,
 };
 use host_planner::{
-    apply_host_telemetry, effective_average_throughput_bytes_per_second,
-    effective_average_ttfb_ms, effective_connection_target_for_scope, host_diagnostics_summary_for_scope,
+    apply_host_telemetry, effective_average_throughput_bytes_per_second, effective_average_ttfb_ms,
+    effective_connection_target_for_scope, host_diagnostics_summary_for_scope,
     initial_target_connections_for_scope, profile_warning_for_scope,
 };
 use integrity::{
@@ -74,19 +74,20 @@ use probe_cache::{
     probe_cache_stale, probe_scope_key, record_probe_failure, scoped_hard_no_range,
     scoped_probe_failures, store_recent_probe, update_profile_probe_cache,
 };
+use runtime_dispatch::{RuntimeDispatchPlan, plan_runtime_dispatch};
 use runtime_state::clear_runtime_checkpoint;
-use runtime_dispatch::{plan_runtime_dispatch, RuntimeDispatchPlan};
 use runtime_transfer::TokenBucketRateLimiter;
-use segmentation::{compute_segments_with_hints, SegmentPlanningHints};
+use segmentation::{SegmentPlanningHints, compute_segments_with_hints};
 use settings_policy::sanitize_engine_settings;
 use wake_lock::WakeLockController;
 
 use crate::model::{
-    AddDownloadArgs, ChecksumSpec, DownloadCapabilities, DownloadDiagnostics, DownloadFailureKind,
-    DownloadCompatibility, DownloadIntegrity, DownloadLogEntry, DownloadLogLevel, DownloadRecord,
-    DownloadRequestField, DownloadRequestMethod, DownloadRuntimeCheckpoint, DownloadSegment,
-    DownloadSegmentStatus, DownloadStatus, EngineSettings, HostProfile, HostTelemetryArgs,
-    ProbeDownloadArgs, ProbeResult, QueueState, RegistrySnapshot, ReorderDirection, TrafficMode,
+    AddDownloadArgs, ChecksumSpec, DownloadCapabilities, DownloadCompatibility,
+    DownloadDiagnostics, DownloadFailureKind, DownloadIntegrity, DownloadLogEntry,
+    DownloadLogLevel, DownloadRecord, DownloadRequestField, DownloadRequestMethod,
+    DownloadRuntimeCheckpoint, DownloadSegment, DownloadSegmentStatus, DownloadStatus,
+    EngineSettings, HostProfile, HostTelemetryArgs, ProbeDownloadArgs, ProbeResult, QueueState,
+    RegistrySnapshot, ReorderDirection, TrafficMode,
 };
 
 const DEFAULT_QUEUE: &str = "default";
@@ -287,7 +288,8 @@ pub(super) fn apply_download_host_profile(
         download.capabilities.resumable = false;
         download.capabilities.segmented = false;
     }
-    if let Some(protocol) = host_profile.and_then(|profile| profile.negotiated_protocol.as_deref()) {
+    if let Some(protocol) = host_profile.and_then(|profile| profile.negotiated_protocol.as_deref())
+    {
         download.host_protocol = Some(normalize_protocol_label(protocol).to_string());
     }
     download.host_diagnostics = host_diagnostics_summary_for_scope(host_profile, Some(&scope_key));
@@ -351,7 +353,9 @@ pub(super) fn effective_download_speed_limit(
     download
         .speed_limit_bytes_per_second
         .filter(|value| *value > 0)
-        .or(settings.speed_limit_bytes_per_second.filter(|value| *value > 0))
+        .or(settings
+            .speed_limit_bytes_per_second
+            .filter(|value| *value > 0))
 }
 
 fn planned_download_size(size: i64) -> Option<u64> {
@@ -402,8 +406,10 @@ fn runtime_chunk_buffer_floor(base: usize) -> usize {
 }
 
 fn runtime_chunk_buffer_ceiling(base: usize) -> usize {
-    base.saturating_mul(2)
-        .clamp(runtime_chunk_buffer_floor(base), RUNTIME_CHUNK_BUFFER_CEILING_BYTES)
+    base.saturating_mul(2).clamp(
+        runtime_chunk_buffer_floor(base),
+        RUNTIME_CHUNK_BUFFER_CEILING_BYTES,
+    )
 }
 
 pub(super) fn compatibility_request_context_supports_segmented_transfer(
@@ -658,18 +664,15 @@ impl EngineState {
     fn finish_bootstrap(&self, snapshot: Result<RegistrySnapshot, String>) {
         let mut bootstrap_error = None;
         match snapshot {
-            Ok(snapshot) => {
-                match self.inner.registry.lock() {
-                    Ok(mut registry) => {
-                        *registry = snapshot;
-                    }
-                    Err(_) => {
-                        bootstrap_error = Some(
-                            "Engine state lock was poisoned during bootstrap.".to_string(),
-                        );
-                    }
+            Ok(snapshot) => match self.inner.registry.lock() {
+                Ok(mut registry) => {
+                    *registry = snapshot;
                 }
-            }
+                Err(_) => {
+                    bootstrap_error =
+                        Some("Engine state lock was poisoned during bootstrap.".to_string());
+                }
+            },
             Err(error) => bootstrap_error = Some(error),
         }
 
@@ -685,10 +688,9 @@ impl EngineState {
             }
             Err(_) => EngineBootstrapState {
                 ready: true,
-                error: bootstrap_error.or_else(|| {
-                    Some("Engine bootstrap state lock was poisoned.".to_string())
-                }),
-            }
+                error: bootstrap_error
+                    .or_else(|| Some("Engine bootstrap state lock was poisoned.".to_string())),
+            },
         };
 
         self.inner.bootstrap_notify.notify_waiters();
@@ -792,9 +794,10 @@ impl EngineState {
         let rate = rate_bytes_per_second.unwrap_or(0);
         let burst = token_bucket_burst_bytes(rate);
         if let Ok(limiters) = self.inner.download_limiters.lock()
-            && let Some(existing) = limiters.get(download_id) {
-                existing.reconfigure(rate, burst);
-            }
+            && let Some(existing) = limiters.get(download_id)
+        {
+            existing.reconfigure(rate, burst);
+        }
     }
 
     fn clear_download_rate_limiter(&self, download_id: &str) {
@@ -1104,16 +1107,18 @@ impl EngineState {
 
     fn abort_integrity_task(&self, id: &str) {
         if let Ok(mut tasks) = self.inner.integrity_tasks.lock()
-            && let Some(handle) = tasks.remove(id) {
-                handle.abort();
-            }
+            && let Some(handle) = tasks.remove(id)
+        {
+            handle.abort();
+        }
     }
 
     fn abort_runtime_task(&self, id: &str) {
         if let Ok(mut tasks) = self.inner.runtime_tasks.lock()
-            && let Some(handle) = tasks.remove(id) {
-                handle.abort();
-            }
+            && let Some(handle) = tasks.remove(id)
+        {
+            handle.abort();
+        }
     }
 
     fn abort_all_runtime_tasks(&self) {
@@ -1126,9 +1131,10 @@ impl EngineState {
 
     fn spawn_checksum_verification(&self, id: String) {
         if let Ok(tasks) = self.inner.integrity_tasks.lock()
-            && tasks.contains_key(&id) {
-                return;
-            }
+            && tasks.contains_key(&id)
+        {
+            return;
+        }
 
         let engine = self.clone();
         let task_id = id.clone();
@@ -1150,9 +1156,10 @@ impl EngineState {
 
     fn spawn_download_runtime(&self, id: String) {
         if let Ok(tasks) = self.inner.runtime_tasks.lock()
-            && tasks.contains_key(&id) {
-                return;
-            }
+            && tasks.contains_key(&id)
+        {
+            return;
+        }
         let engine = self.clone();
         let task_id = id.clone();
         let handle = tokio::spawn(async move {

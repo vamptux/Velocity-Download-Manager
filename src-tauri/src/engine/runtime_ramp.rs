@@ -1,4 +1,3 @@
-
 pub(super) const RUNTIME_RAMP_MIN_INTERVAL_MS: i64 = 850;
 
 pub(super) const RUNTIME_RAMP_MIN_SPEED_BYTES_PER_SECOND: u64 = 1024 * 1024;
@@ -20,4 +19,3 @@ pub(super) const RUNTIME_RAMP_FAST_PATH_MAX_TTFB_MS: u64 = 800;
 pub(super) const RUNTIME_RAMP_NEGATIVE_GAIN_PERCENT: u64 = 12;
 
 pub(super) const RUNTIME_RAMP_NEGATIVE_GAIN_WINDOWS: u32 = 2;
-

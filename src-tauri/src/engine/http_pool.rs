@@ -155,8 +155,7 @@ fn cleanup_clients(
     let stale_keys: Vec<String> = clients
         .iter()
         .filter(|(host, entry)| {
-            Some(host.as_str()) != protected_host
-                && entry.last_access_at_millis() <= stale_before
+            Some(host.as_str()) != protected_host && entry.last_access_at_millis() <= stale_before
         })
         .map(|(host, _)| host.clone())
         .collect();

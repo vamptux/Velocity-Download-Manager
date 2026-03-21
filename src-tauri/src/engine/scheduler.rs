@@ -106,12 +106,15 @@ impl SegmentScheduler {
         sample: &SegmentRuntimeSample,
         idle_worker_count: u32,
     ) -> Option<u64> {
-        let throughput = sample.throughput_bytes_per_second.filter(|value| *value > 0)?;
+        let throughput = sample
+            .throughput_bytes_per_second
+            .filter(|value| *value > 0)?;
         let target_window_bytes = throughput
             .saturating_mul(u64::from(self.target_chunk_time_seconds.max(1)))
             .max(self.min_segment_size_bytes);
         let eta_gain_floor = remaining_bytes.div_ceil(STEAL_MIN_ETA_GAIN_PERCENT);
-        let share_cap = remaining_bytes.div_ceil(u64::from(idle_worker_count.max(1)).saturating_add(1));
+        let share_cap =
+            remaining_bytes.div_ceil(u64::from(idle_worker_count.max(1)).saturating_add(1));
         let challenger_size = target_window_bytes
             .max(eta_gain_floor)
             .max(self.min_segment_size_bytes)

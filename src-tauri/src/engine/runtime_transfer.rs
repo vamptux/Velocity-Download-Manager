@@ -1,13 +1,13 @@
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::{
-    header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_RANGE, RETRY_AFTER},
     StatusCode,
+    header::{CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderValue, RETRY_AFTER},
 };
 use tokio::time::sleep;
 
@@ -197,9 +197,11 @@ fn validate_range_response(
         }
         StatusCode::OK => {
             if let Some((start, end, _)) = parse_content_range_bounds(content_range)
-                && start == request.start && end == request.end {
-                    return Ok(());
-                }
+                && start == request.start
+                && end == request.end
+            {
+                return Ok(());
+            }
 
             let content_length = header_to_u64(headers.get(CONTENT_LENGTH));
             if request.start == 0 && content_length == Some(requested_len) {
@@ -617,10 +619,8 @@ where
                     observed_throughput_bytes_per_second,
                     disk_pool.queue_utilization_percent(),
                 );
-                let mut write_buffer = std::mem::replace(
-                    &mut local_buffer,
-                    Vec::with_capacity(next_buffer_capacity),
-                );
+                let mut write_buffer =
+                    std::mem::replace(&mut local_buffer, Vec::with_capacity(next_buffer_capacity));
                 if write_plan.bytes_to_write < write_buffer.len() {
                     write_buffer.truncate(write_plan.bytes_to_write);
                 }
@@ -777,15 +777,14 @@ where
                 .send()
                 .await;
             outcome = response.map(|response| {
-                    let negotiated_protocol = Some(protocol_label(response.version()).to_string());
-                    InitialResponseStream {
-                        ttfb_ms: request_started.elapsed().as_millis().min(u64::MAX as u128)
-                            as u64,
-                        negotiated_protocol,
-                        response,
-                        connection_reused_hint: pooled_client_reused,
-                    }
-                });
+                let negotiated_protocol = Some(protocol_label(response.version()).to_string());
+                InitialResponseStream {
+                    ttfb_ms: request_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    negotiated_protocol,
+                    response,
+                    connection_reused_hint: pooled_client_reused,
+                }
+            });
         }
         match outcome {
             Ok(initial) if initial.response.status().is_success() => {
@@ -858,14 +857,15 @@ where
                         )
                         .await?;
                         if let Some(path) = options.space_check_path.as_deref()
-                            && current_offset >= next_space_check_at {
-                                enforce_unknown_size_free_space(
-                                    path,
-                                    options.space_safety_margin_bytes,
-                                    current_offset.saturating_sub(starting_offset),
-                                )?;
-                                next_space_check_at = current_offset.saturating_add(check_interval);
-                            }
+                            && current_offset >= next_space_check_at
+                        {
+                            enforce_unknown_size_free_space(
+                                path,
+                                options.space_safety_margin_bytes,
+                                current_offset.saturating_sub(starting_offset),
+                            )?;
+                            next_space_check_at = current_offset.saturating_add(check_interval);
+                        }
                         window_bytes = window_bytes.saturating_add(written);
                         let throughput =
                             compute_window_throughput(&mut window_start, &mut window_bytes);
@@ -1053,11 +1053,7 @@ fn jittered_retry_delay_ms(base_delay_ms: u64, jitter_percent: u8) -> u64 {
     jittered_retry_delay_with_entropy(base_delay_ms, jitter_percent, entropy)
 }
 
-fn jittered_retry_delay_with_entropy(
-    base_delay_ms: u64,
-    jitter_percent: u8,
-    entropy: u64,
-) -> u64 {
+fn jittered_retry_delay_with_entropy(base_delay_ms: u64, jitter_percent: u8, entropy: u64) -> u64 {
     if base_delay_ms == 0 || jitter_percent == 0 {
         return base_delay_ms;
     }

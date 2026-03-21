@@ -35,8 +35,7 @@ const AUTH_HEADER_TIMESTAMP: &str = "x-vdm-timestamp";
 const AUTH_HEADER_REQUEST_NONCE: &str = "x-vdm-request-nonce";
 const AUTH_HEADER_SIGNATURE: &str = "x-vdm-auth";
 const AUTH_HEADER_EXTENSION_ORIGIN: &str = "x-vdm-extension-origin";
-const CORS_ALLOW_HEADERS: &str =
-    "Content-Type, X-VDM-Client, X-VDM-Extension-Origin, X-VDM-Timestamp, X-VDM-Request-Nonce, X-VDM-Auth";
+const CORS_ALLOW_HEADERS: &str = "Content-Type, X-VDM-Client, X-VDM-Extension-Origin, X-VDM-Timestamp, X-VDM-Request-Nonce, X-VDM-Auth";
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -288,11 +287,7 @@ async fn run_capture_server(app: AppHandle, state: CaptureBridgeState) {
     }
 }
 
-async fn handle_connection(
-    mut socket: TcpStream,
-    app: AppHandle,
-    state: CaptureBridgeState,
-) {
+async fn handle_connection(mut socket: TcpStream, app: AppHandle, state: CaptureBridgeState) {
     let mut buf = Vec::with_capacity(4096);
     if read_request(&mut socket, &mut buf).await.is_err() {
         return;

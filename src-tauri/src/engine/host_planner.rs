@@ -71,9 +71,10 @@ pub fn effective_connection_target_for_scope(
             }
         }
         if should_apply_concurrency_lock_for_scope(profile, scope_key)
-            && let Some(locked) = effective_locked_connections(profile, scope_key) {
-                target = target.min(locked.max(1).min(host_hard_cap));
-            }
+            && let Some(locked) = effective_locked_connections(profile, scope_key)
+        {
+            target = target.min(locked.max(1).min(host_hard_cap));
+        }
         if protocol_is_multiplexed(profile.negotiated_protocol.as_deref()) {
             let reused = profile.protocol_reuse_events;
             let opened = profile.protocol_new_connection_events;
@@ -114,15 +115,17 @@ pub fn initial_target_connections_for_scope(
     }
 
     if should_apply_concurrency_lock_for_scope(profile, scope_key)
-        && let Some(locked) = effective_locked_connections(profile, scope_key) {
-            return locked.max(1).min(max_connections);
-        }
+        && let Some(locked) = effective_locked_connections(profile, scope_key)
+    {
+        return locked.max(1).min(max_connections);
+    }
 
     if effective_telemetry_samples(profile, scope_key) < WARM_START_CONFIDENCE_SAMPLES {
         return target;
     }
 
-    if let Some(throughput) = effective_average_throughput_bytes_per_second(Some(profile), scope_key)
+    if let Some(throughput) =
+        effective_average_throughput_bytes_per_second(Some(profile), scope_key)
     {
         if throughput <= WARM_START_SLOW_HOST_BYTES_PER_SECOND {
             target = 1;
@@ -339,7 +342,10 @@ pub fn apply_host_telemetry(profile: &mut HostProfile, payload: &HostTelemetryAr
     maybe_recover_host_max_connections(profile, payload);
 
     if let Some(scope_key) = scope_key {
-        let scope = profile.probe_scopes.entry(scope_key.to_string()).or_default();
+        let scope = profile
+            .probe_scopes
+            .entry(scope_key.to_string())
+            .or_default();
         apply_scope_telemetry(scope, payload, now);
     }
 }
@@ -437,7 +443,10 @@ fn host_reuse_preference(profile: &HostProfile) -> Option<bool> {
     None
 }
 
-fn scope_entry<'a>(profile: &'a HostProfile, scope_key: Option<&str>) -> Option<&'a ProbeScopeCache> {
+fn scope_entry<'a>(
+    profile: &'a HostProfile,
+    scope_key: Option<&str>,
+) -> Option<&'a ProbeScopeCache> {
     scope_key.and_then(|key| profile.probe_scopes.get(key))
 }
 
@@ -478,10 +487,7 @@ fn effective_throttle_events(profile: &HostProfile, scope_key: Option<&str>) -> 
         .unwrap_or(profile.throttle_events)
 }
 
-fn should_apply_concurrency_lock_for_scope(
-    profile: &HostProfile,
-    scope_key: Option<&str>,
-) -> bool {
+fn should_apply_concurrency_lock_for_scope(profile: &HostProfile, scope_key: Option<&str>) -> bool {
     let Some(scope) = scope_entry(profile, scope_key) else {
         return should_apply_concurrency_lock(profile);
     };
@@ -530,7 +536,9 @@ fn apply_range_validation_downgrade_to_scope(scope: &mut ProbeScopeCache, now_mi
 
 fn apply_scope_telemetry(scope: &mut ProbeScopeCache, payload: &HostTelemetryArgs, now: i64) {
     maybe_release_stale_scope_ramp_lock(scope, now);
-    if !cooldown_active(scope.cooldown_until) && scope.lock_reason.as_deref() == Some("cooldown-active") {
+    if !cooldown_active(scope.cooldown_until)
+        && scope.lock_reason.as_deref() == Some("cooldown-active")
+    {
         clear_scope_lock(scope);
     }
     if payload.range_validation_failed {

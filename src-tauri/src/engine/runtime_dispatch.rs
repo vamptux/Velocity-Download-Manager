@@ -1,14 +1,12 @@
 use std::collections::BTreeMap;
 
-use crate::model::{
-    DownloadRecord, DownloadStatus, EngineSettings, HostProfile, RegistrySnapshot,
-};
+use crate::model::{DownloadRecord, DownloadStatus, EngineSettings, HostProfile, RegistrySnapshot};
 
+use super::host_planner::effective_connection_target;
 use super::{
     apply_download_host_profile, compatibility_request_context_supports_segmented_transfer,
     ensure_segment_plan,
 };
-use super::host_planner::effective_connection_target;
 
 #[derive(Default)]
 pub(super) struct RuntimeDispatchPlan {
@@ -49,9 +47,7 @@ fn dispatch_sort_key(download: &DownloadRecord) -> (u8, u32, i64, String) {
 }
 
 fn requested_connection_cap(download: &DownloadRecord, _settings: &EngineSettings) -> u32 {
-    download
-        .max_connections
-        .max(1)
+    download.max_connections.max(1)
 }
 
 fn scheduler_host_connection_budget(
@@ -92,15 +88,12 @@ fn rebalance_host_active_targets(
     }
 
     let host_profile = registry.host_profiles.get(host);
-    let requested_connections =
-        active_indices
-            .iter()
-            .fold(16u32, |current, index| {
-                current.max(requested_connection_cap(
-                    &registry.downloads[*index],
-                    settings,
-                ))
-            });
+    let requested_connections = active_indices.iter().fold(16u32, |current, index| {
+        current.max(requested_connection_cap(
+            &registry.downloads[*index],
+            settings,
+        ))
+    });
     let host_budget =
         scheduler_host_connection_budget(requested_connections, settings, host_profile);
 
@@ -214,7 +207,9 @@ pub(super) fn plan_runtime_dispatch(registry: &mut RegistrySnapshot) -> RuntimeD
         .downloads
         .iter()
         .enumerate()
-        .filter_map(|(index, download)| scheduler_can_launch(download, queue_running).then_some(index))
+        .filter_map(|(index, download)| {
+            scheduler_can_launch(download, queue_running).then_some(index)
+        })
         .collect();
     queued_indices.sort_by_key(|index| dispatch_sort_key(&registry.downloads[*index]));
 
