@@ -29,7 +29,16 @@ if (distinctVersions.size !== 1) {
   throw new Error(`Version metadata is out of sync: ${detail}`);
 }
 
-const tag = process.env.GITHUB_REF_NAME?.trim() || process.env.RELEASE_TAG?.trim() || "";
+const refName = process.env.GITHUB_REF_NAME?.trim() || "";
+const refType = process.env.GITHUB_REF_TYPE?.trim() || "";
+const ref = process.env.GITHUB_REF?.trim() || "";
+const explicitTag = process.env.RELEASE_TAG?.trim() || "";
+const tag = explicitTag || (
+  refType === "tag" || ref.startsWith("refs/tags/")
+    ? refName
+    : ""
+);
+
 if (tag) {
   const normalizedTag = tag.startsWith("v") ? tag.slice(1) : tag;
   if (normalizedTag !== packageVersion) {

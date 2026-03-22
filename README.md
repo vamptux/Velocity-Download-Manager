@@ -1,15 +1,21 @@
 # Velocity Download Manager (VDM)
 
-Velocity Download Manager is a Windows-first Tauri v2 download manager built around an IDM-style backend philosophy: reserve disk space early, write into the final file at exact offsets, scale connections only when the host and disk can sustain it, and fall back conservatively when the request shape is not safe for segmentation.
+Velocity Download Manager is a Windows-first desktop downloader built with Rust, Tauri v2, and React. It is designed for high sustained throughput, careful resume handling, and a cleaner modern UI without the usual clutter.
 
-## Current baseline
+## Features
 
-- Rust download engine with zero-cost temp-file reservation, concurrent offset writes, batched disk I/O, and guarded finalization.
-- Dynamic segmentation, work stealing, slow-peer race steals, and host-adaptive connection planning.
-- Conservative replay and resume handling for POST/form-backed, auth-gated, wrapper-page, unknown-size, and no-range downloads.
-- SQLite-backed checkpoints, checksum verification, structured engine logs, and host diagnostics surfaced in the UI.
-- Chrome MV3 capture extension with response-aware classification and an authenticated loopback bridge.
-- Generated Rust-to-frontend IPC bindings committed under `src/types/generated/backend`.
+- Faster multi-connection downloads with host-aware scaling and guarded fallbacks.
+- Queue control and scheduler-ready workflow foundations for managing long download sessions.
+- Browser capture via a Chrome MV3 extension and local authenticated bridge.
+- Multiple built-in themes, including Graphite, Midnight, Carbon, Slate, and Dusk.
+- Free and open source.
+
+## Engine highlights
+
+- Early disk reservation, direct offset writes, and batched I/O to keep transfers stable under load.
+- Adaptive segmentation with work stealing, slow-peer recovery, and conservative single-stream fallback when segmentation is unsafe.
+- SQLite checkpoints, checksum verification, runtime diagnostics, and structured engine logs.
+- Resume and replay guard rails for auth-gated, POST-backed, wrapper-page, unknown-size, and no-range downloads.
 
 ## Platform support
 
