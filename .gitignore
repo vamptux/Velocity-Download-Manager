@@ -29,6 +29,7 @@ Thumbs.db
 
 # IDE
 .idea/
+.vscode/
 
 # Release signing
 .tauri/

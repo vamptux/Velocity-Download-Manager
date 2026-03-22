@@ -1151,7 +1151,7 @@ impl EngineState {
             }
             Err(error) => {
                 let detail = format!("Checksum verification failed: {error}");
-                mark_integrity_failure(&mut download.integrity, &error);
+                mark_integrity_failure(&mut download.integrity, &error, unix_epoch_millis());
                 append_download_log(
                     download,
                     DownloadLogLevel::Error,

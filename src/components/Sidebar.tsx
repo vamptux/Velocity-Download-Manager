@@ -13,7 +13,6 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { formatBytesPerSecond } from "@/lib/format";
 import type { SidebarCategory, Download } from "@/types/download";
 
 const SIDEBAR_DEFAULT_W = 182;
@@ -46,9 +45,6 @@ interface SidebarProps {
   activeCategory: SidebarCategory;
   onCategoryChange: (category: SidebarCategory) => void;
   downloads: Download[];
-  activeCount: number;
-  queuedCount: number;
-  totalSpeed: number;
 }
 
 function countForCategory(cat: SidebarCategory, downloads: Download[]): number {
@@ -130,7 +126,7 @@ function NavItem({
   );
 }
 
-export function Sidebar({ activeCategory, onCategoryChange, downloads, activeCount, queuedCount, totalSpeed }: SidebarProps) {
+export function Sidebar({ activeCategory, onCategoryChange, downloads }: SidebarProps) {
   const [catOpen, setCatOpen] = useState(true);
   const [statusOpen, setStatusOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_W);
@@ -201,27 +197,6 @@ export function Sidebar({ activeCategory, onCategoryChange, downloads, activeCou
           </div>
         )}
       </nav>
-
-      <div className="border-t border-border/45 px-2.5 py-2.5">
-        <div className="rounded-lg border border-border/50 bg-black/10 px-2.5 py-2">
-          <div className="text-[9px] font-semibold uppercase tracking-[0.13em] text-muted-foreground/46">
-            Queue Snapshot
-          </div>
-          <div className="mt-1.5 flex items-baseline justify-between gap-2">
-            <div>
-              <div className="text-[15px] font-semibold text-foreground/84">{activeCount}</div>
-              <div className="text-[10px] text-muted-foreground/52">active</div>
-            </div>
-            <div className="text-right">
-              <div className="text-[11px] font-medium text-foreground/76">
-                {formatBytesPerSecond(totalSpeed, { idleLabel: "0 B/s", fixedFractionDigits: 1 })}
-              </div>
-              <div className="text-[10px] text-muted-foreground/52">{queuedCount} queued</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
       {/* Right-edge resize handle – drag to resize sidebar width, snaps to default */}
       <div
         role="separator"

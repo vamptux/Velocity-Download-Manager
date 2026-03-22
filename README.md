@@ -1,21 +1,21 @@
 # Velocity Download Manager (VDM)
 
-Velocity Is a Rust Based Download Manager in rust focused on speed, stability and seamless UX.
+Velocity Download Manager is a Rust-based desktop downloader focused on throughput, stable recovery, and a cleaner Windows-first experience.
 
-## 👻 Features
+## Features
 
-- ⚡️ Faster Downloads
-- 🧩 Queue control and scheduler-ready workflow foundations for managing long download sessions.
-- 🛟 Browser capture via a Chrome MV3 extension and local authenticated bridge.
-- 🎨 Multiple built-in themes, including Graphite, Midnight, Carbon, Slate, and Dusk.
-- 🔱 Free and open source.
+- Faster multi-connection downloads with host-aware scheduling and guarded fallbacks.
+- Queue control and scheduled-start workflow support for longer download sessions.
+- Browser capture through a Chrome MV3 extension and local authenticated bridge.
+- Multiple built-in themes, including Graphite, Midnight, Carbon, Slate, and Dusk.
+- Free and open source.
 
-## 🌀 Engine highlights
+## Engine Highlights
 
-- 📍 Early disk reservation, direct offset writes, and batched I/O to keep transfers stable under load.
-- 📍 Adaptive segmentation with work stealing, slow-peer recovery, and conservative single-stream fallback when segmentation is unsafe.
-- 📍 SQLite checkpoints, checksum verification, runtime diagnostics, and structured engine logs.
-- 📍 Resume and replay guard rails for auth-gated, POST-backed, wrapper-page, unknown-size, and no-range downloads.
+- Early disk reservation, direct offset writes, and batched I/O to keep transfers stable under load.
+- Adaptive segmentation with work stealing, slow-peer recovery, and conservative single-stream fallback when segmentation is unsafe.
+- SQLite checkpoints, checksum verification, runtime diagnostics, and structured engine logs.
+- Resume and replay guard rails for auth-gated, POST-backed, wrapper-page, unknown-size, and no-range downloads.
 
 ## Platform support
 

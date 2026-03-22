@@ -272,6 +272,19 @@ function formatScheduledSummary(timestamp: number | null | undefined): string {
   });
 }
 
+function formatChecksumCheckedAt(timestamp: number | null | undefined): string {
+  if (timestamp == null || !Number.isFinite(timestamp) || timestamp <= 0) {
+    return "Not checked yet";
+  }
+
+  return new Date(timestamp).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 export interface DownloadRowProps {
   download: Download;
   index: number;
@@ -410,7 +423,6 @@ export const DownloadRow = memo(function DownloadRow({
     setCsError(null);
     try {
       await ipcVerifyDownloadChecksum(download.id);
-      setCsOpen(false);
       onRefresh();
     } catch (err) {
       setCsError(
@@ -760,7 +772,7 @@ export const DownloadRow = memo(function DownloadRow({
                   strokeWidth={1.8}
                 />
                 <Dialog.Title className="text-[13px] font-semibold text-foreground">
-                  Checksum Info
+                  Checksum
                 </Dialog.Title>
               </div>
               <Dialog.Close className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground transition-colors">
@@ -769,22 +781,19 @@ export const DownloadRow = memo(function DownloadRow({
             </div>
             <form
               onSubmit={(e) => void handleChecksumSave(e)}
-              className="flex flex-col gap-3 px-4 py-4"
+              className="flex flex-col gap-2.5 px-4 py-4"
             >
-              <p className="text-[11.5px] text-muted-foreground/70 leading-relaxed">
-                Completed downloads are verified automatically when a checksum is
-                configured. You can also re-run verification manually here.
-                Leave the hash blank to remove the current checksum.
-              </p>
-              <div className="grid grid-cols-2 gap-2 text-[11px]">
-                <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
-                  <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Status</div>
-                  <div className="mt-1 text-foreground/80">{download.integrity.expected ? (download.integrity.message ?? integrityStatusDetail(download) ?? "Ready") : "No checksum configured"}</div>
+              <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2 text-[11px] leading-relaxed text-foreground/78">
+                <div>
+                  {download.integrity.expected
+                    ? (download.integrity.message ?? integrityStatusDetail(download) ?? "Checksum ready")
+                    : "Add a checksum once and VDM will verify it automatically after the file finishes."}
                 </div>
-                <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
-                  <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Last checked</div>
-                  <div className="mt-1 text-foreground/80">{download.integrity.checkedAt ? new Date(download.integrity.checkedAt).toLocaleString() : "Not checked yet"}</div>
-                </div>
+                {download.integrity.expected ? (
+                  <div className="mt-1 text-muted-foreground/58">
+                    Last checked: {formatChecksumCheckedAt(download.integrity.checkedAt)}
+                  </div>
+                ) : null}
               </div>
               <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-2">
                 <div className="flex flex-col gap-1.5">
@@ -818,12 +827,22 @@ export const DownloadRow = memo(function DownloadRow({
                   />
                 </div>
               </div>
-              <div className="grid grid-cols-1 gap-2 text-[11px]">
-                <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
-                  <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Computed hash</div>
-                  <div className="mt-1 break-all text-foreground/80">{download.integrity.actual ?? "Not available yet"}</div>
+              {download.integrity.expected || download.integrity.actual ? (
+                <div className="grid grid-cols-1 gap-1.5 text-[11px]">
+                  {download.integrity.expected ? (
+                    <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
+                      <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Expected</div>
+                      <div className="mt-1 break-all text-foreground/80">{download.integrity.expected.value}</div>
+                    </div>
+                  ) : null}
+                  {download.integrity.actual ? (
+                    <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
+                      <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Computed</div>
+                      <div className="mt-1 break-all text-foreground/80">{download.integrity.actual}</div>
+                    </div>
+                  ) : null}
                 </div>
-              </div>
+              ) : null}
               {download.integrity.expected ? (
                 <button
                   type="button"
@@ -873,7 +892,7 @@ export const DownloadRow = memo(function DownloadRow({
                   disabled={csBusyAction !== null}
                   className="h-7 px-4 rounded-md bg-primary hover:bg-primary/90 text-primary-foreground text-[12px] font-medium transition-colors disabled:opacity-40"
                 >
-                  {csBusyAction === "save" ? "Saving…" : "Save"}
+                  {csBusyAction === "save" ? "Saving…" : "Save checksum"}
                 </button>
               </div>
             </form>

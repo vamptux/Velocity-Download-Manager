@@ -16,8 +16,12 @@ const INTEGRITY_VERIFIED_MESSAGE: &str = "Checksum verified successfully.";
 const INTEGRITY_MISMATCH_MESSAGE: &str = "Checksum mismatch detected.";
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-fn clear_integrity_observation(integrity: &mut DownloadIntegrity) {
+fn clear_integrity_actual(integrity: &mut DownloadIntegrity) {
     integrity.actual = None;
+}
+
+fn clear_integrity_observation(integrity: &mut DownloadIntegrity) {
+    clear_integrity_actual(integrity);
     integrity.checked_at = None;
 }
 
@@ -61,7 +65,7 @@ pub(super) fn reset_integrity_for_expected(
 }
 
 pub(super) fn mark_integrity_verifying(integrity: &mut DownloadIntegrity) {
-    clear_integrity_observation(integrity);
+    clear_integrity_actual(integrity);
     integrity.state = IntegrityState::Verifying;
     integrity.message = Some(INTEGRITY_VERIFYING_MESSAGE.to_string());
 }
@@ -86,8 +90,9 @@ pub(super) fn apply_integrity_result(
     });
 }
 
-pub(super) fn mark_integrity_failure(integrity: &mut DownloadIntegrity, error: &str) {
-    clear_integrity_observation(integrity);
+pub(super) fn mark_integrity_failure(integrity: &mut DownloadIntegrity, error: &str, checked_at: i64) {
+    clear_integrity_actual(integrity);
+    integrity.checked_at = Some(checked_at);
     integrity.state = IntegrityState::Pending;
     integrity.message = Some(format!("Checksum verification failed: {error}"));
 }

@@ -1553,9 +1553,6 @@ export function App() {
             activeCategory={activeCategory}
             onCategoryChange={setActiveCategory}
             downloads={downloads}
-            activeCount={downloadStats.activeCount}
-            queuedCount={downloadStats.queuedCount}
-            totalSpeed={downloadStats.totalSpeed}
           />
           <main className="flex flex-1 flex-col overflow-hidden">
             <Toolbar
