@@ -6,6 +6,8 @@ use super::scheduler::SegmentRuntimeSample;
 
 const SPEED_RISE_NEW_WEIGHT: u64 = 70;
 const SPEED_DROP_NEW_WEIGHT: u64 = 35;
+const SEGMENT_SPEED_RISE_NEW_WEIGHT: u64 = 55;
+const SEGMENT_SPEED_DROP_NEW_WEIGHT: u64 = 30;
 
 pub(super) fn aggregate_runtime_throughput(
     samples: &BTreeMap<u32, SegmentRuntimeSample>,
@@ -27,7 +29,10 @@ pub(super) fn stabilized_segment_throughput(
         return Some(0);
     }
     if latest_throughput > 0 {
-        return Some(latest_throughput);
+        return Some(smooth_segment_throughput(
+            previous_throughput,
+            latest_throughput,
+        ));
     }
     previous_throughput.filter(|value| *value > 0)
 }
@@ -63,4 +68,55 @@ fn smooth_download_speed(previous_speed: u64, instantaneous_speed: u64) -> u64 {
         .saturating_mul(old_weight)
         .saturating_add(instantaneous_speed.saturating_mul(new_weight))
         / 100
+}
+
+fn smooth_segment_throughput(previous_throughput: Option<u64>, latest_throughput: u64) -> u64 {
+    let Some(previous_throughput) = previous_throughput.filter(|value| *value > 0) else {
+        return latest_throughput;
+    };
+
+    let new_weight = if latest_throughput >= previous_throughput {
+        SEGMENT_SPEED_RISE_NEW_WEIGHT
+    } else {
+        SEGMENT_SPEED_DROP_NEW_WEIGHT
+    };
+    let old_weight = 100_u64.saturating_sub(new_weight);
+    previous_throughput
+        .saturating_mul(old_weight)
+        .saturating_add(latest_throughput.saturating_mul(new_weight))
+        / 100
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_previous_segment_speed_when_latest_sample_is_zero() {
+        let stabilized = stabilized_segment_throughput(
+            Some(120),
+            0,
+            &DownloadSegmentStatus::Downloading,
+        );
+
+        assert_eq!(stabilized, Some(120));
+    }
+
+    #[test]
+    fn smooths_segment_speed_spikes_before_aggregation() {
+        let stabilized = stabilized_segment_throughput(
+            Some(100),
+            1_000,
+            &DownloadSegmentStatus::Downloading,
+        );
+
+        assert_eq!(stabilized, Some(595));
+    }
+
+    #[test]
+    fn finished_segments_report_zero_throughput() {
+        let stabilized = stabilized_segment_throughput(Some(500), 250, &DownloadSegmentStatus::Finished);
+
+        assert_eq!(stabilized, Some(0));
+    }
 }

@@ -6,7 +6,7 @@ pub(super) const RUNTIME_RAMP_WARMUP_MIN_INTERVAL_MS: i64 = 350;
 
 pub(super) const RUNTIME_RAMP_WARMUP_MIN_SPEED_BYTES_PER_SECOND: u64 = 512 * 1024;
 
-pub(super) const RUNTIME_RAMP_WINDOW_SAMPLES: usize = 3;
+pub(super) const RUNTIME_RAMP_WINDOW_SAMPLES: usize = 5;
 
 pub(super) const RUNTIME_RAMP_HISTORY_RETENTION_MS: i64 = 6_000;
 
