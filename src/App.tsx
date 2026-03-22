@@ -9,6 +9,7 @@ import { StatusBar } from "@/components/StatusBar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { formatBytes } from "@/lib/format";
 import {
+  type BatchActionResult,
   canPauseDownload,
   canRestartDownload,
   canResumeDownload,
@@ -31,6 +32,7 @@ import {
   ipcReorderDownload,
   ipcRestartApp,
   ipcRestartDownload,
+  ipcRemoveDownloads,
   ipcResumeDownload,
   ipcRemoveDownload,
   ipcRetryEngineBootstrap,
@@ -87,6 +89,36 @@ type AppUpdateFeedback = {
   title: string;
   message: string;
 };
+
+type ActionFeedback = {
+  tone: "success" | "warning" | "error" | "info";
+  title: string;
+  message: string;
+};
+
+function summarizeBatchResult(actionLabel: string, result: BatchActionResult): ActionFeedback | null {
+  if (result.requested === 0) {
+    return null;
+  }
+
+  if (result.failed.length === 0) {
+    return null;
+  }
+
+  if (result.succeeded.length === 0) {
+    return {
+      tone: "error",
+      title: `${actionLabel} failed`,
+      message: result.failed[0]?.message ?? `VDM could not ${actionLabel.toLowerCase()} the selected downloads.`,
+    };
+  }
+
+  return {
+    tone: "warning",
+    title: `${actionLabel} partially completed`,
+    message: `${result.succeeded.length} of ${result.requested} selected downloads were updated. ${result.failed[0]?.message ?? "Some items need another try."}`,
+  };
+}
 
 function getActionErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message) {
@@ -405,6 +437,7 @@ export function App() {
   const [appUpdateCheckPending, setAppUpdateCheckPending] = useState(false);
   const [appUpdateFeedback, setAppUpdateFeedback] = useState<AppUpdateFeedback | null>(null);
   const [appUpdateCheckError, setAppUpdateCheckError] = useState<string | null>(null);
+  const [actionFeedback, setActionFeedback] = useState<ActionFeedback | null>(null);
   const completionTimers = useRef<Map<string, number>>(new Map());
   const lastRealtimeSyncAt = useRef(Date.now());
   const eventBridgeAttached = useRef(false);
@@ -635,7 +668,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!settingsNotice && !appUpdateFeedback && !appUpdateCheckError) {
+    if (!settingsNotice && !appUpdateFeedback && !appUpdateCheckError && !actionFeedback) {
       return;
     }
 
@@ -643,12 +676,13 @@ export function App() {
       setSettingsNotice(null);
       setAppUpdateFeedback(null);
       setAppUpdateCheckError(null);
+      setActionFeedback(null);
     }, 4200);
 
     return () => {
       window.clearTimeout(timeoutId);
     };
-  }, [appUpdateCheckError, appUpdateFeedback, settingsNotice]);
+  }, [actionFeedback, appUpdateCheckError, appUpdateFeedback, settingsNotice]);
 
   useEffect(() => {
     if (!bootstrapState.error) {
@@ -907,29 +941,47 @@ export function App() {
 
   const handlePauseSelected = useCallback(async () => {
     const ids = selectDownloadIds(selectedDownloads, canPauseDownload);
-    const changed = await runDownloadActionBatch(ids, ipcPauseDownload);
-    if (!changed) {
+    const result = await runDownloadActionBatch(ids, ipcPauseDownload);
+    if (result.requested === 0) {
       return;
     }
-    await refreshDownloadsAndQueue();
+    const feedback = summarizeBatchResult("Pause", result);
+    if (feedback) {
+      setActionFeedback(feedback);
+    }
+    if (result.succeeded.length > 0) {
+      await refreshDownloadsAndQueue();
+    }
   }, [refreshDownloadsAndQueue, selectedDownloads]);
 
   const handleResumeSelected = useCallback(async () => {
     const ids = selectDownloadIds(selectedDownloads, canResumeDownload);
-    const changed = await runDownloadActionBatch(ids, ipcResumeDownload);
-    if (!changed) {
+    const result = await runDownloadActionBatch(ids, ipcResumeDownload);
+    if (result.requested === 0) {
       return;
     }
-    await refreshDownloadsAndQueue();
+    const feedback = summarizeBatchResult("Resume", result);
+    if (feedback) {
+      setActionFeedback(feedback);
+    }
+    if (result.succeeded.length > 0) {
+      await refreshDownloadsAndQueue();
+    }
   }, [refreshDownloadsAndQueue, selectedDownloads]);
 
   const handleRestartSelected = useCallback(async () => {
     const ids = selectDownloadIds(selectedDownloads, canRestartDownload);
-    const changed = await runDownloadActionBatch(ids, ipcRestartDownload);
-    if (!changed) {
+    const result = await runDownloadActionBatch(ids, ipcRestartDownload);
+    if (result.requested === 0) {
       return;
     }
-    await refreshDownloadsAndQueue();
+    const feedback = summarizeBatchResult("Restart", result);
+    if (feedback) {
+      setActionFeedback(feedback);
+    }
+    if (result.succeeded.length > 0) {
+      await refreshDownloadsAndQueue();
+    }
   }, [refreshDownloadsAndQueue, selectedDownloads]);
 
   const handlePauseOne = useCallback(
@@ -963,10 +1015,6 @@ export function App() {
     }
   }, [selectedIds]);
 
-  const handleActivateDownload = useCallback((id: string) => {
-    setSelectedIds(new Set([id]));
-  }, []);
-
   const handleDeleteOne = useCallback(async (id: string) => {
     setDeleteTargetIds(new Set([id]));
     setDeleteDialogOpen(true);
@@ -975,16 +1023,80 @@ export function App() {
   const handleConfirmDelete = useCallback(
     async (deleteFile: boolean) => {
       const ids = [...deleteTargetIds];
-      await Promise.allSettled(ids.map((id) => ipcRemoveDownload(id, deleteFile)));
+      if (ids.length === 0) {
+        return;
+      }
+
+      let removedIds: string[] = [];
+      let errorMessage: string | null = null;
+
+      try {
+        removedIds = ids.length === 1
+          ? (await ipcRemoveDownload(ids[0], deleteFile).then(() => [ids[0]]))
+          : await ipcRemoveDownloads(ids, deleteFile);
+      } catch (error) {
+        errorMessage = getActionErrorMessage(
+          error,
+          `Velocity Download Manager could not remove the selected ${ids.length === 1 ? "download" : "downloads"}.`,
+        );
+      }
+
+      const removedSet = new Set(removedIds);
+      const failedIds = ids.filter((id) => !removedSet.has(id));
+
       setSelectedIds((prev) => {
         const next = new Set(prev);
-        for (const id of ids) {
+        for (const id of removedIds) {
           next.delete(id);
+        }
+        if (failedIds.length > 0) {
+          return new Set(failedIds);
+        }
+        return next;
+      });
+      setDownloadDetails((prev) => {
+        if (removedIds.length === 0) {
+          return prev;
+        }
+
+        const next = { ...prev };
+        for (const id of removedIds) {
+          delete next[id];
         }
         return next;
       });
       setDeleteTargetIds(new Set());
-      await refreshDownloadsAndQueue();
+
+      if (removedIds.length > 0 && failedIds.length === 0) {
+        setActionFeedback({
+          tone: "success",
+          title: deleteFile ? "Downloads deleted" : "Downloads removed",
+          message:
+            removedIds.length === 1
+              ? deleteFile
+                ? "The download and its file were deleted."
+                : "The download was removed from the list."
+              : deleteFile
+                ? `${removedIds.length} downloads and their files were deleted.`
+                : `${removedIds.length} downloads were removed from the list.`,
+        });
+      } else if (removedIds.length > 0) {
+        setActionFeedback({
+          tone: "warning",
+          title: "Delete partially completed",
+          message: `${removedIds.length} of ${ids.length} selected downloads were removed. ${errorMessage ?? "Some items were left selected so you can retry them."}`,
+        });
+      } else if (errorMessage) {
+        setActionFeedback({
+          tone: "error",
+          title: "Delete failed",
+          message: errorMessage,
+        });
+      }
+
+      if (removedIds.length > 0) {
+        await refreshDownloadsAndQueue();
+      }
     },
     [deleteTargetIds, refreshDownloadsAndQueue],
   );
@@ -1436,6 +1548,19 @@ export function App() {
       });
     }
 
+    if (actionFeedback) {
+      alerts.push({
+        id: `action-feedback:${actionFeedback.title}:${actionFeedback.message}`,
+        tone: actionFeedback.tone,
+        eyebrow: "Selection",
+        title: actionFeedback.title,
+        message: actionFeedback.message,
+        onDismiss: () => {
+          setActionFeedback(null);
+        },
+      });
+    }
+
     if (appUpdateFeedback) {
       alerts.push({
         id: `app-update-feedback:${appUpdateFeedback.title}:${appUpdateFeedback.message}`,
@@ -1491,6 +1616,7 @@ export function App() {
     handleCheckForUpdates,
     handleRestartAppUpdate,
     handleRetryBootstrap,
+    actionFeedback,
     settingsError,
     settingsNotice,
     settingsOpen,
@@ -1544,7 +1670,6 @@ export function App() {
               searchQuery={searchQuery}
               selectedIds={selectedIds}
               onSelectedChange={setSelectedIds}
-              onRowActivate={handleActivateDownload}
               onDelete={handleDeleteOne}
               onReorder={handleReorderOne}
               onOpenFolder={handleOpenFolder}

@@ -46,7 +46,6 @@ interface DownloadListProps {
   searchQuery?: string;
   selectedIds: Set<string>;
   onSelectedChange: (ids: Set<string>) => void;
-  onRowActivate: (id: string) => void;
   onDelete: (id: string) => Promise<void>;
   onReorder: (id: string, direction: "up" | "down") => Promise<void> | void;
   onOpenFolder: (id: string) => Promise<void> | void;
@@ -59,7 +58,6 @@ export function DownloadList({
   searchQuery,
   selectedIds,
   onSelectedChange,
-  onRowActivate,
   onDelete,
   onReorder,
   onOpenFolder,
@@ -69,6 +67,7 @@ export function DownloadList({
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
+  const selectionAnchorId = useRef<string | null>(null);
   const deferredSearchQuery = useDeferredValue(searchQuery);
   const normalizedSearchQuery = useMemo(
     () => deferredSearchQuery?.trim().toLowerCase() ?? "",
@@ -180,8 +179,39 @@ export function DownloadList({
   const handleSelect = useCallback((id: string, checked: boolean) => {
     const next = new Set(selectedIds);
     if (checked) next.add(id); else next.delete(id);
+    selectionAnchorId.current = id;
     onSelectedChange(next);
   }, [onSelectedChange, selectedIds]);
+
+  const handleActivate = useCallback((id: string, options?: { toggle?: boolean; range?: boolean }) => {
+    const orderedIds = sorted.map((download) => download.id);
+    const anchorId = selectionAnchorId.current;
+
+    if (options?.range && anchorId && orderedIds.includes(anchorId)) {
+      const startIndex = orderedIds.indexOf(anchorId);
+      const endIndex = orderedIds.indexOf(id);
+      if (endIndex >= 0) {
+        const [from, to] = startIndex <= endIndex ? [startIndex, endIndex] : [endIndex, startIndex];
+        onSelectedChange(new Set(orderedIds.slice(from, to + 1)));
+        return;
+      }
+    }
+
+    if (options?.toggle) {
+      const next = new Set(selectedIds);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      selectionAnchorId.current = id;
+      onSelectedChange(next);
+      return;
+    }
+
+    selectionAnchorId.current = id;
+    onSelectedChange(new Set([id]));
+  }, [onSelectedChange, selectedIds, sorted]);
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
@@ -244,7 +274,7 @@ export function DownloadList({
                   canMoveUp={moveState?.canMoveUp ?? false}
                   canMoveDown={moveState?.canMoveDown ?? false}
                   onSelect={handleSelect}
-                  onActivate={onRowActivate}
+                  onActivate={handleActivate}
                   onDelete={onDelete}
                   onReorder={onReorder}
                   onOpenFolder={onOpenFolder}

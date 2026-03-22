@@ -1,5 +1,28 @@
 import type { Download } from "@/types/download";
 
+export interface BatchActionFailure {
+  id: string;
+  message: string;
+}
+
+export interface BatchActionResult {
+  requested: number;
+  succeeded: string[];
+  failed: BatchActionFailure[];
+}
+
+function batchActionErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+
+  return "The action could not be completed.";
+}
+
 function isReplayOnlyRequest(download: Download): boolean {
   return download.compatibility.requestMethod !== "get" || download.compatibility.requestFormFields.length > 0;
 }
@@ -78,11 +101,35 @@ export function selectDownloadIds(
 export async function runDownloadActionBatch(
   ids: string[],
   action: (id: string) => Promise<void>,
-): Promise<boolean> {
+) : Promise<BatchActionResult> {
   if (ids.length === 0) {
-    return false;
+    return {
+      requested: 0,
+      succeeded: [],
+      failed: [],
+    };
   }
 
-  await Promise.allSettled(ids.map((id) => action(id)));
-  return true;
+  const outcomes = await Promise.allSettled(ids.map((id) => action(id)));
+  const succeeded: string[] = [];
+  const failed: BatchActionFailure[] = [];
+
+  outcomes.forEach((outcome, index) => {
+    const id = ids[index];
+    if (outcome.status === "fulfilled") {
+      succeeded.push(id);
+      return;
+    }
+
+    failed.push({
+      id,
+      message: batchActionErrorMessage(outcome.reason),
+    });
+  });
+
+  return {
+    requested: ids.length,
+    succeeded,
+    failed,
+  };
 }

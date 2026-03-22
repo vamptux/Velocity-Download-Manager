@@ -191,6 +191,16 @@ async fn remove_download(
 }
 
 #[tauri::command]
+async fn remove_downloads(
+    ids: Vec<String>,
+    delete_file: bool,
+    app: AppHandle,
+    state: State<'_, EngineState>,
+) -> CommandResult<Vec<String>> {
+    state.inner().remove_downloads(&app, &ids, delete_file).await
+}
+
+#[tauri::command]
 async fn reorder_download(
     id: String,
     direction: ReorderDirection,
@@ -338,6 +348,7 @@ pub fn run() {
             resume_download,
             restart_download,
             remove_download,
+            remove_downloads,
             reorder_download,
             start_queue,
             stop_queue,

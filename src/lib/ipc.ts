@@ -247,6 +247,10 @@ export async function ipcRemoveDownload(id: string, deleteFile: boolean = false)
   await invoke("remove_download", { id, deleteFile });
 }
 
+export async function ipcRemoveDownloads(ids: string[], deleteFile: boolean = false): Promise<string[]> {
+  return invoke<string[]>("remove_downloads", { ids, deleteFile });
+}
+
 export async function ipcReorderDownload(id: string, direction: ReorderDirection): Promise<Download> {
   const raw = await invoke<RawDownload>("reorder_download", { id, direction });
   return fromRawDownload(raw);

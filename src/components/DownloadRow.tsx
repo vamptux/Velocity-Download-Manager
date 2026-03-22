@@ -235,7 +235,7 @@ export interface DownloadRowProps {
   canMoveUp: boolean;
   canMoveDown: boolean;
   onSelect: (id: string, checked: boolean) => void;
-  onActivate: (id: string) => void;
+  onActivate: (id: string, options?: { toggle?: boolean; range?: boolean }) => void;
   onDelete: (id: string) => Promise<void>;
   onReorder: (id: string, direction: "up" | "down") => Promise<void> | void;
   onOpenFolder: (id: string) => Promise<void> | void;
@@ -398,7 +398,12 @@ export const DownloadRow = memo(function DownloadRow({
               isDownloading && !selected && "shadow-[inset_2px_0_0_hsl(var(--status-downloading)/0.3)]",
             )}
             style={{ minHeight: "38px" }}
-            onClick={() => onActivate(download.id)}
+            onClick={(event) =>
+              onActivate(download.id, {
+                toggle: event.ctrlKey || event.metaKey,
+                range: event.shiftKey,
+              })
+            }
           >
             <span
               className={cn(

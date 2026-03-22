@@ -1012,6 +1012,69 @@ impl EngineState {
         Ok(())
     }
 
+    pub async fn remove_downloads(
+        &self,
+        _app: &AppHandle,
+        ids: &[String],
+        delete_file: bool,
+    ) -> Result<Vec<String>, String> {
+        use std::collections::HashSet;
+
+        self.await_bootstrap().await;
+
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        for id in ids {
+            self.abort_runtime_task(id);
+            self.abort_integrity_task(id);
+        }
+
+        let requested_ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut registry = self.registry_guard()?;
+
+        for download in registry
+            .downloads
+            .iter()
+            .filter(|download| requested_ids.contains(download.id.as_str()))
+        {
+            if delete_file || download.status != DownloadStatus::Finished {
+                let _ = std::fs::remove_file(&download.temp_path);
+            }
+            if delete_file {
+                let _ = std::fs::remove_file(&download.target_path);
+            }
+        }
+
+        let mut removed_ids = Vec::new();
+        registry.downloads.retain(|download| {
+            let keep = !requested_ids.contains(download.id.as_str());
+            if !keep {
+                removed_ids.push(download.id.clone());
+            }
+            keep
+        });
+
+        if removed_ids.is_empty() {
+            return Err("No downloads found for the requested ids.".to_string());
+        }
+
+        normalize_queue_positions(&mut registry.downloads);
+        let dispatch_plan = plan_runtime_dispatch(&mut registry);
+        let min_interval_ms = registry.settings.segment_checkpoint_min_interval_ms;
+        self.persist_registry_flush(&registry)?;
+        drop(registry);
+
+        for id in &removed_ids {
+            self.clear_download_rate_limiter(id);
+            self.emit_download_removed(id);
+        }
+
+        self.apply_runtime_dispatch_plan(dispatch_plan, min_interval_ms);
+        Ok(removed_ids)
+    }
+
     pub async fn reorder_download(
         &self,
         _app: &AppHandle,
