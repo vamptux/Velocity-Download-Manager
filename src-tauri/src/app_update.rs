@@ -13,7 +13,10 @@ fn to_update_info(update: &Update) -> AppUpdateInfo {
     }
 }
 
-pub async fn check_for_update(app: &AppHandle) -> Result<Option<AppUpdateInfo>, String> {
+pub async fn check_for_update(
+    app: &AppHandle,
+    skipped_version: Option<&str>,
+) -> Result<Option<AppUpdateInfo>, String> {
     let update = app
         .updater_builder()
         .build()
@@ -22,7 +25,13 @@ pub async fn check_for_update(app: &AppHandle) -> Result<Option<AppUpdateInfo>, 
         .await
         .map_err(|error| format!("Failed checking for updates: {error}"))?;
 
-    Ok(update.as_ref().map(to_update_info))
+    Ok(update.as_ref().and_then(|candidate| {
+        let info = to_update_info(candidate);
+        match skipped_version {
+            Some(skipped) if skipped == info.version => None,
+            _ => Some(info),
+        }
+    }))
 }
 
 pub async fn install_update(app: &AppHandle) -> Result<AppUpdateInfo, String> {

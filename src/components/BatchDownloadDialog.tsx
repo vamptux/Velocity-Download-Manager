@@ -1,61 +1,124 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { X, ListPlus } from "lucide-react";
+import { InlineNotice } from "@/components/ui/inline-notice";
 import { cn } from "@/lib/utils";
 import { ipcAddDownload } from "@/lib/ipc";
-import { getCaptureErrorMessage } from "@/lib/captureUtils";
+import { getCaptureErrorMessage, useDefaultCaptureSavePath } from "@/lib/captureUtils";
+import { parseBatchImportInput } from "@/lib/batchImport";
+import { describeDuplicateMatch, findDuplicateDownload } from "@/lib/downloadDuplicates";
 import type { Download } from "@/types/download";
 
 interface BatchDownloadDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onDownloadsAdded?: (downloads: Download[]) => void;
+  existingDownloads?: Download[];
 }
 
-export function BatchDownloadDialog({ open, onOpenChange, onDownloadsAdded }: BatchDownloadDialogProps) {
+interface BatchImportResult {
+  successCount: number;
+  failureCount: number;
+  failures: Array<{ lineNumber: number; label: string; message: string }>;
+}
+
+export function BatchDownloadDialog({
+  open,
+  onOpenChange,
+  onDownloadsAdded,
+  existingDownloads = [],
+}: BatchDownloadDialogProps) {
   const [urls, setUrls] = useState("");
+  const [defaultSavePath, setDefaultSavePath] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [progress, setProgress] = useState<{ total: number; done: number } | null>(null);
+  const [importResult, setImportResult] = useState<BatchImportResult | null>(null);
+
+  useDefaultCaptureSavePath(open, defaultSavePath, setDefaultSavePath);
+
+  const preview = useMemo(() => {
+    const base = parseBatchImportInput(urls, defaultSavePath);
+    const rows = base.rows.map((row) => {
+      const duplicateMatch = findDuplicateDownload(existingDownloads, {
+        url: row.url,
+        targetPath: row.targetPath,
+      });
+
+      if (!duplicateMatch) {
+        return row;
+      }
+
+      return {
+        ...row,
+        errors: [...row.errors, describeDuplicateMatch(duplicateMatch)],
+      };
+    });
+
+    const invalidCount = rows.filter((row) => row.errors.length > 0).length;
+    return {
+      ...base,
+      rows,
+      validCount: rows.length - invalidCount,
+      invalidCount,
+    };
+  }, [defaultSavePath, existingDownloads, urls]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!urls.trim() || submitting) return;
 
-    const lines = urls.split("\n").map(line => line.trim()).filter(line => line.length > 0);
-    if (lines.length === 0) return;
+    const validRows = preview.rows.filter((row) => row.errors.length === 0);
+    if (validRows.length === 0) return;
 
     setSubmitting(true);
     setSubmitError(null);
-    setProgress({ total: lines.length, done: 0 });
+    setImportResult(null);
+    setProgress({ total: validRows.length, done: 0 });
 
     const addedDownloads: Download[] = [];
+    const failures: BatchImportResult["failures"] = [];
 
     try {
-      for (let i = 0; i < lines.length; i++) {
-        const url = lines[i];
+      for (let index = 0; index < validRows.length; index += 1) {
+        const row = validRows[index];
         try {
           const download = await ipcAddDownload({
-            url,
-            category: "compressed",
-            savePath: "",
-            startImmediately: true,
+            url: row.url,
+            name: row.filename,
+            category: row.category,
+            savePath: row.folder,
+            checksum: row.checksum ?? undefined,
+            startImmediately: row.startImmediately,
           });
           addedDownloads.push(download);
         } catch (err) {
-          console.error("Failed to add download for", url, err);
-          // Continue with others even if one fails
+          failures.push({
+            lineNumber: row.lineNumber,
+            label: row.filename || row.url,
+            message: getCaptureErrorMessage(err),
+          });
         }
-        setProgress({ total: lines.length, done: i + 1 });
+        setProgress({ total: validRows.length, done: index + 1 });
       }
 
       onDownloadsAdded?.(addedDownloads);
-      onOpenChange(false);
-      setUrls("");
-      setProgress(null);
+
+      if (failures.length === 0 && preview.invalidCount === 0) {
+        onOpenChange(false);
+        setUrls("");
+        setImportResult(null);
+      } else {
+        setImportResult({
+          successCount: addedDownloads.length,
+          failureCount: failures.length,
+          failures,
+        });
+      }
     } catch (error) {
       setSubmitError(getCaptureErrorMessage(error));
     } finally {
+      setProgress(null);
       setSubmitting(false);
     }
   }
@@ -68,6 +131,7 @@ export function BatchDownloadDialog({ open, onOpenChange, onDownloadsAdded }: Ba
           setUrls("");
           setSubmitError(null);
           setProgress(null);
+          setImportResult(null);
         }
       }
     }}>
@@ -103,17 +167,24 @@ export function BatchDownloadDialog({ open, onOpenChange, onDownloadsAdded }: Ba
           <form onSubmit={handleSubmit} className="flex flex-col gap-3 px-5 py-4">
             <div className="flex flex-col gap-1.5">
               <label htmlFor="batch-urls" className="text-[11.5px] font-medium text-foreground/80">
-                Download URLs (one per line)
+                Paste URLs, CSV, or TSV
               </label>
               <textarea
                 id="batch-urls"
                 value={urls}
-                onChange={(e) => setUrls(e.target.value)}
-                placeholder="https://example.com/file1.zip&#10;https://example.com/file2.zip"
+                onChange={(e) => {
+                  setUrls(e.target.value);
+                  setSubmitError(null);
+                  setImportResult(null);
+                }}
+                placeholder={"https://example.com/file1.zip\nhttps://example.com/file2.zip\n\nurl,folder,filename,category,start mode\nhttps://example.com/file3.zip,C:\\Downloads,file3.zip,compressed,queued"}
                 className="min-h-[150px] w-full rounded-md border border-border bg-black/20 p-2.5 text-[12px] text-foreground placeholder:text-muted-foreground/40 outline-none focus:border-primary/50 focus:bg-black/40 transition-colors resize-none shadow-inner"
                 disabled={submitting}
                 autoFocus
               />
+              <div className="text-[11px] text-muted-foreground/55">
+                Rows without a folder use {defaultSavePath || "your default download directory"}. Supported columns: url, folder, filename, checksum, category, start mode.
+              </div>
             </div>
 
             {submitError && (
@@ -122,9 +193,83 @@ export function BatchDownloadDialog({ open, onOpenChange, onDownloadsAdded }: Ba
               </div>
             )}
 
+            {preview.rows.length > 0 ? (
+              <div className="rounded-lg border border-border/60 bg-black/10 p-3">
+                <div className="flex items-center justify-between gap-3 text-[11px] text-muted-foreground/70">
+                  <span>Detected format: {preview.format.toUpperCase()}</span>
+                  <span>{preview.validCount} ready, {preview.invalidCount} need review</span>
+                </div>
+                <div className="mt-2 max-h-[190px] overflow-y-auto rounded-md border border-border/40 bg-black/10">
+                  <div className="grid grid-cols-[52px_minmax(0,1.4fr)_minmax(0,1.1fr)_88px] gap-x-2 border-b border-border/40 px-3 py-2 text-[10px] uppercase tracking-[0.12em] text-muted-foreground/45">
+                    <span>Row</span>
+                    <span>File</span>
+                    <span>Folder</span>
+                    <span>Status</span>
+                  </div>
+                  {preview.rows.slice(0, 8).map((row) => {
+                    const hasErrors = row.errors.length > 0;
+                    return (
+                      <div
+                        key={`${row.lineNumber}:${row.url}`}
+                        className="grid grid-cols-[52px_minmax(0,1.4fr)_minmax(0,1.1fr)_88px] gap-x-2 border-b border-border/20 px-3 py-2 text-[11px] last:border-b-0"
+                      >
+                        <span className="text-muted-foreground/60">{row.lineNumber}</span>
+                        <div className="min-w-0">
+                          <div className="truncate text-foreground/84">{row.filename || row.url}</div>
+                          <div className="truncate text-muted-foreground/50">{row.url}</div>
+                          {hasErrors ? (
+                            <div className="mt-1 text-[10.5px] text-[hsl(var(--status-error))]">
+                              {row.errors[0]}
+                            </div>
+                          ) : null}
+                        </div>
+                        <div className="min-w-0 truncate text-muted-foreground/60">{row.folder || "Missing"}</div>
+                        <div className={hasErrors ? "text-[hsl(var(--status-error))]" : "text-[hsl(var(--status-finished))]"}>
+                          {hasErrors ? "Review" : row.startImmediately ? "Start now" : "Queued"}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {preview.rows.length > 8 ? (
+                  <div className="mt-2 text-[11px] text-muted-foreground/55">
+                    Showing 8 of {preview.rows.length} parsed rows.
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {preview.invalidCount > 0 ? (
+              <InlineNotice
+                tone="warning"
+                title="Some rows need review"
+                message="VDM will only import rows that validate cleanly and do not duplicate existing downloads."
+              />
+            ) : null}
+
+            {importResult ? (
+              <InlineNotice
+                tone={importResult.failureCount > 0 ? "warning" : "success"}
+                title={importResult.failureCount > 0 ? "Import finished with issues" : "Import complete"}
+                message={importResult.failureCount > 0
+                  ? `${importResult.successCount} downloads were added and ${importResult.failureCount} rows failed.`
+                  : `${importResult.successCount} downloads were added.`}
+              />
+            ) : null}
+
+            {importResult?.failures.length ? (
+              <div className="max-h-[100px] overflow-y-auto rounded-md border border-[hsl(var(--status-paused)/0.2)] bg-[hsl(var(--status-paused)/0.07)] px-3 py-2 text-[11px] text-foreground/74">
+                {importResult.failures.slice(0, 5).map((failure) => (
+                  <div key={`${failure.lineNumber}:${failure.label}`} className="py-0.5">
+                    Row {failure.lineNumber}: {failure.message}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
             {progress && (
               <div className="flex items-center justify-between text-[11.5px] text-muted-foreground">
-                <span>Processing links...</span>
+                <span>Importing rows...</span>
                 <span>{progress.done} / {progress.total}</span>
               </div>
             )}
@@ -142,11 +287,11 @@ export function BatchDownloadDialog({ open, onOpenChange, onDownloadsAdded }: Ba
               </Dialog.Close>
               <button
                 type="submit"
-                disabled={!urls.trim() || submitting}
+                disabled={preview.validCount === 0 || submitting}
                 style={{ background: "linear-gradient(90deg, hsl(var(--accent-h) 22% 32%) 0%, hsl(var(--accent-h) 15% 25%) 55%, hsl(0,0%,18%) 100%)" }}
                 className="h-8 px-5 rounded-md text-[12.5px] font-semibold text-[hsl(0,0%,93%)] hover:brightness-110 transition-all disabled:opacity-40 disabled:pointer-events-none"
               >
-                {submitting ? "Adding..." : "Add Downloads"}
+                {submitting ? "Importing..." : preview.validCount > 0 ? `Import ${preview.validCount}` : "Nothing to import"}
               </button>
             </div>
           </form>

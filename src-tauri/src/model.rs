@@ -129,6 +129,8 @@ pub struct EngineSettings {
     pub traffic_mode: TrafficMode,
     #[serde(default)]
     pub speed_limit_bytes_per_second: Option<u64>,
+    #[serde(default)]
+    pub skipped_update_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, TS)]
@@ -151,6 +153,7 @@ impl Default for EngineSettings {
             experimental_uncapped_mode: false,
             traffic_mode: TrafficMode::default(),
             speed_limit_bytes_per_second: None,
+            skipped_update_version: None,
         }
     }
 }

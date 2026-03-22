@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { X, Link, ArrowDownToLine } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ipcAddDownload, ipcProbeDownload } from "@/lib/ipc";
+import { InlineNotice } from "@/components/ui/inline-notice";
 import type { Download, DownloadContentCategory, DownloadProbe } from "@/types/download";
 import {
   DialogFormField,
@@ -12,15 +13,27 @@ import {
   ProbeSummaryStrip,
 } from "@/components/DownloadCapturePane";
 import { getCaptureErrorMessage, useDefaultCaptureSavePath } from "@/lib/captureUtils";
+import {
+  describeDuplicateMatch,
+  findDuplicateDownload,
+  joinTargetPathPreview,
+} from "@/lib/downloadDuplicates";
 
 interface NewDownloadDialogProps {
   open: boolean;
   initialUrl?: string;
   onOpenChange: (open: boolean) => void;
   onDownloadAdded?: (download: Download) => void;
+  existingDownloads?: Download[];
 }
 
-export function NewDownloadDialog({ open, initialUrl, onOpenChange, onDownloadAdded }: NewDownloadDialogProps) {
+export function NewDownloadDialog({
+  open,
+  initialUrl,
+  onOpenChange,
+  onDownloadAdded,
+  existingDownloads = [],
+}: NewDownloadDialogProps) {
   const [url, setUrl] = useState("");
   const [filename, setFilename] = useState("");
   const [category, setCategory] = useState<DownloadContentCategory>("compressed");
@@ -96,9 +109,16 @@ export function NewDownloadDialog({ open, initialUrl, onOpenChange, onDownloadAd
     };
   }, [categoryDirty, filenameDirty, open, savePath, url]);
 
+  const effectiveFilename = filename.trim() || probe?.suggestedName || "";
+  const duplicateMatch = useMemo(() => findDuplicateDownload(existingDownloads, {
+    url,
+    finalUrl: probe?.finalUrl,
+    targetPath: joinTargetPathPreview(savePath, effectiveFilename),
+  }), [effectiveFilename, existingDownloads, probe?.finalUrl, savePath, url]);
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!url.trim() || submitting) return;
+    if (!url.trim() || submitting || duplicateMatch) return;
     setSubmitting(true);
     setSubmitError(null);
     try {
@@ -237,6 +257,14 @@ export function NewDownloadDialog({ open, initialUrl, onOpenChange, onDownloadAd
               }}
             />
 
+            {duplicateMatch ? (
+              <InlineNotice
+                tone="warning"
+                title="Potential duplicate"
+                message={describeDuplicateMatch(duplicateMatch)}
+              />
+            ) : null}
+
             {/* Actions */}
             <div className="flex items-center justify-end gap-2.5 pt-1">
               <Dialog.Close asChild>
@@ -251,7 +279,7 @@ export function NewDownloadDialog({ open, initialUrl, onOpenChange, onDownloadAd
                 type="submit"
                 style={{ background: "linear-gradient(90deg, hsl(var(--accent-h) 22% 32%) 0%, hsl(var(--accent-h) 15% 25%) 55%, hsl(0,0%,18%) 100%)" }}
                 className="h-8 px-5 rounded-md text-[12.5px] font-semibold text-[hsl(0,0%,93%)] hover:brightness-110 transition-all disabled:opacity-40 disabled:pointer-events-none"
-                disabled={!url.trim() || submitting}
+                disabled={!url.trim() || submitting || duplicateMatch != null}
               >
                 {submitting ? "Adding…" : "Download"}
               </button>

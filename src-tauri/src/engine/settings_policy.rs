@@ -26,5 +26,9 @@ pub(super) fn sanitize_engine_settings(mut settings: EngineSettings) -> EngineSe
     settings.speed_limit_bytes_per_second = settings
         .speed_limit_bytes_per_second
         .filter(|value| *value > 0);
+    settings.skipped_update_version = settings
+        .skipped_update_version
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     settings
 }

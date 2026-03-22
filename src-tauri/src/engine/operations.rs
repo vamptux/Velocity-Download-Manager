@@ -12,6 +12,52 @@ const PROBE_SOURCE_WARNING_CACHED: &str = "Probe metadata source: recent probe c
 const PROBE_SOURCE_WARNING_FALLBACK: &str =
     "Probe metadata source: planning fallback without fresh metadata.";
 
+fn target_path_matches(left: &str, right: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        left.eq_ignore_ascii_case(right)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        left == right
+    }
+}
+
+fn urls_overlap(existing: &DownloadRecord, requested_url: &str, final_url: &str) -> bool {
+    let existing_urls = [existing.url.as_str(), existing.final_url.as_str()];
+    existing_urls.iter().any(|candidate| {
+        super::probe_html::urls_match_after_normalization(candidate, requested_url)
+            || super::probe_html::urls_match_after_normalization(candidate, final_url)
+    })
+}
+
+fn duplicate_download_message(existing: &DownloadRecord, reason: &str) -> String {
+    format!(
+        "Download already exists: '{}' is already {}. Existing status: {:?}.",
+        existing.name, reason, existing.status
+    )
+}
+
+fn find_duplicate_download<'a>(
+    downloads: &'a [DownloadRecord],
+    requested_url: &str,
+    final_url: &str,
+    target_path: &str,
+) -> Option<(&'a DownloadRecord, &'static str)> {
+    for existing in downloads {
+        if target_path_matches(&existing.target_path, target_path) {
+            return Some((existing, "using the same target file"));
+        }
+
+        if urls_overlap(existing, requested_url, final_url) {
+            return Some((existing, "tracking the same source URL"));
+        }
+    }
+
+    None
+}
+
 struct ProbePlanningState {
     now: i64,
     scope_key: String,
@@ -506,6 +552,11 @@ impl EngineState {
         let max_connections =
             effective_connection_target_for_scope(16, &settings, host_profile, Some(&scope_key));
         let target_path = join_target_path(&save_path, &name);
+        if let Some((existing, reason)) =
+            find_duplicate_download(&registry.downloads, &url, &final_url, &target_path)
+        {
+            return Err(duplicate_download_message(existing, reason));
+        }
         let available_space = query_available_space(Path::new(&save_path));
         let cached_range = cached_probe
             .as_ref()

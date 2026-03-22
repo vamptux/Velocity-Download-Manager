@@ -60,13 +60,13 @@ const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   experimentalUncappedMode: false,
   trafficMode: "max",
   speedLimitBytesPerSecond: null,
+  skippedUpdateVersion: null,
 };
 
 const LIVE_PROGRESS_HEARTBEAT_MS = 1200;
 const LIVE_PROGRESS_STALL_MS = 2500;
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const UPDATE_LAST_CHECK_KEY = "velocity-update:last-check";
-const UPDATE_DISMISSED_VERSION_KEY = "velocity-update:dismissed-version";
 
 type AppUpdateStage = "idle" | "available" | "downloading" | "downloaded" | "failed" | "up-to-date";
 
@@ -368,7 +368,7 @@ export function App() {
     downloadedBytes: 0,
     totalBytes: null,
     error: null,
-    dismissedVersion: readStoredString(UPDATE_DISMISSED_VERSION_KEY),
+    dismissedVersion: null,
   }));
   const completionTimers = useRef<Map<string, number>>(new Map());
   const lastRealtimeSyncAt = useRef(Date.now());
@@ -624,6 +624,20 @@ export function App() {
       setDismissedDownloadIssueSignature(null);
     }
   }, [downloads]);
+
+  useEffect(() => {
+    setAppUpdate((prev) => {
+      const dismissedVersion = settings.skippedUpdateVersion ?? null;
+      if (prev.dismissedVersion === dismissedVersion) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        dismissedVersion,
+      };
+    });
+  }, [settings.skippedUpdateVersion]);
 
   useEffect(() => {
     if (import.meta.env.DEV) {
@@ -992,17 +1006,38 @@ export function App() {
 
   const handleDismissAppUpdate = useCallback(() => {
     const dismissedVersion = appUpdate.info?.version ?? appUpdate.dismissedVersion;
-    if (dismissedVersion) {
-      writeStoredString(UPDATE_DISMISSED_VERSION_KEY, dismissedVersion);
+    if (!dismissedVersion) {
+      setAppUpdate((prev) => ({
+        ...prev,
+        stage: prev.stage === "downloaded" ? prev.stage : "idle",
+        error: null,
+      }));
+      return;
     }
 
-    setAppUpdate((prev) => ({
-      ...prev,
-      stage: prev.stage === "downloaded" ? prev.stage : "idle",
-      dismissedVersion,
-      error: null,
-    }));
-  }, [appUpdate.dismissedVersion, appUpdate.info]);
+    void ipcUpdateEngineSettings({
+      ...settings,
+      skippedUpdateVersion: dismissedVersion,
+    })
+      .then((updated) => {
+        setSettings(updated);
+        setAppUpdate((prev) => ({
+          ...prev,
+          stage: prev.stage === "downloaded" ? prev.stage : "idle",
+          dismissedVersion,
+          error: null,
+        }));
+      })
+      .catch((error) => {
+        setAppUpdate((prev) => ({
+          ...prev,
+          stage: "failed",
+          error: simplifyUserMessage(
+            getActionErrorMessage(error, "Velocity Download Manager could not store the skipped version."),
+          ),
+        }));
+      });
+  }, [appUpdate.dismissedVersion, appUpdate.info, settings]);
 
   const handleInstallAppUpdate = useCallback(async () => {
     setAppUpdate((prev) => ({
@@ -1015,8 +1050,15 @@ export function App() {
 
     try {
       const installedUpdate = await ipcInstallAppUpdate();
-      writeStoredString(UPDATE_DISMISSED_VERSION_KEY, null);
       writeStoredString(UPDATE_LAST_CHECK_KEY, String(Date.now()));
+
+      if (settings.skippedUpdateVersion != null) {
+        const updatedSettings = await ipcUpdateEngineSettings({
+          ...settings,
+          skippedUpdateVersion: null,
+        });
+        setSettings(updatedSettings);
+      }
 
       setAppUpdate((prev) => ({
         ...prev,
@@ -1037,7 +1079,7 @@ export function App() {
         totalBytes: null,
       }));
     }
-  }, []);
+  }, [settings]);
 
   const handleRestartAppUpdate = useCallback(async () => {
     try {
@@ -1360,6 +1402,7 @@ export function App() {
           <NewDownloadDialog
             open={newDownloadOpen}
             initialUrl={newDownloadPrefillUrl}
+            existingDownloads={downloads}
             onOpenChange={(nextOpen) => {
               setNewDownloadOpen(nextOpen);
               if (!nextOpen) {
@@ -1379,6 +1422,7 @@ export function App() {
           <BatchDownloadDialog
             open={batchDownloadOpen}
             onOpenChange={setBatchDownloadOpen}
+            existingDownloads={downloads}
             onDownloadsAdded={(addedDownloads) => {
               for (const download of addedDownloads) {
                 upsertDownload(download);

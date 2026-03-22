@@ -42,8 +42,12 @@ fn retry_engine_bootstrap(state: State<'_, EngineState>) -> EngineBootstrapState
 }
 
 #[tauri::command]
-async fn check_app_update(app: AppHandle) -> CommandResult<Option<AppUpdateInfo>> {
-    app_update::check_for_update(&app).await
+async fn check_app_update(
+    app: AppHandle,
+    state: State<'_, EngineState>,
+) -> CommandResult<Option<AppUpdateInfo>> {
+    let skipped_version = state.inner().get_settings().skipped_update_version;
+    app_update::check_for_update(&app, skipped_version.as_deref()).await
 }
 
 #[tauri::command]
