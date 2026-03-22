@@ -691,7 +691,6 @@ export const DownloadRow = memo(function DownloadRow({
               icon={Shield}
               label="Checksum info…"
               onSelect={openChecksumDialog}
-              disabled={download.integrity.state === "verifying"}
             />
             <MenuItem
               icon={Clock3}
