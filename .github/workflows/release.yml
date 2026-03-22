@@ -6,14 +6,21 @@ on:
       - "v*"
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   release:
     runs-on: windows-latest
+    timeout-minutes: 60
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -69,4 +76,7 @@ jobs:
           $assetNames = @($release.assets | ForEach-Object { $_.name })
           if (-not ($assetNames -contains "latest.json")) {
             throw "The release is missing latest.json, so in-app updates would fail."
+          }
+          if (-not ($assetNames | Where-Object { $_ -like "*.sig" })) {
+            throw "The release is missing updater signature assets, so in-app update verification would fail."
           }

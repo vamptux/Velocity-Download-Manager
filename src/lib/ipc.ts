@@ -118,7 +118,11 @@ export async function ipcInstallAppUpdate(): Promise<AppUpdateInfo> {
 }
 
 export async function ipcRestartApp(): Promise<void> {
-  await invoke("restart_app");
+  await invoke("restart_app", { updateInfo: null });
+}
+
+export async function ipcRestartToApplyUpdate(updateInfo: AppUpdateInfo): Promise<void> {
+  await invoke("restart_app", { updateInfo });
 }
 
 export async function ipcOpenExternalUrl(url: string): Promise<void> {

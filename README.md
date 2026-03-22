@@ -52,16 +52,26 @@ The signed NSIS installer is emitted under `src-tauri/target/release/bundle/nsis
 
 - Tauri updater artifacts and `latest.json` are produced by `.github/workflows/release.yml`.
 - Push a tag in the form `vX.Y.Z` to publish a Windows installer release on GitHub.
+- `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` must stay on the same version; `bun run check:version-sync` enforces that locally and in CI.
 - Stable builds check `https://github.com/vamptux/Velocity-Download-Manager/releases/latest/download/latest.json` for updates.
 - Preview builds check `https://github.com/vamptux/Velocity-Download-Manager/releases/latest/download/latest-preview.json` first and fall back to the stable manifest when no preview manifest is published.
 - Manual update checks now fall back to GitHub release metadata when an updater manifest is missing or delayed, so the app can say "up to date" or "release published but not ready for in-app install yet" instead of surfacing a raw JSON fetch failure.
 - The update channel is persisted in engine settings and can be switched in the app under Browser Integration -> App Updates.
-- After install, VDM records a pending startup-health transition. If the first restart boots the wrong version or the updated build fails engine bootstrap, the failed version is marked as skipped for future checks and preview users are moved back to the stable channel.
+- VDM records the pending startup-health transition only when the user chooses to restart and apply the staged update, which avoids falsely marking a downloaded-but-not-yet-applied build as failed.
+- Startup maintenance prunes stale updater temp artifacts and legacy app-local update directories so repeated upgrades do not keep growing disk usage.
 - `TAURI_SIGNING_PRIVATE_KEY` must contain the full contents of `%USERPROFILE%\.tauri\velocity-download-manager.key`, not the password or a placeholder string.
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is only the passphrase for a password-protected key.
 - The current local updater key for this repo was generated without a password, so `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` should be omitted in GitHub or left empty.
 - The current public updater key is embedded in `src-tauri/tauri.conf.json`.
-- The release workflow now hard-fails if `latest.json` is not attached to the tagged GitHub release, which prevents shipping a build that would break the in-app updater.
+- The release workflow now hard-fails if `latest.json` or updater signature assets are missing from the tagged GitHub release, which prevents shipping a build that would break in-app verification.
+
+## Versioning
+
+```powershell
+bun run check:version-sync
+```
+
+Run that before tagging a release if you changed any version metadata by hand.
 
 ## Validation
 

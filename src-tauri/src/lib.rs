@@ -68,7 +68,16 @@ async fn install_app_update(
 }
 
 #[tauri::command]
-fn restart_app(app: AppHandle) {
+fn restart_app(
+    app: AppHandle,
+    state: State<'_, EngineState>,
+    update_info: Option<AppUpdateInfo>,
+) -> CommandResult<()> {
+    if let Some(info) = update_info {
+        let settings = state.inner().get_settings();
+        app_update::persist_pending_restart(&app, &info, &settings)?;
+    }
+
     app.restart();
 }
 
@@ -294,13 +303,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            // Clean up old update files to prevent infinite size growth
-            if let Ok(path) = app.path().app_local_data_dir() {
-                let updates_dir = path.join("updates");
-                if updates_dir.exists() {
-                    let _ = std::fs::remove_dir_all(&updates_dir);
-                }
-            }
+            let _ = app_update::run_startup_maintenance(app.handle());
 
             let app_handle = app.handle().clone();
             let engine = EngineState::new(app_handle.clone());

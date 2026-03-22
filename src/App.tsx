@@ -31,6 +31,7 @@ import {
   ipcPauseDownload,
   ipcReorderDownload,
   ipcRestartApp,
+  ipcRestartToApplyUpdate,
   ipcRestartDownload,
   ipcRemoveDownloads,
   ipcResumeDownload,
@@ -413,7 +414,6 @@ export function App() {
   const [queueState, setQueueState] = useState<QueueState>({ running: true });
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
-  const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
   const [bootstrapState, setBootstrapState] = useState<EngineBootstrapState>({ ready: false, error: null });
   const [startupUpdateHealth, setStartupUpdateHealth] = useState<AppUpdateStartupHealth | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -421,9 +421,7 @@ export function App() {
   const [deleteTargetIds, setDeleteTargetIds] = useState<Set<string>>(new Set());
   const [completionNotices, setCompletionNotices] = useState<DownloadCompletedEvent[]>([]);
   const [completionHistoryExpanded, setCompletionHistoryExpanded] = useState(false);
-  const [dismissedBootstrapError, setDismissedBootstrapError] = useState<string | null>(null);
   const [dismissedStartupUpdateHealthSignature, setDismissedStartupUpdateHealthSignature] = useState<string | null>(null);
-  const [dismissedDownloadIssueSignature, setDismissedDownloadIssueSignature] = useState<string | null>(null);
   const [downloadDetails, setDownloadDetails] = useState<Record<string, DownloadDetailSnapshot>>({});
   const [uiPrefs, setUiPrefs] = useState<UiPrefs>(() => ({ ...loadUiPrefs() }));
   const [appUpdate, setAppUpdate] = useState<AppUpdateState>(() => ({
@@ -668,12 +666,11 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!settingsNotice && !appUpdateFeedback && !appUpdateCheckError && !actionFeedback) {
+    if (!appUpdateFeedback && !appUpdateCheckError && !actionFeedback) {
       return;
     }
 
     const timeoutId = window.setTimeout(() => {
-      setSettingsNotice(null);
       setAppUpdateFeedback(null);
       setAppUpdateCheckError(null);
       setActionFeedback(null);
@@ -682,25 +679,13 @@ export function App() {
     return () => {
       window.clearTimeout(timeoutId);
     };
-  }, [actionFeedback, appUpdateCheckError, appUpdateFeedback, settingsNotice]);
-
-  useEffect(() => {
-    if (!bootstrapState.error) {
-      setDismissedBootstrapError(null);
-    }
-  }, [bootstrapState.error]);
+  }, [actionFeedback, appUpdateCheckError, appUpdateFeedback]);
 
   useEffect(() => {
     if (!startupUpdateHealth) {
       setDismissedStartupUpdateHealthSignature(null);
     }
   }, [startupUpdateHealth]);
-
-  useEffect(() => {
-    if (!downloads.some((download) => download.status === "error")) {
-      setDismissedDownloadIssueSignature(null);
-    }
-  }, [downloads]);
 
   const updateLastCheckKey = useMemo(
     () => `velocity-update:last-check:${settings.updateChannel}`,
@@ -1068,18 +1053,6 @@ export function App() {
       setDeleteTargetIds(new Set());
 
       if (removedIds.length > 0 && failedIds.length === 0) {
-        setActionFeedback({
-          tone: "success",
-          title: deleteFile ? "Downloads deleted" : "Downloads removed",
-          message:
-            removedIds.length === 1
-              ? deleteFile
-                ? "The download and its file were deleted."
-                : "The download was removed from the list."
-              : deleteFile
-                ? `${removedIds.length} downloads and their files were deleted.`
-                : `${removedIds.length} downloads were removed from the list.`,
-        });
       } else if (removedIds.length > 0) {
         setActionFeedback({
           tone: "warning",
@@ -1134,7 +1107,6 @@ export function App() {
       try {
         const updated = await ipcUpdateEngineSettings(nextSettings);
         setSettings(updated);
-        setSettingsNotice("Engine settings saved. New transfers will use the updated profile.");
         await refreshDownloads();
         setSettingsOpen(false);
       } catch (error) {
@@ -1159,7 +1131,6 @@ export function App() {
   );
 
   const handleRetryBootstrap = useCallback(async () => {
-    setDismissedBootstrapError(null);
     try {
       setBootstrapState(await ipcRetryEngineBootstrap());
     } catch (error) {
@@ -1246,7 +1217,11 @@ export function App() {
 
   const handleRestartAppUpdate = useCallback(async () => {
     try {
-      await ipcRestartApp();
+      if (appUpdate.info) {
+        await ipcRestartToApplyUpdate(appUpdate.info);
+      } else {
+        await ipcRestartApp();
+      }
     } catch (error) {
       setAppUpdate((prev) => ({
         ...prev,
@@ -1256,7 +1231,7 @@ export function App() {
         ),
       }));
     }
-  }, []);
+  }, [appUpdate.info]);
 
   const handleCheckForUpdates = useCallback(async () => {
     if (appUpdateCheckPending) {
@@ -1340,14 +1315,6 @@ export function App() {
   const restartTooltip = selectedTransferState.restartRequiredCount > 0
     ? "Clean-restart selected downloads from byte 0"
     : "Restart selected";
-  const failedDownloads = useMemo(
-    () => downloads.filter((download) => download.status === "error"),
-    [downloads],
-  );
-  const failedDownloadIssueSignature = useMemo(
-    () => failedDownloads.map((download) => `${download.id}:${download.errorMessage ?? download.diagnostics.terminalReason ?? ""}`).join("|"),
-    [failedDownloads],
-  );
   const appUpdateProgressPercent = useMemo(() => {
     if (!appUpdate.totalBytes || appUpdate.totalBytes <= 0) {
       return null;
@@ -1377,23 +1344,6 @@ export function App() {
   );
   const floatingAlerts = useMemo<FloatingAlert[]>(() => {
     const alerts: FloatingAlert[] = [];
-
-    if (bootstrapState.error && bootstrapState.error !== dismissedBootstrapError) {
-      alerts.push({
-        id: `bootstrap:${bootstrapState.error}`,
-        tone: "error",
-        eyebrow: "Engine",
-        title: "Engine startup needs attention",
-        message: simplifyUserMessage(bootstrapState.error),
-        actionLabel: "Retry",
-        onAction: () => {
-          void handleRetryBootstrap();
-        },
-        onDismiss: () => {
-          setDismissedBootstrapError(bootstrapState.error);
-        },
-      });
-    }
 
     if (!settingsOpen && settingsError) {
       alerts.push({
@@ -1486,11 +1436,11 @@ export function App() {
         id: `app-update:downloaded:${appUpdate.info.version}`,
         tone: "success",
         eyebrow: "Update",
-        title: "Restart and finish the update",
+        title: "Restart to apply the update",
         meta: appUpdateVersionMeta,
         message: `Velocity Download Manager ${appUpdate.info.version} is installed and ready to apply.`,
         highlights: appUpdateHighlights,
-        actionLabel: "Restart and Update",
+        actionLabel: "Restart App",
         onAction: () => {
           void handleRestartAppUpdate();
         },
@@ -1509,42 +1459,6 @@ export function App() {
           void handleInstallAppUpdate();
         },
         onDismiss: handleDismissAppUpdate,
-      });
-    }
-
-    if (failedDownloads.length > 0 && failedDownloadIssueSignature !== dismissedDownloadIssueSignature) {
-      const lead = failedDownloads[0];
-      const overflow = Math.max(0, failedDownloads.length - 2);
-      const leadNames = failedDownloads.slice(0, 2).map((download) => download.name).join(", ");
-      alerts.push({
-        id: `download-issues:${failedDownloadIssueSignature}`,
-        tone: "warning",
-        eyebrow: "Downloads",
-        title: failedDownloads.length === 1 ? `${lead.name} needs attention` : `${failedDownloads.length} downloads need attention`,
-        message: failedDownloads.length === 1
-          ? simplifyUserMessage(lead.errorMessage ?? lead.diagnostics.terminalReason ?? "The transfer stopped and may need a retry.")
-          : `${leadNames}${overflow > 0 ? ` and ${overflow} more` : ""} stopped and may need a retry.`,
-        actionLabel: "Review",
-        onAction: () => {
-          setSelectedIds(new Set([lead.id]));
-          setDismissedDownloadIssueSignature(failedDownloadIssueSignature);
-        },
-        onDismiss: () => {
-          setDismissedDownloadIssueSignature(failedDownloadIssueSignature);
-        },
-      });
-    }
-
-    if (settingsNotice) {
-      alerts.push({
-        id: `settings-notice:${settingsNotice}`,
-        tone: "success",
-        eyebrow: "Settings",
-        title: "Settings saved",
-        message: settingsNotice,
-        onDismiss: () => {
-          setSettingsNotice(null);
-        },
       });
     }
 
@@ -1593,12 +1507,7 @@ export function App() {
 
     return alerts;
   }, [
-    bootstrapState.error,
     dismissedStartupUpdateHealthSignature,
-    dismissedBootstrapError,
-    dismissedDownloadIssueSignature,
-    failedDownloadIssueSignature,
-    failedDownloads,
     appUpdate.dismissedVersion,
     appUpdate.downloadedBytes,
     appUpdate.error,
@@ -1615,10 +1524,8 @@ export function App() {
     handleInstallAppUpdate,
     handleCheckForUpdates,
     handleRestartAppUpdate,
-    handleRetryBootstrap,
     actionFeedback,
     settingsError,
-    settingsNotice,
     settingsOpen,
     startupUpdateHealth,
     startupUpdateHealthSignature,
@@ -1642,7 +1549,14 @@ export function App() {
           queueRunning={queueState.running}
         />
         <div id="vdm-content" className="flex flex-1 overflow-hidden">
-          <Sidebar activeCategory={activeCategory} onCategoryChange={setActiveCategory} downloads={downloads} />
+          <Sidebar
+            activeCategory={activeCategory}
+            onCategoryChange={setActiveCategory}
+            downloads={downloads}
+            activeCount={downloadStats.activeCount}
+            queuedCount={downloadStats.queuedCount}
+            totalSpeed={downloadStats.totalSpeed}
+          />
           <main className="flex flex-1 flex-col overflow-hidden">
             <Toolbar
               onNewDownload={openNewDownload}

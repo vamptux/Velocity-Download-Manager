@@ -256,7 +256,7 @@ export function DownloadList({
         onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
       >
         {sorted.length === 0 ? (
-          <EmptyState />
+          <EmptyState activeCategory={activeCategory} hasDownloads={downloads.length > 0} searchQuery={normalizedSearchQuery} />
         ) : (
           <>
             {visibleWindow.topSpacerHeight > 0 ? (
@@ -293,7 +293,31 @@ export function DownloadList({
   );
 }
 
-function EmptyState() {
+function EmptyState({
+  activeCategory,
+  hasDownloads,
+  searchQuery,
+}: {
+  activeCategory: SidebarCategory;
+  hasDownloads: boolean;
+  searchQuery: string;
+}) {
+  const isFiltered = searchQuery.length > 0 || activeCategory !== "all";
+  const title = !hasDownloads
+    ? "Nothing downloading yet"
+    : searchQuery.length > 0
+      ? "No downloads match this search"
+      : activeCategory === "finished"
+        ? "No finished downloads yet"
+        : activeCategory === "unfinished"
+          ? "Everything is finished"
+          : `No ${activeCategory} downloads right now`;
+  const message = !hasDownloads
+    ? "Start with Ctrl+N or New Download to add your first transfer."
+    : isFiltered
+      ? "Try a broader search or switch back to All to see more transfers."
+      : "New transfers in this section will appear here automatically.";
+
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-4 py-16">
       <div
@@ -303,12 +327,17 @@ function EmptyState() {
         <Download size={22} strokeWidth={1.4} className="text-muted-foreground/40" />
       </div>
       <div className="flex flex-col items-center gap-1.5">
-        <p className="text-[13px] font-semibold text-foreground/65 tracking-tight">Nothing downloading yet</p>
+        <p className="text-[13px] font-semibold text-foreground/65 tracking-tight">{title}</p>
         <p className="text-[11.5px] text-muted-foreground/42 text-center leading-relaxed">
-          Hit{" "}
-          <kbd className="mx-0.5 rounded bg-muted px-1 py-px text-[10px] font-mono text-muted-foreground/65">Ctrl+N</kbd>
-          {" "}or click{" "}
-          <span className="font-medium text-[hsl(var(--primary)/0.7)]">New Download</span>{" "}to get started
+          {!hasDownloads ? (
+            <>
+              Start with
+              <kbd className="mx-0.5 rounded bg-muted px-1 py-px text-[10px] font-mono text-muted-foreground/65">Ctrl+N</kbd>
+              or click <span className="font-medium text-[hsl(var(--primary)/0.7)]">New Download</span> to add your first transfer.
+            </>
+          ) : (
+            message
+          )}
         </p>
       </div>
     </div>

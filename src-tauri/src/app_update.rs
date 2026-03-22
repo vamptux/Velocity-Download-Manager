@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::{Client, StatusCode, Url};
 use semver::Version;
@@ -28,6 +28,9 @@ const GITHUB_RELEASES_API_LIST: &str =
     "https://api.github.com/repos/vamptux/Velocity-Download-Manager/releases?per_page=12";
 const STABLE_UPDATE_MANIFEST_NAME: &str = "latest.json";
 const PREVIEW_UPDATE_MANIFEST_NAME: &str = "latest-preview.json";
+const UPDATER_TEMP_ARTIFACT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 3);
+const LEGACY_UPDATES_DIR_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+const APP_PRODUCT_NAME: &str = "Velocity Download Manager";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,9 +60,19 @@ struct GithubReleaseCandidate {
     manifest_name: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+enum PendingAppUpdatePhase {
+    #[default]
+    Downloaded,
+    AwaitingValidation,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingAppUpdateTransition {
+    #[serde(default)]
+    phase: PendingAppUpdatePhase,
     channel: AppUpdateChannel,
     from_version: String,
     target_version: String,
@@ -396,6 +409,7 @@ fn persist_pending_update_transition(
 ) -> Result<(), String> {
     let path = pending_update_transition_path(app)?;
     let payload = PendingAppUpdateTransition {
+        phase: PendingAppUpdatePhase::AwaitingValidation,
         channel: info.channel.clone(),
         from_version: info.current_version.clone(),
         target_version: info.version.clone(),
@@ -423,8 +437,95 @@ fn app_version(app: &AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
+fn prune_matching_entries<F>(path: &PathBuf, cutoff: SystemTime, predicate: F) -> Result<(), String>
+where
+    F: Fn(&str) -> bool,
+{
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Failed listing updater maintenance directory '{}': {error}",
+                path.display()
+            ));
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "Failed reading updater maintenance directory '{}': {error}",
+                path.display()
+            )
+        })?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if !predicate(&file_name) {
+            continue;
+        }
+
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let modified_at = match metadata.modified() {
+            Ok(modified_at) => modified_at,
+            Err(_) => continue,
+        };
+        if modified_at > cutoff {
+            continue;
+        }
+
+        let entry_path = entry.path();
+        if metadata.is_dir() {
+            let _ = fs::remove_dir_all(&entry_path);
+        } else {
+            let _ = fs::remove_file(&entry_path);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_stale_updater_temp_artifact(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    let product_prefix = format!("{}-", APP_PRODUCT_NAME.to_ascii_lowercase());
+    lower.starts_with(&product_prefix)
+        && (lower.contains("-updater-") || lower.contains("-installer"))
+}
+
+pub fn run_startup_maintenance(app: &AppHandle) -> Result<(), String> {
+    let temp_cutoff = SystemTime::now()
+        .checked_sub(UPDATER_TEMP_ARTIFACT_RETENTION)
+        .unwrap_or(UNIX_EPOCH);
+    prune_matching_entries(&std::env::temp_dir(), temp_cutoff, is_stale_updater_temp_artifact)?;
+
+    if let Ok(base_dir) = app.path().app_local_data_dir() {
+        let updates_dir = base_dir.join("updates");
+        let updates_cutoff = SystemTime::now()
+            .checked_sub(LEGACY_UPDATES_DIR_RETENTION)
+            .unwrap_or(UNIX_EPOCH);
+        prune_matching_entries(&updates_dir, updates_cutoff, |_| true)?;
+
+        let is_empty = fs::read_dir(&updates_dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if is_empty {
+            let _ = fs::remove_dir(&updates_dir);
+        }
+    }
+
+    Ok(())
+}
+
 pub fn pending_startup_health(app: &AppHandle) -> Option<AppUpdateStartupHealth> {
     let pending = load_pending_update_transition(app).ok().flatten()?;
+    if pending.phase != PendingAppUpdatePhase::AwaitingValidation {
+        let _ = clear_pending_update_transition(app);
+        return None;
+    }
+
     Some(AppUpdateStartupHealth {
         status: AppUpdateStartupHealthStatus::Pending,
         channel: pending.channel,
@@ -447,6 +548,11 @@ pub fn finalize_startup_health(
     let Some(pending) = load_pending_update_transition(app)? else {
         return Ok(StartupHealthEvaluation::default());
     };
+
+    if pending.phase != PendingAppUpdatePhase::AwaitingValidation {
+        clear_pending_update_transition(app)?;
+        return Ok(StartupHealthEvaluation::default());
+    }
 
     let observed_version = app_version(app);
     let checked_at = now_millis();
@@ -609,7 +715,6 @@ pub async fn install_update(
     };
 
     let info = to_update_info(&update, &channel);
-    persist_pending_update_transition(app, &info, settings)?;
     let mut started = false;
     let started_app = app.clone();
     let progress_app = app.clone();
@@ -641,5 +746,11 @@ pub async fn install_update(
         .await
         .map_err(|error| format!("Failed installing the update: {error}"))?;
 
+    clear_pending_update_transition(app)?;
+
     Ok(info)
+}
+
+pub fn persist_pending_restart(app: &AppHandle, info: &AppUpdateInfo, settings: &EngineSettings) -> Result<(), String> {
+    persist_pending_update_transition(app, info, settings)
 }
