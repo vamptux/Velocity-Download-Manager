@@ -46,8 +46,13 @@ async fn check_app_update(
     app: AppHandle,
     state: State<'_, EngineState>,
 ) -> CommandResult<Option<AppUpdateInfo>> {
-    let skipped_version = state.inner().get_settings().skipped_update_version;
-    app_update::check_for_update(&app, skipped_version.as_deref()).await
+    let settings = state.inner().get_settings();
+    app_update::check_for_update(
+        &app,
+        &settings.update_channel,
+        settings.skipped_update_version.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]

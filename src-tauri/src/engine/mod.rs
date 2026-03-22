@@ -668,7 +668,7 @@ impl EngineState {
 
     fn finish_bootstrap(&self, snapshot: Result<RegistrySnapshot, String>) {
         let mut bootstrap_error = None;
-        let mut restored_settings = false;
+        let mut settings_changed = false;
         let mut update_health = None;
         match snapshot {
             Ok(snapshot) => match self.inner.registry.lock() {
@@ -681,10 +681,10 @@ impl EngineState {
                         None,
                     )
                     .unwrap_or_default();
-                    restored_settings = evaluation.settings_restored;
+                    settings_changed = evaluation.settings_changed;
                     update_health = evaluation.health;
 
-                    if restored_settings {
+                    if evaluation.settings_restored {
                         let settings = registry.settings.clone();
                         let host_profiles = registry.host_profiles.clone();
                         for download in &mut registry.downloads {
@@ -736,7 +736,7 @@ impl EngineState {
         self.inner.bootstrap_notify.notify_waiters();
         let _ = self.inner.app.emit(ENGINE_BOOTSTRAP_EVENT, state);
         if let Ok(registry) = self.inner.registry.lock() {
-            if restored_settings {
+            if settings_changed {
                 let _ = self.persist_registry_flush(&registry);
             }
             self.emit_engine_settings(&registry.settings);

@@ -13,7 +13,7 @@ import {
   loadUiPrefs,
   saveUiPrefs,
 } from "@/lib/uiPrefs";
-import type { EngineSettings, TrafficMode } from "@/types/download";
+import type { AppUpdateChannel, EngineSettings, TrafficMode } from "@/types/download";
 
 /* ─── THEME METADATA ────────────────────────────────────────────────────── */
 
@@ -163,6 +163,11 @@ const TRAFFIC_OPTIONS: Array<{ value: TrafficMode; label: string; hint: string }
   { value: "max",    label: "Max",    hint: "Unlimited" },
 ];
 
+const UPDATE_CHANNEL_OPTIONS: Array<{ value: AppUpdateChannel; label: string; hint: string }> = [
+  { value: "stable", label: "Stable", hint: "Production releases only" },
+  { value: "preview", label: "Preview", hint: "Early builds with fallback to stable on failure" },
+];
+
 type SettingsPage = "appearance" | "engine" | "browser";
 
 const PAGES: Array<{ id: SettingsPage; label: string; icon: React.ElementType }> = [
@@ -308,7 +313,7 @@ export function SettingsDialog({
           <div className="flex items-center justify-between border-b border-border/60 px-4 py-3">
             <div className="flex items-center gap-2">
               <Dialog.Title className="text-[13px] font-semibold text-foreground/88">Settings</Dialog.Title>
-              {isDirty && page === "engine" && (
+              {isDirty && page !== "appearance" && (
                 <span className="h-[6px] w-[6px] rounded-full bg-[hsl(var(--status-paused)/0.85)]" title="Unsaved engine changes" />
               )}
             </div>
@@ -571,6 +576,36 @@ export function SettingsDialog({
                   <div className="rounded-md border border-border/40 bg-black/[0.12] p-4">
                     <div className="mb-2 flex items-center gap-2">
                       <Globe size={14} strokeWidth={1.8} className="text-muted-foreground/50" />
+                      <div className="text-[12.5px] font-semibold text-foreground/80">App Updates</div>
+                    </div>
+                    <div className="text-[11.5px] leading-[1.65] text-muted-foreground/60">
+                      Stable keeps VDM on release builds. Preview checks prerelease manifests first and automatically falls back to stable if the first restart after an update fails.
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-2">
+                      {UPDATE_CHANNEL_OPTIONS.map((option) => {
+                        const active = draft.updateChannel === option.value;
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            onClick={() => setDraft((prev) => ({ ...prev, updateChannel: option.value }))}
+                            className={cn(
+                              "rounded-md border px-3 py-2.5 text-left transition-colors duration-150",
+                              active
+                                ? "border-[hsl(var(--primary)/0.4)] bg-[hsl(var(--primary)/0.12)] text-foreground"
+                                : "border-border/60 bg-black/10 text-foreground/60 hover:border-border/90 hover:text-foreground/80 hover:bg-accent/5",
+                            )}
+                          >
+                            <div className="text-[12px] font-semibold">{option.label}</div>
+                            <div className="mt-0.5 text-[10.5px] text-muted-foreground/55">{option.hint}</div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="rounded-md border border-border/40 bg-black/[0.12] p-4">
+                    <div className="mb-2 flex items-center gap-2">
+                      <Globe size={14} strokeWidth={1.8} className="text-muted-foreground/50" />
                       <div className="text-[12.5px] font-semibold text-foreground/80">VDM Catcher Extension</div>
                     </div>
                     <div className="text-[11.5px] leading-[1.65] text-muted-foreground/60">
@@ -607,14 +642,14 @@ export function SettingsDialog({
             </Dialog.Close>
             <button
               type="button"
-              disabled={saving || !isDirty || page !== "engine"}
+              disabled={saving || !isDirty || page === "appearance"}
               onClick={() => void onSave(draft)}
-              style={!(saving || !isDirty || page !== "engine")
+              style={!(saving || !isDirty || page === "appearance")
                 ? { background: "linear-gradient(90deg, hsl(var(--accent-h) 22% 32%) 0%, hsl(var(--accent-h) 16% 25%) 55%, hsl(0,0%,18%) 100%)" }
                 : undefined}
               className={cn(
                 "h-7 rounded-md px-4 text-[12px] font-semibold transition-all",
-                saving || !isDirty || page !== "engine"
+                saving || !isDirty || page === "appearance"
                   ? "bg-[hsl(0,0%,18%)] text-white/35 pointer-events-none"
                   : "text-[hsl(0,0%,92%)] hover:brightness-110",
               )}

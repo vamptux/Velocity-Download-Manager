@@ -65,6 +65,7 @@ import {
   duplicateResolutionLabel,
   findDuplicateDownload,
   getDuplicateResolution,
+  getSecondaryDuplicateResolution,
   joinTargetPathPreview,
   suggestAlternativeFilename,
 } from "@/lib/downloadDuplicates";
@@ -467,6 +468,10 @@ export function CompactCaptureWindow() {
     () => (duplicateMatch ? getDuplicateResolution(duplicateMatch) : null),
     [duplicateMatch],
   );
+  const duplicateSecondaryResolution = useMemo(
+    () => (duplicateMatch ? getSecondaryDuplicateResolution(duplicateMatch) : null),
+    [duplicateMatch],
+  );
 
   const handleBrowse = async () => {
     const selected = await openDialog({ directory: true, defaultPath: savePath || undefined });
@@ -509,6 +514,12 @@ export function CompactCaptureWindow() {
       return;
     }
 
+    if (duplicateResolution === "keepBoth") {
+      setName(suggestAlternativeFilename(resolvedName || duplicateMatch.download.name));
+      setAddError(null);
+      return;
+    }
+
     setDuplicateActionPending(true);
     setAddError(null);
     try {
@@ -533,7 +544,40 @@ export function CompactCaptureWindow() {
     } finally {
       setDuplicateActionPending(false);
     }
-  }, [activateMonitorDownload, duplicateActionPending, duplicateMatch, duplicateResolution, refreshExistingDownloads]);
+  }, [activateMonitorDownload, duplicateActionPending, duplicateMatch, duplicateResolution, refreshExistingDownloads, resolvedName]);
+
+  const handleDuplicateSecondaryAction = useCallback(async () => {
+    if (!duplicateMatch || !duplicateSecondaryResolution || duplicateActionPending) {
+      return;
+    }
+
+    setDuplicateActionPending(true);
+    setAddError(null);
+    try {
+      switch (duplicateSecondaryResolution) {
+        case "resume":
+          await ipcResumeDownload(duplicateMatch.download.id);
+          break;
+        case "restart":
+          await ipcRestartDownload(duplicateMatch.download.id);
+          break;
+        case "reveal":
+          await ipcOpenDownloadFolder(duplicateMatch.download.id);
+          break;
+        case "inspect":
+          break;
+        case "keepBoth":
+          break;
+      }
+
+      activateMonitorDownload(duplicateMatch.download);
+      void refreshExistingDownloads();
+    } catch (error) {
+      setAddError(getCaptureErrorMessage(error));
+    } finally {
+      setDuplicateActionPending(false);
+    }
+  }, [activateMonitorDownload, duplicateActionPending, duplicateMatch, duplicateSecondaryResolution, refreshExistingDownloads]);
 
   const handleMonitorPause = () => {
     if (!monitorDownload) return;
@@ -1368,17 +1412,20 @@ export function CompactCaptureWindow() {
           duplicateActions={duplicateMatch && duplicateResolution ? {
             active: true,
             title: describeDuplicateMatch(duplicateMatch),
-            primaryLabel: duplicateActionPending && duplicateResolution !== "inspect"
+            primaryLabel: duplicateActionPending && duplicateResolution !== "inspect" && duplicateResolution !== "keepBoth"
               ? "Working..."
               : duplicateResolutionLabel(duplicateResolution, "compact"),
             onPrimary: () => {
               void handleDuplicatePrimaryAction();
             },
-            secondaryLabel: duplicateMatch.reason === "targetPath" ? "Rename target" : undefined,
-            onSecondary: duplicateMatch.reason === "targetPath"
+            secondaryLabel: duplicateSecondaryResolution
+              ? duplicateActionPending && duplicateSecondaryResolution !== "inspect"
+                ? "Working..."
+                : duplicateResolutionLabel(duplicateSecondaryResolution, "compact")
+              : undefined,
+            onSecondary: duplicateSecondaryResolution
               ? () => {
-                setName(suggestAlternativeFilename(resolvedName || duplicateMatch.download.name));
-                setAddError(null);
+                void handleDuplicateSecondaryAction();
               }
               : undefined,
           } : undefined}
@@ -1417,8 +1464,8 @@ export function CompactCaptureWindow() {
         >
           {duplicateMatch && duplicateResolution ? (
             <>
-              {duplicateActionPending && duplicateResolution !== "inspect" ? <Loader2 size={10} className="animate-spin" /> : <ArrowDownToLine size={10} />}
-              {duplicateActionPending && duplicateResolution !== "inspect"
+              {duplicateActionPending && duplicateResolution !== "inspect" && duplicateResolution !== "keepBoth" ? <Loader2 size={10} className="animate-spin" /> : <ArrowDownToLine size={10} />}
+              {duplicateActionPending && duplicateResolution !== "inspect" && duplicateResolution !== "keepBoth"
                 ? "Working..."
                 : duplicateResolutionLabel(duplicateResolution, "compact")}
             </>

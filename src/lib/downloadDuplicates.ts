@@ -13,7 +13,7 @@ export interface DuplicateMatch {
   reason: "url" | "validators" | "targetPath";
 }
 
-export type DuplicateResolutionKind = "resume" | "restart" | "reveal" | "inspect";
+export type DuplicateResolutionKind = "resume" | "restart" | "reveal" | "inspect" | "keepBoth";
 
 export function normalizeComparableUrl(url: string | null | undefined): string | null {
   const trimmed = url?.trim();
@@ -172,7 +172,7 @@ export function describeDuplicateMatch(match: DuplicateMatch): string {
   return `${match.download.name} already tracks this source URL.`;
 }
 
-export function getDuplicateResolution(match: DuplicateMatch): DuplicateResolutionKind {
+function getExistingDuplicateResolution(match: DuplicateMatch): DuplicateResolutionKind {
   if (match.download.status === "finished") {
     return "reveal";
   }
@@ -188,11 +188,29 @@ export function getDuplicateResolution(match: DuplicateMatch): DuplicateResoluti
   return "inspect";
 }
 
+export function getDuplicateResolution(match: DuplicateMatch): DuplicateResolutionKind {
+  if (match.reason === "targetPath") {
+    return "keepBoth";
+  }
+
+  return getExistingDuplicateResolution(match);
+}
+
+export function getSecondaryDuplicateResolution(match: DuplicateMatch): DuplicateResolutionKind | null {
+  if (match.reason !== "targetPath") {
+    return null;
+  }
+
+  return getExistingDuplicateResolution(match);
+}
+
 export function duplicateResolutionLabel(
   kind: DuplicateResolutionKind,
   surface: "dialog" | "compact",
 ): string {
   switch (kind) {
+    case "keepBoth":
+      return "Keep both";
     case "resume":
       return "Resume existing";
     case "restart":

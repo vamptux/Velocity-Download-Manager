@@ -100,6 +100,15 @@ pub enum DownloadRequestMethod {
     Post,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum AppUpdateChannel {
+    #[default]
+    Stable,
+    Preview,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadRequestField {
@@ -130,6 +139,8 @@ pub struct EngineSettings {
     #[serde(default)]
     pub speed_limit_bytes_per_second: Option<u64>,
     #[serde(default)]
+    pub update_channel: AppUpdateChannel,
+    #[serde(default)]
     pub skipped_update_version: Option<String>,
 }
 
@@ -153,6 +164,7 @@ impl Default for EngineSettings {
             experimental_uncapped_mode: false,
             traffic_mode: TrafficMode::default(),
             speed_limit_bytes_per_second: None,
+            update_channel: AppUpdateChannel::default(),
             skipped_update_version: None,
         }
     }
@@ -590,6 +602,8 @@ pub struct AppUpdateInfo {
     pub version: String,
     pub current_version: String,
     #[serde(default)]
+    pub channel: AppUpdateChannel,
+    #[serde(default)]
     pub notes: Option<String>,
 }
 
@@ -600,6 +614,7 @@ pub enum AppUpdateStartupHealthStatus {
     Pending,
     Healthy,
     RestoredSettings,
+    RollbackTriggered,
     Failed,
 }
 
@@ -608,6 +623,7 @@ pub enum AppUpdateStartupHealthStatus {
 #[serde(rename_all = "camelCase")]
 pub struct AppUpdateStartupHealth {
     pub status: AppUpdateStartupHealthStatus,
+    pub channel: AppUpdateChannel,
     pub from_version: String,
     pub target_version: String,
     pub observed_version: String,

@@ -41,6 +41,7 @@ import {
 } from "@/lib/ipc";
 import { simplifyUserMessage } from "@/lib/userFacingMessages";
 import type {
+  AppUpdateChannel,
   AppUpdateInfo,
   AppUpdateProgressEvent,
   AppUpdateStartupHealth,
@@ -62,14 +63,13 @@ const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   experimentalUncappedMode: false,
   trafficMode: "max",
   speedLimitBytesPerSecond: null,
+  updateChannel: "stable",
   skippedUpdateVersion: null,
 };
 
 const LIVE_PROGRESS_HEARTBEAT_MS = 1200;
 const LIVE_PROGRESS_STALL_MS = 2500;
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const UPDATE_LAST_CHECK_KEY = "velocity-update:last-check";
-
 type AppUpdateStage = "idle" | "available" | "downloading" | "downloaded" | "failed" | "up-to-date";
 
 type AppUpdateState = {
@@ -132,6 +132,10 @@ function appUpdateProgressMessage(downloadedBytes: number, totalBytes: number | 
   }
 
   return "Downloading the update package...";
+}
+
+function updateChannelLabel(channel: AppUpdateChannel): string {
+  return channel === "preview" ? "Preview" : "Stable";
 }
 
 type FloatingAlert = {
@@ -630,6 +634,11 @@ export function App() {
     }
   }, [downloads]);
 
+  const updateLastCheckKey = useMemo(
+    () => `velocity-update:last-check:${settings.updateChannel}`,
+    [settings.updateChannel],
+  );
+
   useEffect(() => {
     setAppUpdate((prev) => {
       const dismissedVersion = settings.skippedUpdateVersion ?? null;
@@ -693,7 +702,7 @@ export function App() {
       return;
     }
 
-    if (Date.now() - readStoredNumber(UPDATE_LAST_CHECK_KEY) < UPDATE_CHECK_INTERVAL_MS) {
+    if (Date.now() - readStoredNumber(updateLastCheckKey) < UPDATE_CHECK_INTERVAL_MS) {
       return;
     }
 
@@ -705,7 +714,7 @@ export function App() {
           return;
         }
 
-        writeStoredString(UPDATE_LAST_CHECK_KEY, String(Date.now()));
+        writeStoredString(updateLastCheckKey, String(Date.now()));
 
         if (!update) {
           setAppUpdate((prev) => ({
@@ -733,7 +742,7 @@ export function App() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [settings.updateChannel, updateLastCheckKey]);
 
   useEffect(() => {
     const timers = completionTimers.current;
@@ -1056,7 +1065,7 @@ export function App() {
 
     try {
       const installedUpdate = await ipcInstallAppUpdate();
-      writeStoredString(UPDATE_LAST_CHECK_KEY, String(Date.now()));
+      writeStoredString(updateLastCheckKey, String(Date.now()));
 
       if (settings.skippedUpdateVersion != null) {
         const updatedSettings = await ipcUpdateEngineSettings({
@@ -1085,7 +1094,7 @@ export function App() {
         totalBytes: null,
       }));
     }
-  }, [settings]);
+  }, [settings, updateLastCheckKey]);
 
   const handleRestartAppUpdate = useCallback(async () => {
     try {
@@ -1156,12 +1165,14 @@ export function App() {
     [appUpdate.info?.notes, appUpdateNotesSummary],
   );
   const appUpdateVersionMeta = useMemo(
-    () => appUpdate.info ? `Current ${appUpdate.info.currentVersion} -> ${appUpdate.info.version}` : undefined,
+    () => appUpdate.info
+      ? `${updateChannelLabel(appUpdate.info.channel)} channel · ${appUpdate.info.currentVersion} -> ${appUpdate.info.version}`
+      : undefined,
     [appUpdate.info],
   );
   const startupUpdateHealthSignature = useMemo(
     () => startupUpdateHealth
-      ? `${startupUpdateHealth.status}:${startupUpdateHealth.fromVersion}:${startupUpdateHealth.targetVersion}:${startupUpdateHealth.observedVersion}:${startupUpdateHealth.checkedAt}`
+      ? `${startupUpdateHealth.status}:${startupUpdateHealth.channel}:${startupUpdateHealth.fromVersion}:${startupUpdateHealth.targetVersion}:${startupUpdateHealth.observedVersion}:${startupUpdateHealth.checkedAt}`
       : null,
     [startupUpdateHealth],
   );
@@ -1203,9 +1214,11 @@ export function App() {
     }
 
     if (startupUpdateHealth && startupUpdateHealthSignature !== dismissedStartupUpdateHealthSignature) {
-      const meta = `${startupUpdateHealth.fromVersion} -> ${startupUpdateHealth.targetVersion}`;
+      const meta = `${updateChannelLabel(startupUpdateHealth.channel)} channel · ${startupUpdateHealth.fromVersion} -> ${startupUpdateHealth.targetVersion}`;
       const tone = startupUpdateHealth.status === "failed"
         ? "error"
+        : startupUpdateHealth.status === "rollbackTriggered"
+          ? "warning"
         : startupUpdateHealth.status === "restoredSettings"
           ? "warning"
           : startupUpdateHealth.status === "healthy"
@@ -1213,6 +1226,8 @@ export function App() {
             : "info";
       const title = startupUpdateHealth.status === "failed"
         ? "Updated build needs review"
+        : startupUpdateHealth.status === "rollbackTriggered"
+          ? "Rollback guard triggered"
         : startupUpdateHealth.status === "restoredSettings"
           ? "Engine settings were restored"
           : startupUpdateHealth.status === "healthy"

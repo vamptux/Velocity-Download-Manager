@@ -2,20 +2,27 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use tauri_plugin_updater::Error as UpdaterError;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::model::{
-    AppUpdateInfo, AppUpdateProgressEvent, AppUpdateStartupHealth,
+    AppUpdateChannel, AppUpdateInfo, AppUpdateProgressEvent, AppUpdateStartupHealth,
     AppUpdateStartupHealthStatus, EngineSettings,
 };
 
 pub const APP_UPDATE_PROGRESS_EVENT: &str = "app://update-progress";
+const STABLE_UPDATE_ENDPOINT: &str =
+    "https://github.com/vamptux/Velocity-Download-Manager/releases/latest/download/latest.json";
+const PREVIEW_UPDATE_ENDPOINT: &str =
+    "https://github.com/vamptux/Velocity-Download-Manager/releases/latest/download/latest-preview.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingAppUpdateTransition {
+    channel: AppUpdateChannel,
     from_version: String,
     target_version: String,
     recorded_at: i64,
@@ -27,14 +34,68 @@ struct PendingAppUpdateTransition {
 pub struct StartupHealthEvaluation {
     pub health: Option<AppUpdateStartupHealth>,
     pub settings_restored: bool,
+    pub settings_changed: bool,
 }
 
-fn to_update_info(update: &Update) -> AppUpdateInfo {
+fn to_update_info(update: &Update, channel: &AppUpdateChannel) -> AppUpdateInfo {
     AppUpdateInfo {
         version: update.version.to_string(),
         current_version: update.current_version.to_string(),
+        channel: channel.clone(),
         notes: update.body.clone(),
     }
+}
+
+fn updater_endpoints(channel: &AppUpdateChannel) -> Result<Vec<Url>, String> {
+    let raw = match channel {
+        AppUpdateChannel::Stable => vec![STABLE_UPDATE_ENDPOINT],
+        // Preview first, then stable as a safe fallback when no preview manifest is published.
+        AppUpdateChannel::Preview => vec![PREVIEW_UPDATE_ENDPOINT, STABLE_UPDATE_ENDPOINT],
+    };
+
+    raw.into_iter()
+        .map(|value| {
+            Url::parse(value).map_err(|error| {
+                format!("Failed parsing updater endpoint '{value}': {error}")
+            })
+        })
+        .collect()
+}
+
+fn updater_for_channel(
+    app: &AppHandle,
+    channel: &AppUpdateChannel,
+) -> Result<tauri_plugin_updater::Updater, String> {
+    let builder = app
+        .updater_builder()
+        .endpoints(updater_endpoints(channel)?)
+        .map_err(|error| format!("Failed preparing updater endpoints: {error}"))?;
+
+    builder
+        .build()
+        .map_err(|error| format!("Failed preparing the updater: {error}"))
+}
+
+fn apply_failed_update_guardrails(
+    settings: &mut EngineSettings,
+    pending: &PendingAppUpdateTransition,
+) -> String {
+    settings.skipped_update_version = Some(pending.target_version.clone());
+
+    if pending.channel == AppUpdateChannel::Preview
+        && settings.update_channel == AppUpdateChannel::Preview
+    {
+        settings.update_channel = AppUpdateChannel::Stable;
+        return format!(
+            "The first restart after updating to {} on the preview channel failed. VDM will skip that build on future checks and has switched the updater back to the stable channel.",
+            pending.target_version
+        );
+    }
+
+    format!(
+        "The first restart after updating to {} failed. VDM will skip that build on future checks until a newer release is available.",
+        pending.target_version
+    )
 }
 
 fn now_millis() -> i64 {
@@ -84,6 +145,7 @@ fn persist_pending_update_transition(
 ) -> Result<(), String> {
     let path = pending_update_transition_path(app)?;
     let payload = PendingAppUpdateTransition {
+        channel: info.channel.clone(),
         from_version: info.current_version.clone(),
         target_version: info.version.clone(),
         recorded_at: now_millis(),
@@ -114,6 +176,7 @@ pub fn pending_startup_health(app: &AppHandle) -> Option<AppUpdateStartupHealth>
     let pending = load_pending_update_transition(app).ok().flatten()?;
     Some(AppUpdateStartupHealth {
         status: AppUpdateStartupHealthStatus::Pending,
+        channel: pending.channel,
         from_version: pending.from_version,
         target_version: pending.target_version,
         observed_version: app_version(app),
@@ -137,27 +200,53 @@ pub fn finalize_startup_health(
     let observed_version = app_version(app);
     let checked_at = now_millis();
     let mut settings_restored = false;
+    let mut settings_changed = false;
 
     let (status, message) = if observed_version != pending.target_version {
-        (
-            AppUpdateStartupHealthStatus::Failed,
-            Some(format!(
-                "Expected version {} after restart, but the app started as {}.",
-                pending.target_version, observed_version
-            )),
-        )
+        if let Some(current_settings) = settings {
+            settings_changed = true;
+            (
+                AppUpdateStartupHealthStatus::RollbackTriggered,
+                Some(format!(
+                    "Expected version {} after restart, but the app started as {}. {}",
+                    pending.target_version,
+                    observed_version,
+                    apply_failed_update_guardrails(current_settings, &pending)
+                )),
+            )
+        } else {
+            (
+                AppUpdateStartupHealthStatus::Failed,
+                Some(format!(
+                    "Expected version {} after restart, but the app started as {}.",
+                    pending.target_version, observed_version
+                )),
+            )
+        }
     } else if let Some(error) = bootstrap_error {
-        (
-            AppUpdateStartupHealthStatus::Failed,
-            Some(format!(
-                "The updated build started, but engine bootstrap failed: {error}"
-            )),
-        )
+        if let Some(current_settings) = settings {
+            settings_changed = true;
+            (
+                AppUpdateStartupHealthStatus::RollbackTriggered,
+                Some(format!(
+                    "The updated build started, but engine bootstrap failed: {error} {}",
+                    apply_failed_update_guardrails(current_settings, &pending)
+                )),
+            )
+        } else {
+            (
+                AppUpdateStartupHealthStatus::Failed,
+                Some(format!(
+                    "The updated build started, but engine bootstrap failed: {error}"
+                )),
+            )
+        }
     } else if let Some(current_settings) = settings {
         let default_settings = EngineSettings::default();
         if *current_settings == default_settings && pending.settings != default_settings {
             *current_settings = pending.settings.clone();
             settings_restored = true;
+            settings_changed = true;
             (
                 AppUpdateStartupHealthStatus::RestoredSettings,
                 Some(
@@ -189,6 +278,7 @@ pub fn finalize_startup_health(
     Ok(StartupHealthEvaluation {
         health: Some(AppUpdateStartupHealth {
             status,
+            channel: pending.channel,
             from_version: pending.from_version,
             target_version: pending.target_version,
             observed_version,
@@ -196,23 +286,31 @@ pub fn finalize_startup_health(
             message,
         }),
         settings_restored,
+        settings_changed,
     })
 }
 
 pub async fn check_for_update(
     app: &AppHandle,
+    channel: &AppUpdateChannel,
     skipped_version: Option<&str>,
 ) -> Result<Option<AppUpdateInfo>, String> {
-    let update = app
-        .updater_builder()
-        .build()
-        .map_err(|error| format!("Failed preparing the updater: {error}"))?
+    let update = updater_for_channel(app, channel)?
         .check()
         .await
+        .or_else(|error| {
+            if matches!(channel, AppUpdateChannel::Preview)
+                && matches!(error, UpdaterError::ReleaseNotFound)
+            {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        })
         .map_err(|error| format!("Failed checking for updates: {error}"))?;
 
     Ok(update.as_ref().and_then(|candidate| {
-        let info = to_update_info(candidate);
+        let info = to_update_info(candidate, channel);
         match skipped_version {
             Some(skipped) if skipped == info.version => None,
             _ => Some(info),
@@ -224,10 +322,8 @@ pub async fn install_update(
     app: &AppHandle,
     settings: &EngineSettings,
 ) -> Result<AppUpdateInfo, String> {
-    let Some(update) = app
-        .updater_builder()
-        .build()
-        .map_err(|error| format!("Failed preparing the updater: {error}"))?
+    let channel = settings.update_channel.clone();
+    let Some(update) = updater_for_channel(app, &channel)?
         .check()
         .await
         .map_err(|error| format!("Failed checking for updates: {error}"))?
@@ -235,7 +331,7 @@ pub async fn install_update(
         return Err("Velocity Download Manager is already up to date.".to_string());
     };
 
-    let info = to_update_info(&update);
+    let info = to_update_info(&update, &channel);
     persist_pending_update_transition(app, &info, settings)?;
     let mut started = false;
     let started_app = app.clone();

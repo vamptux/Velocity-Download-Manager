@@ -24,6 +24,7 @@ import {
   duplicateResolutionLabel,
   findDuplicateDownload,
   getDuplicateResolution,
+  getSecondaryDuplicateResolution,
   joinTargetPathPreview,
   suggestAlternativeFilename,
 } from "@/lib/downloadDuplicates";
@@ -130,6 +131,10 @@ export function NewDownloadDialog({
     () => (duplicateMatch ? getDuplicateResolution(duplicateMatch) : null),
     [duplicateMatch],
   );
+  const duplicateSecondaryResolution = useMemo(
+    () => (duplicateMatch ? getSecondaryDuplicateResolution(duplicateMatch) : null),
+    [duplicateMatch],
+  );
 
   function closeWithExisting(download: Download) {
     onDownloadAdded?.(download);
@@ -145,6 +150,13 @@ export function NewDownloadDialog({
 
   async function handleDuplicatePrimaryAction() {
     if (!duplicateMatch || !duplicateResolution || duplicateActionPending) {
+      return;
+    }
+
+    if (duplicateResolution === "keepBoth") {
+      setFilename(suggestAlternativeFilename(effectiveFilename || duplicateMatch.download.name));
+      setFilenameDirty(true);
+      setSubmitError(null);
       return;
     }
 
@@ -166,6 +178,40 @@ export function NewDownloadDialog({
           break;
         case "inspect":
           closeWithExisting(duplicateMatch.download);
+          break;
+      }
+    } catch (error) {
+      setSubmitError(getCaptureErrorMessage(error));
+    } finally {
+      setDuplicateActionPending(false);
+    }
+  }
+
+  async function handleDuplicateSecondaryAction() {
+    if (!duplicateMatch || !duplicateSecondaryResolution || duplicateActionPending) {
+      return;
+    }
+
+    setDuplicateActionPending(true);
+    setSubmitError(null);
+    try {
+      switch (duplicateSecondaryResolution) {
+        case "resume":
+          await ipcResumeDownload(duplicateMatch.download.id);
+          closeWithExisting(duplicateMatch.download);
+          break;
+        case "restart":
+          await ipcRestartDownload(duplicateMatch.download.id);
+          closeWithExisting(duplicateMatch.download);
+          break;
+        case "reveal":
+          await ipcOpenDownloadFolder(duplicateMatch.download.id);
+          closeWithExisting(duplicateMatch.download);
+          break;
+        case "inspect":
+          closeWithExisting(duplicateMatch.download);
+          break;
+        case "keepBoth":
           break;
       }
     } catch (error) {
@@ -336,17 +382,16 @@ export function NewDownloadDialog({
                         ? duplicateResolutionLabel(duplicateResolution, "dialog")
                         : "Select existing"}
                   </button>
-                  {duplicateMatch.reason === "targetPath" ? (
+                  {duplicateSecondaryResolution ? (
                     <button
                       type="button"
-                      onClick={() => {
-                        setFilename(suggestAlternativeFilename(effectiveFilename || duplicateMatch.download.name));
-                        setFilenameDirty(true);
-                        setSubmitError(null);
-                      }}
+                      onClick={() => void handleDuplicateSecondaryAction()}
+                      disabled={duplicateActionPending || submitting}
                       className="rounded-md border border-border/70 px-2.5 py-1.5 text-[11.5px] text-muted-foreground/72 transition-colors hover:bg-accent hover:text-foreground"
                     >
-                      Rename target
+                      {duplicateActionPending && duplicateSecondaryResolution !== "inspect"
+                        ? "Working..."
+                        : duplicateResolutionLabel(duplicateSecondaryResolution, "dialog")}
                     </button>
                   ) : null}
                 </div>

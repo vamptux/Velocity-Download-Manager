@@ -1,4 +1,5 @@
 import type { AddDownloadArgs as BackendAddDownloadArgs } from "./generated/backend/AddDownloadArgs";
+import type { AppUpdateChannel as BackendAppUpdateChannel } from "./generated/backend/AppUpdateChannel";
 import type { AppUpdateInfo as BackendAppUpdateInfo } from "./generated/backend/AppUpdateInfo";
 import type { AppUpdateProgressEvent as BackendAppUpdateProgressEvent } from "./generated/backend/AppUpdateProgressEvent";
 import type { AppUpdateStartupHealth as BackendAppUpdateStartupHealth } from "./generated/backend/AppUpdateStartupHealth";
@@ -51,6 +52,7 @@ export type TrafficMode = Jsonify<BackendTrafficMode>;
 export type DownloadRequestMethod = Jsonify<BackendDownloadRequestMethod>;
 export type DownloadRequestField = Jsonify<BackendDownloadRequestField>;
 export type EngineSettings = Jsonify<BackendEngineSettings>;
+export type AppUpdateChannel = Jsonify<BackendAppUpdateChannel>;
 export type AppUpdateInfo = Jsonify<BackendAppUpdateInfo>;
 export type AppUpdateProgressEvent = Jsonify<BackendAppUpdateProgressEvent>;
 export type AppUpdateStartupHealthStatus = Jsonify<BackendAppUpdateStartupHealthStatus>;

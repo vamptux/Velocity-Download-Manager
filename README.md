@@ -52,7 +52,10 @@ The signed NSIS installer is emitted under `src-tauri/target/release/bundle/nsis
 
 - Tauri updater artifacts and `latest.json` are produced by `.github/workflows/release.yml`.
 - Push a tag in the form `vX.Y.Z` to publish a Windows installer release on GitHub.
-- The app checks `https://github.com/vamptux/Velocity-Download-Manager/releases/latest/download/latest.json` for updates.
+- Stable builds check `https://github.com/vamptux/Velocity-Download-Manager/releases/latest/download/latest.json` for updates.
+- Preview builds check `https://github.com/vamptux/Velocity-Download-Manager/releases/latest/download/latest-preview.json` first and fall back to the stable manifest when no preview manifest is published.
+- The update channel is persisted in engine settings and can be switched in the app under Browser Integration -> App Updates.
+- After install, VDM records a pending startup-health transition. If the first restart boots the wrong version or the updated build fails engine bootstrap, the failed version is marked as skipped for future checks and preview users are moved back to the stable channel.
 - `TAURI_SIGNING_PRIVATE_KEY` must contain the full contents of `%USERPROFILE%\.tauri\velocity-download-manager.key`, not the password or a placeholder string.
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is only the passphrase for a password-protected key.
 - The current local updater key for this repo was generated without a password, so `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` should be omitted in GitHub or left empty.

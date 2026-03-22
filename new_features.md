@@ -73,8 +73,9 @@ Notes:
 - Current gap: same file can be added twice without clear duplicate warning in capture popup and in-app add flow.
 - Identity decisions: backend add rejects normalized URL matches and target-path collisions; URL matches now take precedence over path-only matches so the UI does not suggest a rename that the backend would still block.
 - Validator decisions: validator matches now require equal content length plus a matching `etag` or `last-modified`, which keeps the rule conservative enough for production while still catching same-file re-adds across wrapper or redirect URL changes.
-- Current UI actions: main add dialog now routes duplicates to `Select existing`, `Resume existing`, `Restart existing`, or `Open folder`; compact capture offers the same contextual action before submit and can rename target-path-only collisions.
+- Current UI actions: main add dialog now routes duplicates to `Keep both`, `Select existing`, `Resume existing`, `Restart existing`, or `Open folder`; compact capture offers the same contextual flow before submit and can keep both for target-path-only collisions without leaving the pane.
 - Partial duplicate policy: paused and resumable partials prefer `Resume existing`; guarded or restart-required partials prefer `Restart existing`; finished duplicates prefer `Open folder`.
+- Remaining duplicate-action gap: `Replace existing` and `Merge source list` are still intentionally deferred until destructive semantics and future mirror support are specified.
 
 ---
 
@@ -97,22 +98,22 @@ Notes:
 ---
 
 ## Phase 6 - Updater safety
-- [ ] Add update channel model: `stable` and `preview`.
+- [x] Add update channel model: `stable` and `preview`.
 - [x] Add skip-this-version state.
 - [x] Preserve engine settings across update transitions.
 - [x] Record enough update metadata to diff settings / behavior changes.
 - [x] Define startup health check after install.
-- [ ] Define rollback trigger if post-update startup health check fails.
+- [x] Define rollback trigger if post-update startup health check fails.
 - [x] Show changelog highlights tied to engine behavior changes.
 
 Notes:
 - Current updater flow is straightforward and all-or-nothing in `src-tauri/src/app_update.rs`.
-- Channel config decision:
-- Rollback trigger:
+- Channel config decision: `EngineSettings.updateChannel` now persists `stable` or `preview`; preview checks `latest-preview.json` first and falls back to stable metadata when no preview manifest is published.
+- Rollback trigger: if the first restart after install comes up on the wrong version or the updated build fails engine bootstrap, VDM marks that target version as skipped and, for preview installs, automatically switches future checks back to the stable channel.
 - Skip-version storage: persisted in `EngineSettings.skippedUpdateVersion` and filtered in backend update checks.
 - Update alerts now show current-to-target version metadata plus up to three prioritized highlights from release notes, with engine/backend items ranked ahead of general notes.
 - Update transition metadata: install now writes a pending transition record with source/target versions, release notes, and the pre-install `EngineSettings` snapshot before download begins.
-- Startup health check: first restart after install now reports `pending`, `healthy`, `restoredSettings`, or `failed`; if the updated build comes up with default engine settings, VDM restores the previous transfer profile before continuing.
+- Startup health check: first restart after install now reports `pending`, `healthy`, `restoredSettings`, `rollbackTriggered`, or `failed`; if the updated build comes up with default engine settings, VDM restores the previous transfer profile before continuing.
 
 ---
 
@@ -132,7 +133,7 @@ Notes:
 ## Session handoff
 - Next recommended step: decide whether validator-based duplicate matches should auto-link into the same contextual action flow before adding any destructive replace semantics.
 - Files most relevant next session: `src/components/BatchDownloadDialog.tsx`, `src/lib/batchImport.ts`, `src/App.tsx`, `src/hooks/useEngineBridge.ts`, `src-tauri/src/app_update.rs`, `src-tauri/src/engine/mod.rs`.
-- Decisions that must not be forgotten: skip-version is backend-persisted, duplicate URL matches outrank path-only matches, batch import rows are now editable and revalidated live before enqueue, and updater startup health restores prior settings only when the updated build appears to have reset to defaults.
+- Decisions that must not be forgotten: skip-version is backend-persisted, duplicate URL matches outrank path-only matches, target-path-only collisions now default to `Keep both` while still exposing the existing download action, batch import rows are now editable and revalidated live before enqueue, and updater startup health can skip a failed build and downgrade preview users back to the stable channel.
 - Current thresholds / limits: batch import preview now keeps all parsed rows editable in a scrollable review pane and still limits the failure summary to the first 5 import failures.
-- Known bugs / risks: CSV/TSV parsing supports quoted fields but not multiline quoted cells; validator duplicate matching intentionally refuses content-length-only matches and will not fire until the probe has both size and either `etag` or `last-modified`; updater health currently reports failures but does not auto-roll back yet.
-- Quick summary for next agent: this pass added editable batch-import review with live revalidation and updater transition hardening that records pending install metadata, validates the first restart, and restores engine settings if an update resets them to defaults. Pending work is preview/stable update channels, rollback policy, and deeper duplicate semantics.
+- Known bugs / risks: CSV/TSV parsing supports quoted fields but not multiline quoted cells; validator duplicate matching intentionally refuses content-length-only matches and will not fire until the probe has both size and either `etag` or `last-modified`; preview and stable currently share the same skip-version state instead of using per-channel suppression.
+- Quick summary for next agent: this pass added editable batch-import review with live revalidation, first-class `Keep both` duplicate handling for target-path-only collisions, and updater hardening with persisted stable/preview channels plus rollback-trigger guardrails. Pending work is destructive duplicate semantics, mirror/source merging, and any decision to split updater keyspace by channel.
