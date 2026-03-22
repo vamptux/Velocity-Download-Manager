@@ -15,7 +15,7 @@
     "test:extension": "bun -e \"import { spawnSync } from 'node:child_process'; import { existsSync } from 'node:fs'; const path = './extensions/vdm-catcher/shared/download-rules.test.js'; if (!existsSync(path)) { console.log('No extension tests found; skipping.'); process.exit(0); } const result = spawnSync(process.execPath, ['test', path], { stdio: 'inherit' }); process.exit(result.status ?? 1);\"",
     "check:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml --target-dir src-tauri/target-clippy --all-targets --all-features -- -D warnings",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --target-dir src-tauri/target-test",
-    "validate": "bun run lint && bun run build && bun run test:extension && bun run test:rust && bun run check:rust",
+    "validate": "bun run lint && bun run test:rust && bun run build && bun run test:extension && bun run check:rust",
     "audit:js": "bun audit"
   },
   "dependencies": {

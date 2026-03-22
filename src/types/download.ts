@@ -1,6 +1,8 @@
 import type { AddDownloadArgs as BackendAddDownloadArgs } from "./generated/backend/AddDownloadArgs";
 import type { AppUpdateInfo as BackendAppUpdateInfo } from "./generated/backend/AppUpdateInfo";
 import type { AppUpdateProgressEvent as BackendAppUpdateProgressEvent } from "./generated/backend/AppUpdateProgressEvent";
+import type { AppUpdateStartupHealth as BackendAppUpdateStartupHealth } from "./generated/backend/AppUpdateStartupHealth";
+import type { AppUpdateStartupHealthStatus as BackendAppUpdateStartupHealthStatus } from "./generated/backend/AppUpdateStartupHealthStatus";
 import type { CapturePayload as BackendCapturePayload } from "./generated/backend/CapturePayload";
 import type { ChecksumAlgorithm as BackendChecksumAlgorithm } from "./generated/backend/ChecksumAlgorithm";
 import type { ChecksumSpec as BackendChecksumSpec } from "./generated/backend/ChecksumSpec";
@@ -51,6 +53,8 @@ export type DownloadRequestField = Jsonify<BackendDownloadRequestField>;
 export type EngineSettings = Jsonify<BackendEngineSettings>;
 export type AppUpdateInfo = Jsonify<BackendAppUpdateInfo>;
 export type AppUpdateProgressEvent = Jsonify<BackendAppUpdateProgressEvent>;
+export type AppUpdateStartupHealthStatus = Jsonify<BackendAppUpdateStartupHealthStatus>;
+export type AppUpdateStartupHealth = Jsonify<BackendAppUpdateStartupHealth>;
 export type QueueState = Jsonify<BackendQueueState>;
 export type HostDiagnosticsSummary = Jsonify<BackendHostDiagnosticsSummary>;
 export type DownloadCompatibility = Jsonify<BackendDownloadCompatibility>;

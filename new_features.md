@@ -86,6 +86,7 @@ Notes:
 - [x] Validate rows before enqueue.
 - [x] Show import preview with parsed fields and row errors.
 - [x] Allow partial success with per-row failure reporting.
+- [x] Allow editing parsed rows before enqueue.
 - [ ] Decide Metalink support scope and parser choice.
 
 Notes:
@@ -98,9 +99,9 @@ Notes:
 ## Phase 6 - Updater safety
 - [ ] Add update channel model: `stable` and `preview`.
 - [x] Add skip-this-version state.
-- [ ] Preserve engine settings across update transitions.
-- [ ] Record enough update metadata to diff settings / behavior changes.
-- [ ] Define startup health check after install.
+- [x] Preserve engine settings across update transitions.
+- [x] Record enough update metadata to diff settings / behavior changes.
+- [x] Define startup health check after install.
 - [ ] Define rollback trigger if post-update startup health check fails.
 - [x] Show changelog highlights tied to engine behavior changes.
 
@@ -110,6 +111,8 @@ Notes:
 - Rollback trigger:
 - Skip-version storage: persisted in `EngineSettings.skippedUpdateVersion` and filtered in backend update checks.
 - Update alerts now show current-to-target version metadata plus up to three prioritized highlights from release notes, with engine/backend items ranked ahead of general notes.
+- Update transition metadata: install now writes a pending transition record with source/target versions, release notes, and the pre-install `EngineSettings` snapshot before download begins.
+- Startup health check: first restart after install now reports `pending`, `healthy`, `restoredSettings`, or `failed`; if the updated build comes up with default engine settings, VDM restores the previous transfer profile before continuing.
 
 ---
 
@@ -118,7 +121,7 @@ Notes:
 - [ ] Should duplicate detection prefer validator matches over URL matches when they disagree?
 - [ ] What exactly should `Replace existing` mean for finished vs partial downloads?
 - [ ] Should `Merge source list` be implemented now or deferred until mirror support lands?
-- [ ] Should batch import preview allow editing parsed rows before enqueue?
+- [x] Should batch import preview allow editing parsed rows before enqueue?
 - [ ] Should preview update channel use a separate settings keyspace or share the same one?
 
 Notes:
@@ -128,8 +131,8 @@ Notes:
 
 ## Session handoff
 - Next recommended step: decide whether validator-based duplicate matches should auto-link into the same contextual action flow before adding any destructive replace semantics.
-- Files most relevant next session: `src/components/CompactCaptureWindow.tsx`, `src/components/NewDownloadDialog.tsx`, `src/components/DownloadCapturePane.tsx`, `src/App.tsx`, `src/lib/downloadDuplicates.ts`, `src/lib/updatePresentation.ts`.
-- Decisions that must not be forgotten: skip-version is backend-persisted, duplicate URL matches outrank path-only matches, compact capture now keeps a live duplicate cache from download upsert/remove events, and updater alerts prioritize engine-related release-note highlights.
-- Current thresholds / limits: batch preview renders the first 8 rows inline and the first 5 import failures in the summary.
-- Known bugs / risks: CSV/TSV parsing supports quoted fields but not multiline quoted cells; validator duplicate matching intentionally refuses content-length-only matches and will not fire until the probe has both size and either `etag` or `last-modified`.
-- Quick summary for next agent: this pass added proactive duplicate handling to compact capture, contextual duplicate actions in the main add flow, and update alerts that surface prioritized engine-related changelog highlights. Pending work is validator-based duplicate identity and updater safety state beyond skip-version filtering.
+- Files most relevant next session: `src/components/BatchDownloadDialog.tsx`, `src/lib/batchImport.ts`, `src/App.tsx`, `src/hooks/useEngineBridge.ts`, `src-tauri/src/app_update.rs`, `src-tauri/src/engine/mod.rs`.
+- Decisions that must not be forgotten: skip-version is backend-persisted, duplicate URL matches outrank path-only matches, batch import rows are now editable and revalidated live before enqueue, and updater startup health restores prior settings only when the updated build appears to have reset to defaults.
+- Current thresholds / limits: batch import preview now keeps all parsed rows editable in a scrollable review pane and still limits the failure summary to the first 5 import failures.
+- Known bugs / risks: CSV/TSV parsing supports quoted fields but not multiline quoted cells; validator duplicate matching intentionally refuses content-length-only matches and will not fire until the probe has both size and either `etag` or `last-modified`; updater health currently reports failures but does not auto-roll back yet.
+- Quick summary for next agent: this pass added editable batch-import review with live revalidation and updater transition hardening that records pending install metadata, validates the first restart, and restores engine settings if an update resets them to defaults. Pending work is preview/stable update channels, rollback policy, and deeper duplicate semantics.

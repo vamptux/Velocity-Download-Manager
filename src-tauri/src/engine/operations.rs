@@ -272,6 +272,12 @@ impl EngineState {
         let mut active_downloads = Vec::new();
         let mut settings = EngineSettings::default();
         let mut queue_running = true;
+        let update_health = self
+            .inner
+            .update_health
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or(None);
         if let Ok(registry) = self.registry_guard() {
             settings = registry.settings.clone();
             queue_running = registry.queue_running;
@@ -288,6 +294,7 @@ impl EngineState {
             queue_state: QueueState {
                 running: queue_running,
             },
+            update_health,
             active_downloads,
         }
     }

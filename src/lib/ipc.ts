@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppUpdateInfo,
+  AppUpdateStartupHealth,
   AddDownloadArgs as BackendAddDownloadArgs,
   CapturePayload,
   ChecksumSpec,
@@ -47,6 +48,7 @@ interface RawStartupSnapshot {
   bootstrap: EngineBootstrapState;
   settings: EngineSettings;
   queueState: QueueState;
+  updateHealth: AppUpdateStartupHealth | null;
   activeDownloads: RawDownload[];
 }
 
@@ -66,6 +68,7 @@ export interface StartupSnapshot {
   bootstrap: EngineBootstrapState;
   settings: EngineSettings;
   queueState: QueueState;
+  updateHealth: AppUpdateStartupHealth | null;
   activeDownloads: Download[];
 }
 
@@ -141,6 +144,7 @@ export async function ipcGetStartupSnapshot(): Promise<StartupSnapshot> {
     bootstrap: raw.bootstrap,
     settings: raw.settings,
     queueState: raw.queueState,
+    updateHealth: raw.updateHealth,
     activeDownloads: raw.activeDownloads.map(fromRawDownload),
   };
 }

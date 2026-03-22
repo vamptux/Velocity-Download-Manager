@@ -9,6 +9,18 @@ import type { ChecksumAlgorithm, ChecksumSpec, DownloadContentCategory } from "@
 
 export type BatchImportFormat = "lines" | "csv" | "tsv";
 
+export interface BatchImportDraftRow {
+  lineNumber: number;
+  source: string;
+  url: string;
+  folder: string;
+  filename: string;
+  category: DownloadContentCategory;
+  startImmediately: boolean;
+  checksumInput: string;
+  seedErrors: string[];
+}
+
 export interface BatchImportRow {
   lineNumber: number;
   source: string;
@@ -17,9 +29,15 @@ export interface BatchImportRow {
   filename: string;
   category: DownloadContentCategory;
   startImmediately: boolean;
+  checksumInput: string;
   checksum: ChecksumSpec | null;
   targetPath: string | null;
   errors: string[];
+}
+
+export interface BatchImportDraftPreview {
+  format: BatchImportFormat;
+  rows: BatchImportDraftRow[];
 }
 
 export interface BatchImportPreview {
@@ -182,20 +200,11 @@ function validateUrl(url: string): string | null {
 }
 
 function finalizeRow(
-  lineNumber: number,
-  source: string,
-  values: {
-    url?: string;
-    folder?: string;
-    filename?: string;
-    checksum?: string;
-    category?: string;
-    startMode?: string;
-  },
+  row: BatchImportDraftRow,
   defaultSavePath: string,
 ): BatchImportRow {
-  const errors: string[] = [];
-  const url = values.url?.trim() ?? "";
+  const errors: string[] = [...row.seedErrors];
+  const url = row.url.trim();
   if (!url) {
     errors.push("URL is required.");
   } else {
@@ -205,45 +214,53 @@ function finalizeRow(
     }
   }
 
-  const filename = (values.filename?.trim() || suggestedNameFromUrl(url)).trim();
-  const folder = (values.folder?.trim() || defaultSavePath).trim();
+  const filename = (row.filename.trim() || suggestedNameFromUrl(url)).trim();
+  const folder = (row.folder.trim() || defaultSavePath).trim();
   if (!folder) {
     errors.push("Folder is required or a default download directory must be available.");
   }
 
-  const categoryValue = values.category?.trim().toLowerCase();
-  const category = categoryValue
-    ? (CATEGORY_VALUES.has(categoryValue as DownloadContentCategory)
-      ? categoryValue as DownloadContentCategory
-      : null)
+  const category = CATEGORY_VALUES.has(row.category)
+    ? row.category
     : guessCaptureCategory(null, filename || suggestedNameFromUrl(url));
   if (!category) {
-    errors.push(`Unsupported category '${values.category?.trim() ?? ""}'.`);
+    errors.push(`Unsupported category '${row.category}'.`);
   }
 
-  const { checksum, error: checksumError } = parseChecksum(values.checksum ?? "");
+  const checksumInput = row.checksumInput.trim();
+  const { checksum, error: checksumError } = parseChecksum(checksumInput);
   if (checksumError) {
     errors.push(checksumError);
-  }
-
-  const { startImmediately, error: startModeError } = parseStartMode(values.startMode ?? "");
-  if (startModeError) {
-    errors.push(startModeError);
   }
 
   const targetPath = joinTargetPathPreview(folder, filename);
 
   return {
-    lineNumber,
-    source,
+    lineNumber: row.lineNumber,
+    source: row.source,
     url,
     folder,
     filename,
     category: category ?? "documents",
-    startImmediately,
+    startImmediately: row.startImmediately,
+    checksumInput,
     checksum,
     targetPath,
     errors,
+  };
+}
+
+function toDraftRow(row: BatchImportRow): BatchImportDraftRow {
+  return {
+    lineNumber: row.lineNumber,
+    source: row.source,
+    url: row.url,
+    folder: row.folder,
+    filename: row.filename,
+    category: row.category,
+    startImmediately: row.startImmediately,
+    checksumInput: row.checksumInput,
+    seedErrors: [],
   };
 }
 
@@ -278,10 +295,10 @@ function addIntraBatchDuplicateErrors(rows: BatchImportRow[]): BatchImportRow[] 
   });
 }
 
-export function parseBatchImportInput(input: string, defaultSavePath: string): BatchImportPreview {
+export function createBatchImportDrafts(input: string, defaultSavePath: string): BatchImportDraftPreview {
   const lines = input.split(/\r?\n/);
   const format = detectFormat(lines);
-  const rows: BatchImportRow[] = [];
+  const rows: BatchImportDraftRow[] = [];
 
   if (format === "lines") {
     lines.forEach((line, index) => {
@@ -289,9 +306,17 @@ export function parseBatchImportInput(input: string, defaultSavePath: string): B
       if (!source) {
         return;
       }
-      rows.push(
-        finalizeRow(index + 1, line, { url: source }, defaultSavePath),
-      );
+      rows.push(toDraftRow(finalizeRow({
+        lineNumber: index + 1,
+        source: line,
+        url: source,
+        folder: defaultSavePath,
+        filename: "",
+        category: guessCaptureCategory(null, suggestedNameFromUrl(source)) ?? "documents",
+        startImmediately: true,
+        checksumInput: "",
+        seedErrors: [],
+      }, defaultSavePath)));
     });
   } else {
     const delimiter = format === "tsv" ? "\t" : ",";
@@ -311,21 +336,42 @@ export function parseBatchImportInput(input: string, defaultSavePath: string): B
           return accumulator;
         }, {});
 
-        rows.push(
-          finalizeRow(index + 1, line, {
-            url: record.url,
-            folder: record.folder,
-            filename: record.filename,
-            checksum: record.checksum,
-            category: record.category,
-            startMode: record.startMode,
-          }, defaultSavePath),
-        );
+        const suggestedUrl = record.url?.trim() ?? "";
+        const { startImmediately, error: startModeError } = parseStartMode(record.startMode ?? "");
+        const normalizedCategory = record.category?.trim().toLowerCase();
+        const categoryError = normalizedCategory && !CATEGORY_VALUES.has(normalizedCategory as DownloadContentCategory)
+          ? `Unsupported category '${record.category?.trim() ?? ""}'.`
+          : null;
+        rows.push(toDraftRow(finalizeRow({
+          lineNumber: index + 1,
+          source: line,
+          url: suggestedUrl,
+          folder: record.folder ?? defaultSavePath,
+          filename: record.filename ?? "",
+          category: CATEGORY_VALUES.has(normalizedCategory as DownloadContentCategory)
+            ? normalizedCategory as DownloadContentCategory
+            : guessCaptureCategory(null, record.filename?.trim() || suggestedNameFromUrl(suggestedUrl)) ?? "documents",
+          startImmediately,
+          checksumInput: record.checksum ?? "",
+          seedErrors: [categoryError, startModeError].filter((value): value is string => value != null),
+        }, defaultSavePath)));
       }
     }
   }
 
-  const rowsWithDuplicateChecks = addIntraBatchDuplicateErrors(rows);
+  return {
+    format,
+    rows,
+  };
+}
+
+export function validateBatchImportRows(
+  rows: BatchImportDraftRow[],
+  format: BatchImportFormat,
+  defaultSavePath: string,
+): BatchImportPreview {
+  const validatedRows = rows.map((row) => finalizeRow(row, defaultSavePath));
+  const rowsWithDuplicateChecks = addIntraBatchDuplicateErrors(validatedRows);
   const invalidCount = rowsWithDuplicateChecks.filter((row) => row.errors.length > 0).length;
 
   return {
@@ -334,4 +380,9 @@ export function parseBatchImportInput(input: string, defaultSavePath: string): B
     validCount: rowsWithDuplicateChecks.length - invalidCount,
     invalidCount,
   };
+}
+
+export function parseBatchImportInput(input: string, defaultSavePath: string): BatchImportPreview {
+  const draftPreview = createBatchImportDrafts(input, defaultSavePath);
+  return validateBatchImportRows(draftPreview.rows, draftPreview.format, defaultSavePath);
 }

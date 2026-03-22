@@ -1,13 +1,17 @@
-import { useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { X, ListPlus } from "lucide-react";
 import { InlineNotice } from "@/components/ui/inline-notice";
 import { cn } from "@/lib/utils";
 import { ipcAddDownload } from "@/lib/ipc";
 import { getCaptureErrorMessage, useDefaultCaptureSavePath } from "@/lib/captureUtils";
-import { parseBatchImportInput } from "@/lib/batchImport";
+import {
+  createBatchImportDrafts,
+  type BatchImportDraftRow,
+  validateBatchImportRows,
+} from "@/lib/batchImport";
 import { describeDuplicateMatch, findDuplicateDownload } from "@/lib/downloadDuplicates";
-import type { Download } from "@/types/download";
+import type { Download, DownloadContentCategory } from "@/types/download";
 
 interface BatchDownloadDialogProps {
   open: boolean;
@@ -22,6 +26,15 @@ interface BatchImportResult {
   failures: Array<{ lineNumber: number; label: string; message: string }>;
 }
 
+const CATEGORY_OPTIONS: DownloadContentCategory[] = [
+  "compressed",
+  "programs",
+  "videos",
+  "music",
+  "pictures",
+  "documents",
+];
+
 export function BatchDownloadDialog({
   open,
   onOpenChange,
@@ -34,11 +47,22 @@ export function BatchDownloadDialog({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [progress, setProgress] = useState<{ total: number; done: number } | null>(null);
   const [importResult, setImportResult] = useState<BatchImportResult | null>(null);
+  const [draftRows, setDraftRows] = useState<BatchImportDraftRow[]>([]);
 
   useDefaultCaptureSavePath(open, defaultSavePath, setDefaultSavePath);
+  const deferredUrls = useDeferredValue(urls);
+
+  const parsedDraftPreview = useMemo(
+    () => createBatchImportDrafts(deferredUrls, defaultSavePath),
+    [defaultSavePath, deferredUrls],
+  );
+
+  useEffect(() => {
+    setDraftRows(parsedDraftPreview.rows);
+  }, [parsedDraftPreview.rows]);
 
   const preview = useMemo(() => {
-    const base = parseBatchImportInput(urls, defaultSavePath);
+    const base = validateBatchImportRows(draftRows, parsedDraftPreview.format, defaultSavePath);
     const rows = base.rows.map((row) => {
       const duplicateMatch = findDuplicateDownload(existingDownloads, {
         url: row.url,
@@ -62,7 +86,32 @@ export function BatchDownloadDialog({
       validCount: rows.length - invalidCount,
       invalidCount,
     };
-  }, [defaultSavePath, existingDownloads, urls]);
+  }, [defaultSavePath, draftRows, existingDownloads, parsedDraftPreview.format]);
+
+  const parsedRowByLine = useMemo(
+    () => new Map(parsedDraftPreview.rows.map((row) => [row.lineNumber, row])),
+    [parsedDraftPreview.rows],
+  );
+  const draftRowByLine = useMemo(
+    () => new Map(draftRows.map((row) => [row.lineNumber, row])),
+    [draftRows],
+  );
+
+  function updateDraftRow(lineNumber: number, patch: Partial<BatchImportDraftRow>) {
+    setDraftRows((prev) => prev.map((row) => (
+      row.lineNumber === lineNumber
+        ? {
+          ...row,
+          ...patch,
+          seedErrors: patch.category !== undefined || patch.startImmediately !== undefined
+            ? []
+            : row.seedErrors,
+        }
+        : row
+    )));
+    setSubmitError(null);
+    setImportResult(null);
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -129,6 +178,7 @@ export function BatchDownloadDialog({
         onOpenChange(val);
         if (!val) {
           setUrls("");
+          setDraftRows([]);
           setSubmitError(null);
           setProgress(null);
           setImportResult(null);
@@ -199,43 +249,135 @@ export function BatchDownloadDialog({
                   <span>Detected format: {preview.format.toUpperCase()}</span>
                   <span>{preview.validCount} ready, {preview.invalidCount} need review</span>
                 </div>
-                <div className="mt-2 max-h-[190px] overflow-y-auto rounded-md border border-border/40 bg-black/10">
-                  <div className="grid grid-cols-[52px_minmax(0,1.4fr)_minmax(0,1.1fr)_88px] gap-x-2 border-b border-border/40 px-3 py-2 text-[10px] uppercase tracking-[0.12em] text-muted-foreground/45">
-                    <span>Row</span>
-                    <span>File</span>
-                    <span>Folder</span>
-                    <span>Status</span>
-                  </div>
-                  {preview.rows.slice(0, 8).map((row) => {
+                <div className="mt-2 max-h-[320px] space-y-2 overflow-y-auto rounded-md border border-border/40 bg-black/10 p-2">
+                  {preview.rows.map((row) => {
                     const hasErrors = row.errors.length > 0;
                     return (
                       <div
-                        key={`${row.lineNumber}:${row.url}`}
-                        className="grid grid-cols-[52px_minmax(0,1.4fr)_minmax(0,1.1fr)_88px] gap-x-2 border-b border-border/20 px-3 py-2 text-[11px] last:border-b-0"
+                        key={row.lineNumber}
+                        className={cn(
+                          "rounded-md border px-3 py-2.5",
+                          hasErrors
+                            ? "border-[hsl(var(--status-error)/0.28)] bg-[hsl(var(--status-error)/0.07)]"
+                            : "border-border/40 bg-black/10",
+                        )}
                       >
-                        <span className="text-muted-foreground/60">{row.lineNumber}</span>
-                        <div className="min-w-0">
-                          <div className="truncate text-foreground/84">{row.filename || row.url}</div>
-                          <div className="truncate text-muted-foreground/50">{row.url}</div>
-                          {hasErrors ? (
-                            <div className="mt-1 text-[10.5px] text-[hsl(var(--status-error))]">
-                              {row.errors[0]}
-                            </div>
-                          ) : null}
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/46">
+                            Row {row.lineNumber}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className={cn(
+                              "rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.1em]",
+                              hasErrors
+                                ? "border-[hsl(var(--status-error)/0.28)] text-[hsl(var(--status-error))]"
+                                : "border-[hsl(var(--status-finished)/0.28)] text-[hsl(var(--status-finished))]",
+                            )}>
+                              {hasErrors ? "Review" : row.startImmediately ? "Start now" : "Queued"}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const sourceRow = parsedRowByLine.get(row.lineNumber);
+                                if (sourceRow) {
+                                  updateDraftRow(row.lineNumber, sourceRow);
+                                }
+                              }}
+                              className="rounded-md border border-border/60 px-2 py-1 text-[10.5px] text-muted-foreground/64 transition-colors hover:bg-accent hover:text-foreground"
+                            >
+                              Reset row
+                            </button>
+                          </div>
                         </div>
-                        <div className="min-w-0 truncate text-muted-foreground/60">{row.folder || "Missing"}</div>
-                        <div className={hasErrors ? "text-[hsl(var(--status-error))]" : "text-[hsl(var(--status-finished))]"}>
-                          {hasErrors ? "Review" : row.startImmediately ? "Start now" : "Queued"}
+
+                        <div className="mt-2 grid gap-2 md:grid-cols-2">
+                          <label className="flex flex-col gap-1 text-[10.5px] uppercase tracking-[0.08em] text-muted-foreground/42">
+                            URL
+                            <input
+                              value={draftRowByLine.get(row.lineNumber)?.url ?? row.url}
+                              onChange={(event) => updateDraftRow(row.lineNumber, { url: event.target.value })}
+                              className="rounded-md border border-border/60 bg-black/20 px-2.5 py-2 text-[11.5px] normal-case tracking-normal text-foreground outline-none transition-colors focus:border-primary/50 focus:bg-black/35"
+                              disabled={submitting}
+                            />
+                          </label>
+                          <label className="flex flex-col gap-1 text-[10.5px] uppercase tracking-[0.08em] text-muted-foreground/42">
+                            Filename
+                            <input
+                              value={draftRowByLine.get(row.lineNumber)?.filename ?? row.filename}
+                              onChange={(event) => updateDraftRow(row.lineNumber, { filename: event.target.value })}
+                              className="rounded-md border border-border/60 bg-black/20 px-2.5 py-2 text-[11.5px] normal-case tracking-normal text-foreground outline-none transition-colors focus:border-primary/50 focus:bg-black/35"
+                              disabled={submitting}
+                            />
+                          </label>
+                          <label className="flex flex-col gap-1 text-[10.5px] uppercase tracking-[0.08em] text-muted-foreground/42">
+                            Folder
+                            <input
+                              value={draftRowByLine.get(row.lineNumber)?.folder ?? row.folder}
+                              onChange={(event) => updateDraftRow(row.lineNumber, { folder: event.target.value })}
+                              className="rounded-md border border-border/60 bg-black/20 px-2.5 py-2 text-[11.5px] normal-case tracking-normal text-foreground outline-none transition-colors focus:border-primary/50 focus:bg-black/35"
+                              disabled={submitting}
+                            />
+                          </label>
+                          <label className="flex flex-col gap-1 text-[10.5px] uppercase tracking-[0.08em] text-muted-foreground/42">
+                            Checksum
+                            <input
+                              value={draftRowByLine.get(row.lineNumber)?.checksumInput ?? row.checksumInput}
+                              onChange={(event) => updateDraftRow(row.lineNumber, { checksumInput: event.target.value })}
+                              placeholder="sha256:..."
+                              className="rounded-md border border-border/60 bg-black/20 px-2.5 py-2 text-[11.5px] normal-case tracking-normal text-foreground outline-none transition-colors focus:border-primary/50 focus:bg-black/35"
+                              disabled={submitting}
+                            />
+                          </label>
                         </div>
+
+                        <div className="mt-2 grid gap-2 md:grid-cols-[minmax(0,1fr)_140px]">
+                          <label className="flex flex-col gap-1 text-[10.5px] uppercase tracking-[0.08em] text-muted-foreground/42">
+                            Category
+                            <select
+                              value={draftRowByLine.get(row.lineNumber)?.category ?? row.category}
+                              onChange={(event) => updateDraftRow(row.lineNumber, {
+                                category: event.target.value as DownloadContentCategory,
+                              })}
+                              className="rounded-md border border-border/60 bg-black/20 px-2.5 py-2 text-[11.5px] text-foreground outline-none transition-colors focus:border-primary/50 focus:bg-black/35"
+                              disabled={submitting}
+                            >
+                              {CATEGORY_OPTIONS.map((category) => (
+                                <option key={category} value={category}>
+                                  {category}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="flex flex-col gap-1 text-[10.5px] uppercase tracking-[0.08em] text-muted-foreground/42">
+                            Start mode
+                            <select
+                              value={(draftRowByLine.get(row.lineNumber)?.startImmediately ?? row.startImmediately) ? "now" : "queued"}
+                              onChange={(event) => updateDraftRow(row.lineNumber, {
+                                startImmediately: event.target.value === "now",
+                              })}
+                              className="rounded-md border border-border/60 bg-black/20 px-2.5 py-2 text-[11.5px] text-foreground outline-none transition-colors focus:border-primary/50 focus:bg-black/35"
+                              disabled={submitting}
+                            >
+                              <option value="now">Start now</option>
+                              <option value="queued">Queued</option>
+                            </select>
+                          </label>
+                        </div>
+
+                        {hasErrors ? (
+                          <div className="mt-2 space-y-1 text-[10.5px] text-[hsl(var(--status-error))]">
+                            {row.errors.map((error) => (
+                              <div key={`${row.lineNumber}:${error}`}>{error}</div>
+                            ))}
+                          </div>
+                        ) : null}
                       </div>
                     );
                   })}
                 </div>
-                {preview.rows.length > 8 ? (
-                  <div className="mt-2 text-[11px] text-muted-foreground/55">
-                    Showing 8 of {preview.rows.length} parsed rows.
-                  </div>
-                ) : null}
+                <div className="mt-2 text-[11px] text-muted-foreground/55">
+                  Edit any parsed row before import. VDM revalidates duplicates and required fields live.
+                </div>
               </div>
             ) : null}
 

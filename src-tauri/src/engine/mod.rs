@@ -82,12 +82,13 @@ use settings_policy::sanitize_engine_settings;
 use wake_lock::WakeLockController;
 
 use crate::model::{
-    AddDownloadArgs, ChecksumSpec, DownloadCapabilities, DownloadCompatibility,
-    DownloadDiagnostics, DownloadFailureKind, DownloadIntegrity, DownloadLogEntry,
-    DownloadLogLevel, DownloadRecord, DownloadRequestField, DownloadRequestMethod,
-    DownloadRuntimeCheckpoint, DownloadSegment, DownloadSegmentStatus, DownloadStatus,
-    EngineSettings, HostProfile, HostTelemetryArgs, ProbeDownloadArgs, ProbeResult, QueueState,
-    RegistrySnapshot, ReorderDirection, TrafficMode,
+    AddDownloadArgs, AppUpdateStartupHealth, ChecksumSpec, DownloadCapabilities,
+    DownloadCompatibility, DownloadDiagnostics, DownloadFailureKind, DownloadIntegrity,
+    DownloadLogEntry, DownloadLogLevel, DownloadRecord, DownloadRequestField,
+    DownloadRequestMethod, DownloadRuntimeCheckpoint, DownloadSegment,
+    DownloadSegmentStatus, DownloadStatus, EngineSettings, HostProfile, HostTelemetryArgs,
+    ProbeDownloadArgs, ProbeResult, QueueState, RegistrySnapshot, ReorderDirection,
+    TrafficMode,
 };
 
 const DEFAULT_QUEUE: &str = "default";
@@ -117,6 +118,7 @@ struct EngineInner {
     registry: Mutex<RegistrySnapshot>,
     snapshot_path: PathBuf,
     snapshot_writer: SnapshotPersistQueue,
+    update_health: Mutex<Option<AppUpdateStartupHealth>>,
     bootstrap: Mutex<BootstrapRuntimeState>,
     bootstrap_notify: Notify,
     progress_sync: Mutex<ProgressSyncState>,
@@ -156,6 +158,7 @@ pub struct StartupSnapshot {
     pub bootstrap: EngineBootstrapState,
     pub settings: EngineSettings,
     pub queue_state: QueueState,
+    pub update_health: Option<AppUpdateStartupHealth>,
     pub active_downloads: Vec<DownloadRecord>,
 }
 
@@ -575,6 +578,7 @@ fn load_persisted_registry_snapshot(path: &Path) -> Result<RegistrySnapshot, Str
 
 impl EngineState {
     pub fn new(app: AppHandle) -> Self {
+        let pending_update_health = crate::app_update::pending_startup_health(&app);
         let base_path = app
             .path()
             .app_data_dir()
@@ -586,6 +590,7 @@ impl EngineState {
                 registry: Mutex::new(RegistrySnapshot::default()),
                 snapshot_writer: SnapshotPersistQueue::new(state_path.clone()),
                 snapshot_path: state_path,
+                update_health: Mutex::new(pending_update_health),
                 bootstrap: Mutex::new(BootstrapRuntimeState::default()),
                 bootstrap_notify: Notify::new(),
                 progress_sync: Mutex::new(ProgressSyncState::default()),
@@ -663,10 +668,31 @@ impl EngineState {
 
     fn finish_bootstrap(&self, snapshot: Result<RegistrySnapshot, String>) {
         let mut bootstrap_error = None;
+        let mut restored_settings = false;
+        let mut update_health = None;
         match snapshot {
             Ok(snapshot) => match self.inner.registry.lock() {
                 Ok(mut registry) => {
                     *registry = snapshot;
+
+                    let evaluation = crate::app_update::finalize_startup_health(
+                        &self.inner.app,
+                        Some(&mut registry.settings),
+                        None,
+                    )
+                    .unwrap_or_default();
+                    restored_settings = evaluation.settings_restored;
+                    update_health = evaluation.health;
+
+                    if restored_settings {
+                        let settings = registry.settings.clone();
+                        let host_profiles = registry.host_profiles.clone();
+                        for download in &mut registry.downloads {
+                            download.traffic_mode = settings.traffic_mode.clone();
+                            let host_profile = host_profiles.get(&download.host);
+                            apply_download_host_profile(download, &settings, host_profile);
+                        }
+                    }
                 }
                 Err(_) => {
                     bootstrap_error =
@@ -674,6 +700,20 @@ impl EngineState {
                 }
             },
             Err(error) => bootstrap_error = Some(error),
+        }
+
+        if update_health.is_none() {
+            update_health = crate::app_update::finalize_startup_health(
+                &self.inner.app,
+                None,
+                bootstrap_error.as_deref(),
+            )
+            .unwrap_or_default()
+            .health;
+        }
+
+        if let Ok(mut current_update_health) = self.inner.update_health.lock() {
+            *current_update_health = update_health;
         }
 
         let state = match self.inner.bootstrap.lock() {
@@ -696,6 +736,9 @@ impl EngineState {
         self.inner.bootstrap_notify.notify_waiters();
         let _ = self.inner.app.emit(ENGINE_BOOTSTRAP_EVENT, state);
         if let Ok(registry) = self.inner.registry.lock() {
+            if restored_settings {
+                let _ = self.persist_registry_flush(&registry);
+            }
             self.emit_engine_settings(&registry.settings);
         }
     }

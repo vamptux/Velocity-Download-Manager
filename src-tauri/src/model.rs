@@ -595,6 +595,29 @@ pub struct AppUpdateInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub enum AppUpdateStartupHealthStatus {
+    Pending,
+    Healthy,
+    RestoredSettings,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUpdateStartupHealth {
+    pub status: AppUpdateStartupHealthStatus,
+    pub from_version: String,
+    pub target_version: String,
+    pub observed_version: String,
+    pub checked_at: i64,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
 #[serde(rename_all = "camelCase", tag = "event", content = "data")]
 pub enum AppUpdateProgressEvent {
     #[serde(rename_all = "camelCase")]

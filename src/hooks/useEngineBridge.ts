@@ -7,10 +7,18 @@ import {
   type EngineBootstrapState,
   type RawDownload,
 } from "@/lib/ipc";
-import type { Download, DownloadCompletedEvent, DownloadProgressDiffEvent, EngineSettings, QueueState } from "@/types/download";
+import type {
+  AppUpdateStartupHealth,
+  Download,
+  DownloadCompletedEvent,
+  DownloadProgressDiffEvent,
+  EngineSettings,
+  QueueState,
+} from "@/types/download";
 
 interface UseEngineBridgeArgs {
   setBootstrapState: Dispatch<SetStateAction<EngineBootstrapState>>;
+  setUpdateHealth: Dispatch<SetStateAction<AppUpdateStartupHealth | null>>;
   setSettings: Dispatch<SetStateAction<EngineSettings>>;
   setQueueState: Dispatch<SetStateAction<QueueState>>;
   setDownloads: Dispatch<SetStateAction<Download[]>>;
@@ -25,6 +33,7 @@ interface UseEngineBridgeArgs {
 
 export function useEngineBridge({
   setBootstrapState,
+  setUpdateHealth,
   setSettings,
   setQueueState,
   setDownloads,
@@ -47,6 +56,7 @@ export function useEngineBridge({
         if (!disposed) {
           startTransition(() => {
             setBootstrapState(startupSnapshot.bootstrap);
+            setUpdateHealth(startupSnapshot.updateHealth);
             setSettings(startupSnapshot.settings);
             setQueueState(startupSnapshot.queueState);
             setDownloads(startupSnapshot.activeDownloads);
@@ -58,6 +68,13 @@ export function useEngineBridge({
         const unlistenBootstrap = await listen<EngineBootstrapState>("engine://bootstrap", (event) => {
           bootstrapEventReceived = true;
           setBootstrapState(event.payload);
+          void ipcGetStartupSnapshot()
+            .then((startupSnapshot) => {
+              if (!disposed) {
+                setUpdateHealth(startupSnapshot.updateHealth);
+              }
+            })
+            .catch(() => null);
           void refreshAppState();
         });
         const unlistenUpsert = await listen<RawDownload>("downloads://upsert-row", (event) => {
@@ -100,11 +117,16 @@ export function useEngineBridge({
         setBootstrapState(bootstrap);
 
         if (bootstrap.ready && !bootstrapEventReceived) {
+          const startupSnapshot = await ipcGetStartupSnapshot().catch(() => null);
+          if (!disposed && startupSnapshot) {
+            setUpdateHealth(startupSnapshot.updateHealth);
+          }
           await refreshAppState();
         }
       } catch {
         eventBridgeAttached.current = false;
         setBootstrapState({ ready: true, error: null });
+        setUpdateHealth(null);
         await refreshAppState();
       }
     }
@@ -126,6 +148,7 @@ export function useEngineBridge({
     refreshAppState,
     removeDownloadLocally,
     setBootstrapState,
+    setUpdateHealth,
     setDownloads,
     setQueueState,
     setSettings,

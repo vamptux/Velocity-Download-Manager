@@ -51,8 +51,12 @@ async fn check_app_update(
 }
 
 #[tauri::command]
-async fn install_app_update(app: AppHandle) -> CommandResult<AppUpdateInfo> {
-    app_update::install_update(&app).await
+async fn install_app_update(
+    app: AppHandle,
+    state: State<'_, EngineState>,
+) -> CommandResult<AppUpdateInfo> {
+    let settings = state.inner().get_settings();
+    app_update::install_update(&app, &settings).await
 }
 
 #[tauri::command]

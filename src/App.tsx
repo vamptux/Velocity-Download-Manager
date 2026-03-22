@@ -43,6 +43,7 @@ import { simplifyUserMessage } from "@/lib/userFacingMessages";
 import type {
   AppUpdateInfo,
   AppUpdateProgressEvent,
+  AppUpdateStartupHealth,
   DownloadCompletedEvent,
   DownloadProgressDiffEvent,
   QueueState,
@@ -349,12 +350,14 @@ export function App() {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
   const [bootstrapState, setBootstrapState] = useState<EngineBootstrapState>({ ready: false, error: null });
+  const [startupUpdateHealth, setStartupUpdateHealth] = useState<AppUpdateStartupHealth | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deleteTargetIds, setDeleteTargetIds] = useState<Set<string>>(new Set());
   const [completionNotices, setCompletionNotices] = useState<DownloadCompletedEvent[]>([]);
   const [completionHistoryExpanded, setCompletionHistoryExpanded] = useState(false);
   const [dismissedBootstrapError, setDismissedBootstrapError] = useState<string | null>(null);
+  const [dismissedStartupUpdateHealthSignature, setDismissedStartupUpdateHealthSignature] = useState<string | null>(null);
   const [dismissedDownloadIssueSignature, setDismissedDownloadIssueSignature] = useState<string | null>(null);
   const [downloadDetails, setDownloadDetails] = useState<Record<string, DownloadDetailSnapshot>>({});
   const [uiPrefs, setUiPrefs] = useState<UiPrefs>(() => ({ ...loadUiPrefs() }));
@@ -616,6 +619,12 @@ export function App() {
   }, [bootstrapState.error]);
 
   useEffect(() => {
+    if (!startupUpdateHealth) {
+      setDismissedStartupUpdateHealthSignature(null);
+    }
+  }, [startupUpdateHealth]);
+
+  useEffect(() => {
     if (!downloads.some((download) => download.status === "error")) {
       setDismissedDownloadIssueSignature(null);
     }
@@ -749,6 +758,7 @@ export function App() {
 
   useEngineBridge({
     setBootstrapState,
+    setUpdateHealth: setStartupUpdateHealth,
     setSettings,
     setQueueState,
     setDownloads,
@@ -1149,6 +1159,12 @@ export function App() {
     () => appUpdate.info ? `Current ${appUpdate.info.currentVersion} -> ${appUpdate.info.version}` : undefined,
     [appUpdate.info],
   );
+  const startupUpdateHealthSignature = useMemo(
+    () => startupUpdateHealth
+      ? `${startupUpdateHealth.status}:${startupUpdateHealth.fromVersion}:${startupUpdateHealth.targetVersion}:${startupUpdateHealth.observedVersion}:${startupUpdateHealth.checkedAt}`
+      : null,
+    [startupUpdateHealth],
+  );
   const floatingAlerts = useMemo<FloatingAlert[]>(() => {
     const alerts: FloatingAlert[] = [];
 
@@ -1182,6 +1198,42 @@ export function App() {
         },
         onDismiss: () => {
           setSettingsError(null);
+        },
+      });
+    }
+
+    if (startupUpdateHealth && startupUpdateHealthSignature !== dismissedStartupUpdateHealthSignature) {
+      const meta = `${startupUpdateHealth.fromVersion} -> ${startupUpdateHealth.targetVersion}`;
+      const tone = startupUpdateHealth.status === "failed"
+        ? "error"
+        : startupUpdateHealth.status === "restoredSettings"
+          ? "warning"
+          : startupUpdateHealth.status === "healthy"
+            ? "success"
+            : "info";
+      const title = startupUpdateHealth.status === "failed"
+        ? "Updated build needs review"
+        : startupUpdateHealth.status === "restoredSettings"
+          ? "Engine settings were restored"
+          : startupUpdateHealth.status === "healthy"
+            ? "Update health check passed"
+            : "Validating updated build";
+
+      alerts.push({
+        id: `startup-update-health:${startupUpdateHealthSignature}`,
+        tone,
+        eyebrow: "Update",
+        title,
+        meta,
+        message: startupUpdateHealth.message ?? "VDM is validating the first restart after the update.",
+        actionLabel: startupUpdateHealth.status === "restoredSettings" ? "Settings" : undefined,
+        onAction: startupUpdateHealth.status === "restoredSettings"
+          ? () => {
+            setSettingsOpen(true);
+          }
+          : undefined,
+        onDismiss: () => {
+          setDismissedStartupUpdateHealthSignature(startupUpdateHealthSignature);
         },
       });
     }
@@ -1285,6 +1337,7 @@ export function App() {
     return alerts;
   }, [
     bootstrapState.error,
+    dismissedStartupUpdateHealthSignature,
     dismissedBootstrapError,
     dismissedDownloadIssueSignature,
     failedDownloadIssueSignature,
@@ -1306,6 +1359,8 @@ export function App() {
     settingsError,
     settingsNotice,
     settingsOpen,
+    startupUpdateHealth,
+    startupUpdateHealthSignature,
   ]);
 
   return (
