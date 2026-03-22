@@ -42,6 +42,7 @@ import {
 import { simplifyUserMessage } from "@/lib/userFacingMessages";
 import type {
   AppUpdateChannel,
+  AppUpdateCheckResult,
   AppUpdateInfo,
   AppUpdateProgressEvent,
   AppUpdateStartupHealth,
@@ -79,6 +80,12 @@ type AppUpdateState = {
   totalBytes: number | null;
   error: string | null;
   dismissedVersion: string | null;
+};
+
+type AppUpdateFeedback = {
+  tone: "info" | "warning";
+  title: string;
+  message: string;
 };
 
 function getActionErrorMessage(error: unknown, fallback: string): string {
@@ -136,6 +143,28 @@ function appUpdateProgressMessage(downloadedBytes: number, totalBytes: number | 
 
 function updateChannelLabel(channel: AppUpdateChannel): string {
   return channel === "preview" ? "Preview" : "Stable";
+}
+
+function updateFeedbackFromResult(result: AppUpdateCheckResult): AppUpdateFeedback | null {
+  if (result.status === "upToDate") {
+    return {
+      tone: "info",
+      title: "No updates found",
+      message: result.message ?? "You already have the latest available build.",
+    };
+  }
+
+  if (result.status === "unavailable") {
+    return {
+      tone: "warning",
+      title: "Update not ready yet",
+      message:
+        result.message ??
+        "A newer release is published, but its in-app update package is not ready yet.",
+    };
+  }
+
+  return null;
 }
 
 type FloatingAlert = {
@@ -374,7 +403,7 @@ export function App() {
     dismissedVersion: null,
   }));
   const [appUpdateCheckPending, setAppUpdateCheckPending] = useState(false);
-  const [appUpdateNotice, setAppUpdateNotice] = useState<string | null>(null);
+  const [appUpdateFeedback, setAppUpdateFeedback] = useState<AppUpdateFeedback | null>(null);
   const [appUpdateCheckError, setAppUpdateCheckError] = useState<string | null>(null);
   const completionTimers = useRef<Map<string, number>>(new Map());
   const lastRealtimeSyncAt = useRef(Date.now());
@@ -606,20 +635,20 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!settingsNotice && !appUpdateNotice && !appUpdateCheckError) {
+    if (!settingsNotice && !appUpdateFeedback && !appUpdateCheckError) {
       return;
     }
 
     const timeoutId = window.setTimeout(() => {
       setSettingsNotice(null);
-      setAppUpdateNotice(null);
+      setAppUpdateFeedback(null);
       setAppUpdateCheckError(null);
     }, 4200);
 
     return () => {
       window.clearTimeout(timeoutId);
     };
-  }, [appUpdateCheckError, appUpdateNotice, settingsNotice]);
+  }, [appUpdateCheckError, appUpdateFeedback, settingsNotice]);
 
   useEffect(() => {
     if (!bootstrapState.error) {
@@ -714,17 +743,17 @@ export function App() {
     let active = true;
 
     void ipcCheckAppUpdate()
-      .then((update) => {
+      .then((result) => {
         if (!active) {
           return;
         }
 
         writeStoredString(updateLastCheckKey, String(Date.now()));
 
-        if (!update) {
+        if (result.status !== "available" || !result.info) {
           setAppUpdate((prev) => ({
             ...prev,
-            stage: "up-to-date",
+            stage: result.status === "upToDate" ? "up-to-date" : "idle",
             info: null,
             downloadedBytes: 0,
             totalBytes: null,
@@ -733,10 +762,12 @@ export function App() {
           return;
         }
 
+        const availableUpdate = result.info;
+
         setAppUpdate((prev) => ({
           ...prev,
-          stage: prev.dismissedVersion === update.version ? "idle" : "available",
-          info: update,
+          stage: prev.dismissedVersion === availableUpdate.version ? "idle" : "available",
+          info: availableUpdate,
           downloadedBytes: 0,
           totalBytes: null,
           error: null,
@@ -1121,34 +1152,32 @@ export function App() {
     }
 
     setAppUpdateCheckPending(true);
-    setAppUpdateNotice(null);
+    setAppUpdateFeedback(null);
     setAppUpdateCheckError(null);
 
     try {
-      const update = await ipcCheckAppUpdate();
+      const result = await ipcCheckAppUpdate();
       writeStoredString(updateLastCheckKey, String(Date.now()));
 
-      if (!update) {
+      if (result.status !== "available" || !result.info) {
         setAppUpdate((prev) => ({
           ...prev,
-          stage: "up-to-date",
+          stage: result.status === "upToDate" ? "up-to-date" : "idle",
           info: null,
           downloadedBytes: 0,
           totalBytes: null,
           error: null,
         }));
-        setAppUpdateNotice(
-          import.meta.env.DEV
-            ? "No newer published release is available for this build yet."
-            : "You already have the latest available build.",
-        );
+        setAppUpdateFeedback(updateFeedbackFromResult(result));
         return;
       }
 
+      const availableUpdate = result.info;
+
       setAppUpdate((prev) => ({
         ...prev,
-        stage: prev.dismissedVersion === update.version ? "idle" : "available",
-        info: update,
+        stage: prev.dismissedVersion === availableUpdate.version ? "idle" : "available",
+        info: availableUpdate,
         downloadedBytes: 0,
         totalBytes: null,
         error: null,
@@ -1345,11 +1374,11 @@ export function App() {
         id: `app-update:downloaded:${appUpdate.info.version}`,
         tone: "success",
         eyebrow: "Update",
-        title: "Restart to finish the update",
+        title: "Restart and finish the update",
         meta: appUpdateVersionMeta,
         message: `Velocity Download Manager ${appUpdate.info.version} is installed and ready to apply.`,
         highlights: appUpdateHighlights,
-        actionLabel: "Restart",
+        actionLabel: "Restart and Update",
         onAction: () => {
           void handleRestartAppUpdate();
         },
@@ -1407,15 +1436,15 @@ export function App() {
       });
     }
 
-    if (appUpdateNotice) {
+    if (appUpdateFeedback) {
       alerts.push({
-        id: `app-update-notice:${appUpdateNotice}`,
-        tone: "info",
+        id: `app-update-feedback:${appUpdateFeedback.title}:${appUpdateFeedback.message}`,
+        tone: appUpdateFeedback.tone,
         eyebrow: "Update",
-        title: "No updates found",
-        message: appUpdateNotice,
+        title: appUpdateFeedback.title,
+        message: appUpdateFeedback.message,
         onDismiss: () => {
-          setAppUpdateNotice(null);
+          setAppUpdateFeedback(null);
         },
       });
     }
@@ -1457,7 +1486,7 @@ export function App() {
     appUpdateVersionMeta,
     handleDismissAppUpdate,
     appUpdateCheckError,
-    appUpdateNotice,
+    appUpdateFeedback,
     handleInstallAppUpdate,
     handleCheckForUpdates,
     handleRestartAppUpdate,

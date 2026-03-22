@@ -53,3 +53,20 @@ jobs:
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
           args: --bundles nsis
+
+      - name: Verify updater manifest asset
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $headers = @{
+            Accept = "application/vnd.github+json"
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $version = (Get-Content "src-tauri/tauri.conf.json" | ConvertFrom-Json).version
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/v$version" -Headers $headers
+          $assetNames = @($release.assets | ForEach-Object { $_.name })
+          if (-not ($assetNames -contains "latest.json")) {
+            throw "The release is missing latest.json, so in-app updates would fail."
+          }

@@ -2,15 +2,17 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Url;
-use serde::{Deserialize, Serialize};
+use reqwest::{Client, StatusCode, Url};
+use semver::Version;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tauri_plugin_updater::Error as UpdaterError;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::model::{
-    AppUpdateChannel, AppUpdateInfo, AppUpdateProgressEvent, AppUpdateStartupHealth,
-    AppUpdateStartupHealthStatus, EngineSettings,
+    AppUpdateChannel, AppUpdateCheckResult, AppUpdateCheckStatus, AppUpdateInfo,
+    AppUpdateProgressEvent, AppUpdateStartupHealth, AppUpdateStartupHealthStatus,
+    EngineSettings,
 };
 
 pub const APP_UPDATE_PROGRESS_EVENT: &str = "app://update-progress";
@@ -18,6 +20,42 @@ const STABLE_UPDATE_ENDPOINT: &str =
     "https://github.com/vamptux/Velocity-Download-Manager/releases/latest/download/latest.json";
 const PREVIEW_UPDATE_ENDPOINT: &str =
     "https://github.com/vamptux/Velocity-Download-Manager/releases/latest/download/latest-preview.json";
+const GITHUB_RELEASES_PAGE: &str =
+    "https://github.com/vamptux/Velocity-Download-Manager/releases";
+const GITHUB_RELEASES_API_LATEST: &str =
+    "https://api.github.com/repos/vamptux/Velocity-Download-Manager/releases/latest";
+const GITHUB_RELEASES_API_LIST: &str =
+    "https://api.github.com/repos/vamptux/Velocity-Download-Manager/releases?per_page=12";
+const STABLE_UPDATE_MANIFEST_NAME: &str = "latest.json";
+const PREVIEW_UPDATE_MANIFEST_NAME: &str = "latest-preview.json";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubReleaseAsset {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubRelease {
+    tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug)]
+struct GithubReleaseCandidate {
+    release: GithubRelease,
+    manifest_name: &'static str,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +82,219 @@ fn to_update_info(update: &Update, channel: &AppUpdateChannel) -> AppUpdateInfo 
         channel: channel.clone(),
         notes: update.body.clone(),
     }
+}
+
+fn update_info_from_release(
+    release: &GithubRelease,
+    channel: &AppUpdateChannel,
+    current_version: &str,
+) -> AppUpdateInfo {
+    AppUpdateInfo {
+        version: normalize_release_version(&release.tag_name),
+        current_version: current_version.to_string(),
+        channel: channel.clone(),
+        notes: release.body.clone(),
+    }
+}
+
+fn update_check_result(
+    status: AppUpdateCheckStatus,
+    info: Option<AppUpdateInfo>,
+    message: Option<String>,
+) -> AppUpdateCheckResult {
+    AppUpdateCheckResult {
+        status,
+        info,
+        message,
+    }
+}
+
+fn normalize_release_version(raw: &str) -> String {
+    raw.trim().trim_start_matches(['v', 'V']).to_string()
+}
+
+fn parse_version(raw: &str) -> Option<Version> {
+    Version::parse(&normalize_release_version(raw)).ok()
+}
+
+fn is_newer_version(candidate: &str, current: &str) -> bool {
+    match (parse_version(candidate), parse_version(current)) {
+        (Some(candidate), Some(current)) => candidate > current,
+        _ => normalize_release_version(candidate) != normalize_release_version(current),
+    }
+}
+
+fn release_has_manifest(release: &GithubRelease, manifest_name: &str) -> bool {
+    release
+        .assets
+        .iter()
+        .any(|asset| asset.name.eq_ignore_ascii_case(manifest_name))
+}
+
+fn should_try_release_fallback(error: &UpdaterError) -> bool {
+    if matches!(error, UpdaterError::ReleaseNotFound) {
+        return true;
+    }
+
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("valid release json")
+        || message.contains("latest.json")
+        || message.contains("latest-preview.json")
+        || message.contains("404")
+        || message.contains("not found")
+}
+
+fn github_client(current_version: &str) -> Result<Client, String> {
+    Client::builder()
+        .user_agent(format!(
+            "Velocity Download Manager/{current_version} (+{GITHUB_RELEASES_PAGE})"
+        ))
+        .build()
+        .map_err(|error| format!("Failed preparing GitHub release fallback client: {error}"))
+}
+
+async fn fetch_json_or_404<T: DeserializeOwned>(client: &Client, url: &str) -> Result<Option<T>, String> {
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| format!("Failed requesting GitHub release metadata: {error}"))?;
+
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "GitHub release metadata returned {} for {url}.",
+            response.status()
+        ));
+    }
+
+    let raw = response
+        .text()
+        .await
+        .map_err(|error| format!("Failed reading GitHub release metadata: {error}"))?;
+
+    serde_json::from_str::<T>(&raw)
+        .map(Some)
+        .map_err(|error| format!("Failed parsing GitHub release metadata: {error}"))
+}
+
+async fn fetch_latest_stable_release(client: &Client) -> Result<Option<GithubRelease>, String> {
+    fetch_json_or_404(client, GITHUB_RELEASES_API_LATEST).await
+}
+
+async fn fetch_latest_preview_release(client: &Client) -> Result<Option<GithubRelease>, String> {
+    let Some(releases) = fetch_json_or_404::<Vec<GithubRelease>>(client, GITHUB_RELEASES_API_LIST).await? else {
+        return Ok(None);
+    };
+
+    Ok(releases
+        .into_iter()
+        .find(|release| !release.draft && release.prerelease))
+}
+
+async fn fetch_release_candidate(
+    client: &Client,
+    channel: &AppUpdateChannel,
+) -> Result<Option<GithubReleaseCandidate>, String> {
+    match channel {
+        AppUpdateChannel::Stable => Ok(fetch_latest_stable_release(client)
+            .await?
+            .map(|release| GithubReleaseCandidate {
+                release,
+                manifest_name: STABLE_UPDATE_MANIFEST_NAME,
+            })),
+        AppUpdateChannel::Preview => {
+            if let Some(release) = fetch_latest_preview_release(client).await? {
+                return Ok(Some(GithubReleaseCandidate {
+                    release,
+                    manifest_name: PREVIEW_UPDATE_MANIFEST_NAME,
+                }));
+            }
+
+            Ok(fetch_latest_stable_release(client)
+                .await?
+                .map(|release| GithubReleaseCandidate {
+                    release,
+                    manifest_name: STABLE_UPDATE_MANIFEST_NAME,
+                }))
+        }
+    }
+}
+
+async fn fallback_update_result(
+    app: &AppHandle,
+    channel: &AppUpdateChannel,
+    skipped_version: Option<&str>,
+    updater_error: &UpdaterError,
+) -> Result<Option<AppUpdateCheckResult>, String> {
+    if !should_try_release_fallback(updater_error) {
+        return Ok(None);
+    }
+
+    let current_version = app_version(app);
+    let client = github_client(&current_version)?;
+    let Some(candidate) = fetch_release_candidate(&client, channel).await? else {
+        return Ok(Some(update_check_result(
+            AppUpdateCheckStatus::UpToDate,
+            None,
+            Some("No published release is available for this channel yet.".to_string()),
+        )));
+    };
+
+    let info = update_info_from_release(&candidate.release, channel, &current_version);
+    if !is_newer_version(&info.version, &current_version) {
+        let message = if release_has_manifest(&candidate.release, candidate.manifest_name) {
+            "You already have the latest published build.".to_string()
+        } else {
+            "This build already matches the latest GitHub release. No in-app update is needed yet."
+                .to_string()
+        };
+
+        return Ok(Some(update_check_result(
+            AppUpdateCheckStatus::UpToDate,
+            None,
+            Some(message),
+        )));
+    }
+
+    if skipped_version.is_some_and(|skipped| skipped == info.version) {
+        return Ok(Some(update_check_result(
+            AppUpdateCheckStatus::UpToDate,
+            None,
+            Some(format!(
+                "Version {} is currently skipped on this device until a newer release appears.",
+                info.version
+            )),
+        )));
+    }
+
+    let release_url = candidate
+        .release
+        .html_url
+        .clone()
+        .unwrap_or_else(|| GITHUB_RELEASES_PAGE.to_string());
+    let manifest_available = release_has_manifest(&candidate.release, candidate.manifest_name);
+    let message = if manifest_available {
+        format!(
+            "Version {} is published, but its in-app updater metadata could not be read cleanly yet. Try again shortly or install it from {}.",
+            info.version, release_url
+        )
+    } else {
+        format!(
+            "Version {} is published on GitHub, but the updater manifest '{}' is not attached yet. Try again shortly or install it from {}.",
+            info.version, candidate.manifest_name, release_url
+        )
+    };
+
+    Ok(Some(update_check_result(
+        AppUpdateCheckStatus::Unavailable,
+        Some(info),
+        Some(message),
+    )))
 }
 
 fn updater_endpoints(channel: &AppUpdateChannel) -> Result<Vec<Url>, String> {
@@ -294,8 +545,8 @@ pub async fn check_for_update(
     app: &AppHandle,
     channel: &AppUpdateChannel,
     skipped_version: Option<&str>,
-) -> Result<Option<AppUpdateInfo>, String> {
-    let update = updater_for_channel(app, channel)?
+) -> Result<AppUpdateCheckResult, String> {
+    let update = match updater_for_channel(app, channel)?
         .check()
         .await
         .or_else(|error| {
@@ -306,16 +557,42 @@ pub async fn check_for_update(
             } else {
                 Err(error)
             }
-        })
-        .map_err(|error| format!("Failed checking for updates: {error}"))?;
+        }) {
+        Ok(update) => update,
+        Err(error) => {
+            if let Some(result) = fallback_update_result(app, channel, skipped_version, &error).await? {
+                return Ok(result);
+            }
 
-    Ok(update.as_ref().and_then(|candidate| {
-        let info = to_update_info(candidate, channel);
-        match skipped_version {
-            Some(skipped) if skipped == info.version => None,
-            _ => Some(info),
+            return Err(format!("Failed checking for updates: {error}"));
         }
-    }))
+    };
+
+    let Some(candidate) = update else {
+        return Ok(update_check_result(
+            AppUpdateCheckStatus::UpToDate,
+            None,
+            Some("You already have the latest available build.".to_string()),
+        ));
+    };
+
+    let info = to_update_info(&candidate, channel);
+    if skipped_version.is_some_and(|skipped| skipped == info.version) {
+        return Ok(update_check_result(
+            AppUpdateCheckStatus::UpToDate,
+            None,
+            Some(format!(
+                "Version {} is currently skipped on this device until a newer release appears.",
+                info.version
+            )),
+        ));
+    }
+
+    Ok(update_check_result(
+        AppUpdateCheckStatus::Available,
+        Some(info),
+        None,
+    ))
 }
 
 pub async fn install_update(

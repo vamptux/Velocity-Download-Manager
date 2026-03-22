@@ -610,6 +610,26 @@ pub struct AppUpdateInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
+pub enum AppUpdateCheckStatus {
+    Available,
+    UpToDate,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUpdateCheckResult {
+    pub status: AppUpdateCheckStatus,
+    #[serde(default)]
+    pub info: Option<AppUpdateInfo>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
 pub enum AppUpdateStartupHealthStatus {
     Pending,
     Healthy,

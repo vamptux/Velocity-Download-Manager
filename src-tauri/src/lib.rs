@@ -10,7 +10,8 @@ use engine::{
     EngineState, StartupSnapshot,
 };
 use model::{
-    AddDownloadArgs, AppUpdateInfo, ChecksumSpec, DownloadRecord, EngineSettings,
+    AddDownloadArgs, AppUpdateCheckResult, AppUpdateInfo, ChecksumSpec, DownloadRecord,
+    EngineSettings,
     HostTelemetryArgs, ProbeDownloadArgs, ProbeResult, QueueState, ReorderDirection,
 };
 use tauri::{AppHandle, Manager, State};
@@ -47,7 +48,7 @@ fn retry_engine_bootstrap(state: State<'_, EngineState>) -> EngineBootstrapState
 async fn check_app_update(
     app: AppHandle,
     state: State<'_, EngineState>,
-) -> CommandResult<Option<AppUpdateInfo>> {
+) -> CommandResult<AppUpdateCheckResult> {
     let settings = state.inner().get_settings();
     app_update::check_for_update(
         &app,
