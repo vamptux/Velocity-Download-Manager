@@ -231,6 +231,32 @@ export function integrityBadgeLabel(
   }
 }
 
+function formatScheduledStartLabel(timestamp: number): string {
+  const diffSeconds = Math.ceil((timestamp - Date.now()) / 1000);
+  if (diffSeconds <= 0) {
+    return "Starting soon";
+  }
+  if (diffSeconds < 8 * 60 * 60) {
+    return `Starts in ${formatDurationShort(diffSeconds)}`;
+  }
+
+  const scheduledAt = new Date(timestamp);
+  const now = new Date();
+  const sameDay = scheduledAt.toDateString() === now.toDateString();
+  const timeLabel = scheduledAt.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  if (sameDay) {
+    return `Starts at ${timeLabel}`;
+  }
+
+  return `Starts ${scheduledAt.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  })} ${timeLabel}`;
+}
+
 export function hostLockLabel(reason: string | null): string {
   switch (reason) {
     case "probe-failures":
@@ -261,6 +287,7 @@ export function stallReasonLabel(
   download: Pick<
     Download,
     | "status"
+    | "scheduledFor"
     | "writerBackpressure"
     | "hostCooldownUntil"
     | "hostDiagnostics"
@@ -268,6 +295,14 @@ export function stallReasonLabel(
     | "capabilities"
   >,
 ): string | null {
+  if (
+    download.scheduledFor != null
+    && download.scheduledFor > Date.now()
+    && download.status !== "finished"
+  ) {
+    return formatScheduledStartLabel(download.scheduledFor);
+  }
+
   if (download.writerBackpressure) {
     return "Disk pressure";
   }

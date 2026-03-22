@@ -58,9 +58,12 @@ fn scheduler_host_connection_budget(
     effective_connection_target(requested_connections.max(1), settings, host_profile).max(1)
 }
 
-fn scheduler_can_launch(download: &DownloadRecord, queue_running: bool) -> bool {
+fn scheduler_can_launch(download: &DownloadRecord, queue_running: bool, now: i64) -> bool {
     matches!(download.status, DownloadStatus::Queued)
         && (queue_running || download.manual_start_requested)
+        && download
+            .scheduled_for
+            .is_none_or(|scheduled_for| scheduled_for <= now)
 }
 
 fn desired_runtime_connections(download: &DownloadRecord) -> u32 {
@@ -151,6 +154,7 @@ pub(super) fn plan_runtime_dispatch(registry: &mut RegistrySnapshot) -> RuntimeD
     let settings = registry.settings.clone();
     let queue_running = registry.queue_running;
     let host_profiles = registry.host_profiles.clone();
+    let now = super::helpers::unix_epoch_millis();
     let mut changed_ids = BTreeMap::new();
 
     for download in &mut registry.downloads {
@@ -208,7 +212,7 @@ pub(super) fn plan_runtime_dispatch(registry: &mut RegistrySnapshot) -> RuntimeD
         .iter()
         .enumerate()
         .filter_map(|(index, download)| {
-            scheduler_can_launch(download, queue_running).then_some(index)
+            scheduler_can_launch(download, queue_running, now).then_some(index)
         })
         .collect();
     queued_indices.sort_by_key(|index| dispatch_sort_key(&registry.downloads[*index]));

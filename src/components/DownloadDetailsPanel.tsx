@@ -63,7 +63,7 @@ interface DownloadDetailsPanelProps {
   onResume: (id: string) => Promise<void> | void;
   onRestart: (id: string) => Promise<void> | void;
   onDelete: (id: string) => Promise<void> | void;
-  onReorder: (id: string, direction: "up" | "down") => Promise<void> | void;
+  onReorder: (id: string, direction: "up" | "down" | "top" | "bottom") => Promise<void> | void;
   canMoveUp: boolean;
   canMoveDown: boolean;
   onClearSelection: () => void;

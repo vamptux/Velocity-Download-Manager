@@ -47,7 +47,7 @@ interface DownloadListProps {
   selectedIds: Set<string>;
   onSelectedChange: (ids: Set<string>) => void;
   onDelete: (id: string) => Promise<void>;
-  onReorder: (id: string, direction: "up" | "down") => Promise<void> | void;
+  onReorder: (id: string, direction: "up" | "down" | "top" | "bottom") => Promise<void> | void;
   onOpenFolder: (id: string) => Promise<void> | void;
   onRefresh: () => void;
 }

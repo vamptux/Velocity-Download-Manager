@@ -4,4 +4,4 @@ import type { DownloadCategory } from "./DownloadCategory";
 import type { DownloadRequestField } from "./DownloadRequestField";
 import type { DownloadRequestMethod } from "./DownloadRequestMethod";
 
-export type AddDownloadArgs = { url: string, name: string | null, category: DownloadCategory, savePath: string, requestReferer: string | null, requestCookies: string | null, requestMethod: DownloadRequestMethod, requestFormFields: Array<DownloadRequestField>, checksum: ChecksumSpec | null, sizeHintBytes: bigint | null, rangeSupportedHint: boolean | null, resumableHint: boolean | null, startImmediately: boolean, };
+export type AddDownloadArgs = { url: string, name: string | null, category: DownloadCategory, savePath: string, requestReferer: string | null, requestCookies: string | null, requestMethod: DownloadRequestMethod, requestFormFields: Array<DownloadRequestField>, checksum: ChecksumSpec | null, sizeHintBytes: bigint | null, rangeSupportedHint: boolean | null, resumableHint: boolean | null, scheduledFor: bigint | null, startImmediately: boolean, };

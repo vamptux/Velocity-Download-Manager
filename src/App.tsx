@@ -1075,7 +1075,7 @@ export function App() {
   );
 
   const handleReorderOne = useCallback(
-    async (id: string, direction: "up" | "down") => {
+    async (id: string, direction: "up" | "down" | "top" | "bottom") => {
       await ipcReorderDownload(id, direction).catch(() => null);
       void refreshDownloads();
     },

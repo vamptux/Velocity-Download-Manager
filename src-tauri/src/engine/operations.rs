@@ -12,6 +12,11 @@ const PROBE_SOURCE_WARNING_CACHED: &str = "Probe metadata source: recent probe c
 const PROBE_SOURCE_WARNING_FALLBACK: &str =
     "Probe metadata source: planning fallback without fresh metadata.";
 
+fn normalize_scheduled_for(scheduled_for: Option<i64>) -> Option<i64> {
+    let now = unix_epoch_millis();
+    scheduled_for.filter(|value| *value > now)
+}
+
 fn target_path_matches(left: &str, right: &str) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -594,6 +599,7 @@ impl EngineState {
         );
 
         let checksum = args.checksum.map(normalize_checksum_spec).transpose()?;
+        let scheduled_for = normalize_scheduled_for(args.scheduled_for);
         let settings = registry.settings.clone();
         let host_profile = registry.host_profiles.get(&host);
         let cached_probe =
@@ -739,12 +745,12 @@ impl EngineState {
                 .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
                 .unwrap_or(-1),
             downloaded: 0,
-            status: if args.start_immediately {
+            status: if args.start_immediately || scheduled_for.is_some() {
                 DownloadStatus::Queued
             } else {
                 DownloadStatus::Stopped
             },
-            manual_start_requested: args.start_immediately,
+            manual_start_requested: args.start_immediately && scheduled_for.is_none(),
             category: args.category,
             speed: 0,
             time_left: None,
@@ -753,6 +759,7 @@ impl EngineState {
             temp_path: format!("{target_path}.part"),
             target_path,
             queue: DEFAULT_QUEUE.to_string(),
+            scheduled_for,
             queue_position: next_queue_position(&registry.downloads),
             max_connections,
             host_max_connections: host_profile.and_then(|profile| profile.max_connections),
@@ -847,6 +854,14 @@ impl EngineState {
                 "Queued checksum verification for completion.",
             );
         }
+        if record.scheduled_for.is_some() {
+            append_download_log(
+                &mut record,
+                DownloadLogLevel::Info,
+                "queue.scheduled",
+                "Scheduled this download to start automatically at the selected time.",
+            );
+        }
 
         apply_download_host_profile(&mut record, &settings, host_profile);
 
@@ -916,6 +931,7 @@ impl EngineState {
             return Err("Finished downloads cannot be resumed.".to_string());
         }
         download.status = DownloadStatus::Queued;
+        download.scheduled_for = None;
         download.manual_start_requested = !queue_running;
         clear_download_terminal_state(download);
         reset_download_transient_state(download);
@@ -951,6 +967,7 @@ impl EngineState {
         reset_download_transient_state(download);
         clear_download_terminal_state(download);
         download.status = DownloadStatus::Queued;
+        download.scheduled_for = None;
         download.manual_start_requested = !queue_running;
         reset_download_progress(download);
         clear_runtime_checkpoint(download);
@@ -1100,18 +1117,23 @@ impl EngineState {
             return Err(format!("No download found for id '{id}'."));
         };
 
-        let swap_position = match direction {
+        let target_position = match direction {
             ReorderDirection::Up if position > 0 => position - 1,
             ReorderDirection::Down if position + 1 < ordered_indices.len() => position + 1,
+            ReorderDirection::Top if position > 0 => 0,
+            ReorderDirection::Bottom if position + 1 < ordered_indices.len() => {
+                ordered_indices.len().saturating_sub(1)
+            }
             _ => position,
         };
 
-        if swap_position != position {
-            let other_index = ordered_indices[swap_position];
-            let current_position = registry.downloads[target_index].queue_position;
-            registry.downloads[target_index].queue_position =
-                registry.downloads[other_index].queue_position;
-            registry.downloads[other_index].queue_position = current_position;
+        if target_position != position {
+            let moved_index = ordered_indices.remove(position);
+            ordered_indices.insert(target_position, moved_index);
+            for (normalized_index, download_index) in ordered_indices.iter().enumerate() {
+                registry.downloads[*download_index].queue_position =
+                    u32::try_from(normalized_index).unwrap_or(u32::MAX).saturating_add(1);
+            }
             normalize_queue_positions(&mut registry.downloads);
         }
 
@@ -1221,6 +1243,107 @@ impl EngineState {
         if should_verify_now {
             self.spawn_checksum_verification(id.to_string());
         }
+        Ok(response)
+    }
+
+    pub async fn verify_download_checksum(
+        &self,
+        _app: &AppHandle,
+        id: &str,
+    ) -> Result<DownloadRecord, String> {
+        self.await_bootstrap().await;
+        self.abort_integrity_task(id);
+        let mut registry = self.registry_guard()?;
+        let Some(download) = registry
+            .downloads
+            .iter_mut()
+            .find(|download| download.id == id)
+        else {
+            return Err(format!("No download found for id '{id}'."));
+        };
+
+        if download.integrity.expected.is_none() {
+            return Err("Configure a checksum before requesting verification.".to_string());
+        }
+        if !matches!(download.status, DownloadStatus::Finished) {
+            return Err("Checksum verification is only available after the download finishes.".to_string());
+        }
+
+        mark_integrity_verifying(&mut download.integrity);
+        append_download_log(
+            download,
+            DownloadLogLevel::Info,
+            "integrity.verify-requested",
+            "Queued manual checksum verification for the completed file.",
+        );
+        let response = download.clone();
+
+        self.persist_registry(&registry)?;
+        drop(registry);
+        self.emit_download_upsert(&response);
+        self.spawn_checksum_verification(id.to_string());
+        Ok(response)
+    }
+
+    pub async fn set_download_schedule(
+        &self,
+        _app: &AppHandle,
+        id: &str,
+        scheduled_for: Option<i64>,
+    ) -> Result<DownloadRecord, String> {
+        self.await_bootstrap().await;
+        let normalized_schedule = normalize_scheduled_for(scheduled_for);
+        if normalized_schedule.is_some() {
+            self.abort_runtime_task(id);
+        }
+
+        let mut registry = self.registry_guard()?;
+        let settings = registry.settings.clone();
+        let Some(download) = registry
+            .downloads
+            .iter_mut()
+            .find(|download| download.id == id)
+        else {
+            return Err(format!("No download found for id '{id}'."));
+        };
+
+        if matches!(download.status, DownloadStatus::Finished) && normalized_schedule.is_some() {
+            return Err("Finished downloads cannot be scheduled again.".to_string());
+        }
+
+        download.scheduled_for = normalized_schedule;
+        if download.scheduled_for.is_some() {
+            if !matches!(download.status, DownloadStatus::Finished) {
+                download.status = DownloadStatus::Queued;
+                download.manual_start_requested = false;
+                clear_download_terminal_state(download);
+                reset_download_transient_state(download);
+                clear_runtime_checkpoint(download);
+                ensure_segment_plan(download, &settings);
+            }
+            append_download_log(
+                download,
+                DownloadLogLevel::Info,
+                "queue.scheduled",
+                "Scheduled this download to start automatically at the selected time.",
+            );
+        } else {
+            append_download_log(
+                download,
+                DownloadLogLevel::Info,
+                "queue.schedule-cleared",
+                "Cleared the scheduled start time for this download.",
+            );
+        }
+
+        let response = download.clone();
+        let dispatch_plan = plan_runtime_dispatch(&mut registry);
+        let min_interval_ms = registry.settings.segment_checkpoint_min_interval_ms;
+        self.persist_registry(&registry)?;
+        drop(registry);
+        self.emit_download_upsert(&response);
+        self.emit_download_progress_diff_if_due(&response, min_interval_ms);
+        self.apply_runtime_dispatch_plan(dispatch_plan, min_interval_ms);
         Ok(response)
     }
 

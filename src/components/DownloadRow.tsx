@@ -5,11 +5,15 @@ import * as Select from "@radix-ui/react-select";
 import {
   ArrowDown,
   ArrowUp,
+  ChevronsDown,
+  ChevronsUp,
   StopCircle,
   FolderOpen,
   Copy,
+  Clock3,
   Play,
   Pause,
+  RefreshCw,
   RotateCcw,
   Trash2,
   Shield,
@@ -54,6 +58,8 @@ import {
   ipcRestartDownload,
   ipcResumeDownload,
   ipcSetDownloadChecksum,
+  ipcSetDownloadSchedule,
+  ipcVerifyDownloadChecksum,
 } from "@/lib/ipc";
 import { writeClipboardText } from "@/lib/clipboard";
 import type { ChecksumAlgorithm, Download } from "@/types/download";
@@ -228,6 +234,44 @@ function MenuItem({
   );
 }
 
+function formatScheduleInputValue(timestamp: number | null | undefined): string {
+  if (timestamp == null || !Number.isFinite(timestamp)) {
+    return "";
+  }
+
+  const local = new Date(timestamp - new Date().getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function parseScheduleInput(value: string): number | null {
+  if (!value.trim()) {
+    return null;
+  }
+
+  const parsed = new Date(value).getTime();
+  if (!Number.isFinite(parsed)) {
+    throw new Error("Enter a valid date and time.");
+  }
+  if (parsed <= Date.now()) {
+    throw new Error("Scheduled start time must be in the future.");
+  }
+
+  return parsed;
+}
+
+function formatScheduledSummary(timestamp: number | null | undefined): string {
+  if (timestamp == null || timestamp <= Date.now()) {
+    return "No scheduled start";
+  }
+
+  return new Date(timestamp).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 export interface DownloadRowProps {
   download: Download;
   index: number;
@@ -237,7 +281,7 @@ export interface DownloadRowProps {
   onSelect: (id: string, checked: boolean) => void;
   onActivate: (id: string, options?: { toggle?: boolean; range?: boolean }) => void;
   onDelete: (id: string) => Promise<void>;
-  onReorder: (id: string, direction: "up" | "down") => Promise<void> | void;
+  onReorder: (id: string, direction: "up" | "down" | "top" | "bottom") => Promise<void> | void;
   onOpenFolder: (id: string) => Promise<void> | void;
   onRefresh: () => void;
 }
@@ -314,8 +358,12 @@ export const DownloadRow = memo(function DownloadRow({
   const [csOpen, setCsOpen] = useState(false);
   const [csAlgorithm, setCsAlgorithm] = useState<ChecksumAlgorithm>("sha256");
   const [csValue, setCsValue] = useState("");
-  const [csSaving, setCsSaving] = useState(false);
+  const [csBusyAction, setCsBusyAction] = useState<"save" | "verify" | null>(null);
   const [csError, setCsError] = useState<string | null>(null);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [scheduleValue, setScheduleValue] = useState("");
+  const [scheduleSaving, setScheduleSaving] = useState(false);
+  const [scheduleError, setScheduleError] = useState<string | null>(null);
 
   function openChecksumDialog() {
     const existing = download.integrity.expected;
@@ -325,9 +373,15 @@ export const DownloadRow = memo(function DownloadRow({
     setCsOpen(true);
   }
 
+  function openScheduleDialog() {
+    setScheduleValue(formatScheduleInputValue(download.scheduledFor));
+    setScheduleError(null);
+    setScheduleOpen(true);
+  }
+
   async function handleChecksumSave(e: React.FormEvent) {
     e.preventDefault();
-    setCsSaving(true);
+    setCsBusyAction("save");
     setCsError(null);
     try {
       await ipcSetDownloadChecksum(
@@ -347,7 +401,49 @@ export const DownloadRow = memo(function DownloadRow({
             : "Failed to set checksum.",
       );
     } finally {
-      setCsSaving(false);
+      setCsBusyAction(null);
+    }
+  }
+
+  async function handleChecksumVerify() {
+    setCsBusyAction("verify");
+    setCsError(null);
+    try {
+      await ipcVerifyDownloadChecksum(download.id);
+      setCsOpen(false);
+      onRefresh();
+    } catch (err) {
+      setCsError(
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : "Failed to verify checksum.",
+      );
+    } finally {
+      setCsBusyAction(null);
+    }
+  }
+
+  async function handleScheduleSave(e: React.FormEvent) {
+    e.preventDefault();
+    setScheduleSaving(true);
+    setScheduleError(null);
+    try {
+      const scheduledFor = parseScheduleInput(scheduleValue);
+      await ipcSetDownloadSchedule(download.id, scheduledFor);
+      setScheduleOpen(false);
+      onRefresh();
+    } catch (err) {
+      setScheduleError(
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : "Failed to update the schedule.",
+      );
+    } finally {
+      setScheduleSaving(false);
     }
   }
 
@@ -379,7 +475,7 @@ export const DownloadRow = memo(function DownloadRow({
     await onOpenFolder(download.id);
   }
 
-  async function handleReorder(direction: "up" | "down") {
+  async function handleReorder(direction: "up" | "down" | "top" | "bottom") {
     await onReorder(download.id, direction);
   }
 
@@ -556,9 +652,15 @@ export const DownloadRow = memo(function DownloadRow({
             />
             <MenuItem
               icon={Shield}
-              label="Set checksum…"
+              label="Checksum info…"
               onSelect={openChecksumDialog}
               disabled={download.integrity.state === "verifying"}
+            />
+            <MenuItem
+              icon={Clock3}
+              label="Schedule start…"
+              onSelect={openScheduleDialog}
+              disabled={download.status === "finished"}
             />
 
             <ContextMenu.Separator className="my-1 h-px bg-border/40 mx-2" />
@@ -603,6 +705,12 @@ export const DownloadRow = memo(function DownloadRow({
             <ContextMenu.Separator className="my-1 h-px bg-border/40 mx-2" />
 
             <MenuItem
+              icon={ChevronsUp}
+              label="Move to top"
+              disabled={!canMoveUp}
+              onSelect={() => void handleReorder("top")}
+            />
+            <MenuItem
               icon={ArrowUp}
               label="Move up in queue"
               disabled={!canMoveUp}
@@ -613,6 +721,12 @@ export const DownloadRow = memo(function DownloadRow({
               label="Move down in queue"
               disabled={!canMoveDown}
               onSelect={() => void handleReorder("down")}
+            />
+            <MenuItem
+              icon={ChevronsDown}
+              label="Move to bottom"
+              disabled={!canMoveDown}
+              onSelect={() => void handleReorder("bottom")}
             />
 
             <ContextMenu.Separator className="my-1 h-px bg-border/40 mx-2" />
@@ -646,7 +760,7 @@ export const DownloadRow = memo(function DownloadRow({
                   strokeWidth={1.8}
                 />
                 <Dialog.Title className="text-[13px] font-semibold text-foreground">
-                  Set Checksum
+                  Checksum Info
                 </Dialog.Title>
               </div>
               <Dialog.Close className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground transition-colors">
@@ -658,10 +772,20 @@ export const DownloadRow = memo(function DownloadRow({
               className="flex flex-col gap-3 px-4 py-4"
             >
               <p className="text-[11.5px] text-muted-foreground/70 leading-relaxed">
-                If the file is already finished, VDM will verify it immediately.
-                Otherwise it will verify after the download completes. Leave the
-                hash blank to remove the current checksum.
+                Completed downloads are verified automatically when a checksum is
+                configured. You can also re-run verification manually here.
+                Leave the hash blank to remove the current checksum.
               </p>
+              <div className="grid grid-cols-2 gap-2 text-[11px]">
+                <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
+                  <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Status</div>
+                  <div className="mt-1 text-foreground/80">{download.integrity.expected ? (download.integrity.message ?? integrityStatusDetail(download) ?? "Ready") : "No checksum configured"}</div>
+                </div>
+                <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
+                  <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Last checked</div>
+                  <div className="mt-1 text-foreground/80">{download.integrity.checkedAt ? new Date(download.integrity.checkedAt).toLocaleString() : "Not checked yet"}</div>
+                </div>
+              </div>
               <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-2">
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
@@ -694,6 +818,12 @@ export const DownloadRow = memo(function DownloadRow({
                   />
                 </div>
               </div>
+              <div className="grid grid-cols-1 gap-2 text-[11px]">
+                <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
+                  <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Computed hash</div>
+                  <div className="mt-1 break-all text-foreground/80">{download.integrity.actual ?? "Not available yet"}</div>
+                </div>
+              </div>
               {download.integrity.expected ? (
                 <button
                   type="button"
@@ -712,6 +842,24 @@ export const DownloadRow = memo(function DownloadRow({
                 </div>
               ) : null}
               <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => void handleChecksumVerify()}
+                  disabled={
+                    csBusyAction !== null
+                    || download.status !== "finished"
+                    || !download.integrity.expected
+                    || download.integrity.state === "verifying"
+                  }
+                  className="h-7 px-3 rounded-md border border-border text-[12px] text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:opacity-40"
+                >
+                  {csBusyAction === "verify" ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      <RefreshCw size={11} className="animate-spin" strokeWidth={1.8} />
+                      Verifying…
+                    </span>
+                  ) : "Verify now"}
+                </button>
                 <Dialog.Close asChild>
                   <button
                     type="button"
@@ -722,10 +870,112 @@ export const DownloadRow = memo(function DownloadRow({
                 </Dialog.Close>
                 <button
                   type="submit"
-                  disabled={csSaving}
+                  disabled={csBusyAction !== null}
                   className="h-7 px-4 rounded-md bg-primary hover:bg-primary/90 text-primary-foreground text-[12px] font-medium transition-colors disabled:opacity-40"
                 >
-                  {csSaving ? "Saving…" : "Save"}
+                  {csBusyAction === "save" ? "Saving…" : "Save"}
+                </button>
+              </div>
+            </form>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      <Dialog.Root open={scheduleOpen} onOpenChange={setScheduleOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-[100] bg-black/50 backdrop-blur-[2px] data-[state=open]:animate-in data-[state=open]:fade-in-0" />
+          <Dialog.Content
+            className={cn(
+              "fixed left-1/2 top-1/2 z-[101] -translate-x-1/2 -translate-y-1/2",
+              "w-[420px] rounded-lg border border-border bg-[hsl(var(--background))] shadow-2xl shadow-black/60 outline-none",
+              "data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
+            )}
+          >
+            <div className="flex items-center justify-between border-b border-border px-4 py-3">
+              <div className="flex items-center gap-2">
+                <Clock3 size={13} className="text-muted-foreground/60" strokeWidth={1.8} />
+                <Dialog.Title className="text-[13px] font-semibold text-foreground">
+                  Schedule Start
+                </Dialog.Title>
+              </div>
+              <Dialog.Close className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground transition-colors">
+                <X size={13} strokeWidth={2} />
+              </Dialog.Close>
+            </div>
+            <form onSubmit={(event) => void handleScheduleSave(event)} className="flex flex-col gap-3 px-4 py-4">
+              <p className="text-[11.5px] text-muted-foreground/70 leading-relaxed">
+                Scheduled downloads stay queued until the selected time arrives.
+                The main queue still needs to be running when that time comes.
+              </p>
+              <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2 text-[11px]">
+                <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Current schedule</div>
+                <div className="mt-1 text-foreground/80">{formatScheduledSummary(download.scheduledFor)}</div>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+                  Start at
+                </label>
+                <input
+                  type="datetime-local"
+                  value={scheduleValue}
+                  onChange={(event) => {
+                    setScheduleValue(event.target.value);
+                    setScheduleError(null);
+                  }}
+                  className={cn(
+                    "w-full rounded-md border border-border bg-[hsl(var(--card))] px-3 h-8 text-[12px] text-foreground outline-none",
+                    "focus:border-primary/60 focus:ring-1 focus:ring-primary/30 transition-colors",
+                  )}
+                />
+              </div>
+              {scheduleError ? (
+                <div className="rounded-md border border-[hsl(var(--status-error)/0.26)] bg-[hsl(var(--status-error)/0.08)] px-3 py-2 text-[11.5px] text-[hsl(var(--status-error))]">
+                  {scheduleError}
+                </div>
+              ) : null}
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setScheduleValue("");
+                    setScheduleError(null);
+                  }}
+                  className="h-7 px-3 rounded-md border border-border text-[12px] text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                >
+                  Clear field
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setScheduleSaving(true);
+                    setScheduleError(null);
+                    void ipcSetDownloadSchedule(download.id, null)
+                      .then(() => {
+                        setScheduleOpen(false);
+                        onRefresh();
+                      })
+                      .catch((err) => {
+                        setScheduleError(
+                          err instanceof Error
+                            ? err.message
+                            : typeof err === "string"
+                              ? err
+                              : "Failed to clear the schedule.",
+                        );
+                      })
+                      .finally(() => setScheduleSaving(false));
+                  }}
+                  disabled={scheduleSaving || download.scheduledFor == null}
+                  className="h-7 px-3 rounded-md border border-border text-[12px] text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:opacity-40"
+                >
+                  Clear schedule
+                </button>
+                <button
+                  type="submit"
+                  disabled={scheduleSaving}
+                  className="h-7 px-4 rounded-md bg-primary hover:bg-primary/90 text-primary-foreground text-[12px] font-medium transition-colors disabled:opacity-40"
+                >
+                  {scheduleSaving ? "Saving…" : "Save"}
                 </button>
               </div>
             </form>

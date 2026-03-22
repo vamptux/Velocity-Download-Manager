@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -124,6 +125,8 @@ struct EngineInner {
     progress_sync: Mutex<ProgressSyncState>,
     runtime_tasks: Mutex<BTreeMap<String, JoinHandle<()>>>,
     integrity_tasks: Mutex<BTreeMap<String, JoinHandle<()>>>,
+    dispatch_wake_task: Mutex<Option<JoinHandle<()>>>,
+    dispatch_wake_at_ms: Mutex<Option<i64>>,
     download_limiters: Mutex<BTreeMap<String, Arc<TokenBucketRateLimiter>>>,
     host_limiters: Mutex<BTreeMap<String, Arc<TokenBucketRateLimiter>>>,
     wake_lock: Mutex<WakeLockController>,
@@ -263,6 +266,16 @@ fn apply_host_feedback_to_registry(
         }
         apply_download_host_profile(download, &settings, Some(&profile_snapshot));
     }
+}
+
+fn next_scheduled_dispatch_at(registry: &RegistrySnapshot) -> Option<i64> {
+    let now = unix_epoch_millis();
+    registry
+        .downloads
+        .iter()
+        .filter(|download| matches!(download.status, DownloadStatus::Queued))
+        .filter_map(|download| download.scheduled_for.filter(|scheduled_for| *scheduled_for > now))
+        .min()
 }
 
 pub(super) fn download_scope_key(download: &DownloadRecord) -> String {
@@ -596,6 +609,8 @@ impl EngineState {
                 progress_sync: Mutex::new(ProgressSyncState::default()),
                 runtime_tasks: Mutex::new(BTreeMap::new()),
                 integrity_tasks: Mutex::new(BTreeMap::new()),
+                dispatch_wake_task: Mutex::new(None),
+                dispatch_wake_at_ms: Mutex::new(None),
                 download_limiters: Mutex::new(BTreeMap::new()),
                 host_limiters: Mutex::new(BTreeMap::new()),
                 wake_lock: Mutex::new(WakeLockController::default()),
@@ -782,6 +797,59 @@ impl EngineState {
                 self.spawn_download_runtime(id);
             },
         );
+        self.sync_scheduled_dispatch_wake();
+    }
+
+    fn sync_scheduled_dispatch_wake(&self) {
+        let next_due = self
+            .registry_guard()
+            .ok()
+            .and_then(|registry| next_scheduled_dispatch_at(&registry));
+
+        let Ok(mut armed_due) = self.inner.dispatch_wake_at_ms.lock() else {
+            return;
+        };
+        if *armed_due == next_due {
+            return;
+        }
+        *armed_due = next_due;
+        drop(armed_due);
+
+        let Ok(mut task_slot) = self.inner.dispatch_wake_task.lock() else {
+            return;
+        };
+        if let Some(handle) = task_slot.take() {
+            handle.abort();
+        }
+
+        let Some(due_at) = next_due else {
+            return;
+        };
+
+        let delay_ms = due_at.saturating_sub(unix_epoch_millis());
+        let delay = Duration::from_millis(u64::try_from(delay_ms.max(0)).unwrap_or(0));
+        let engine = self.clone();
+        *task_slot = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            engine.run_scheduled_dispatch_wake(due_at);
+        }));
+    }
+
+    fn run_scheduled_dispatch_wake(&self, due_at: i64) {
+        if let Ok(mut armed_due) = self.inner.dispatch_wake_at_ms.lock()
+            && *armed_due == Some(due_at)
+        {
+            *armed_due = None;
+        }
+
+        let Ok(mut registry) = self.registry_guard() else {
+            return;
+        };
+        let dispatch_plan = plan_runtime_dispatch(&mut registry);
+        let min_emit_interval_ms = registry.settings.segment_checkpoint_min_interval_ms;
+        let _ = self.persist_registry(&registry);
+        drop(registry);
+        self.apply_runtime_dispatch_plan(dispatch_plan, min_emit_interval_ms);
     }
 
     fn release_wake_lock(&self) {

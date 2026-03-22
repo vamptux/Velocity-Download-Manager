@@ -243,6 +243,28 @@ async fn set_download_checksum(
 }
 
 #[tauri::command]
+async fn verify_download_checksum(
+    id: String,
+    app: AppHandle,
+    state: State<'_, EngineState>,
+) -> CommandResult<DownloadRecord> {
+    state.inner().verify_download_checksum(&app, &id).await
+}
+
+#[tauri::command]
+async fn set_download_schedule(
+    id: String,
+    scheduled_for: Option<i64>,
+    app: AppHandle,
+    state: State<'_, EngineState>,
+) -> CommandResult<DownloadRecord> {
+    state
+        .inner()
+        .set_download_schedule(&app, &id, scheduled_for)
+        .await
+}
+
+#[tauri::command]
 async fn set_download_transfer_options(
     id: String,
     speed_limit_bytes_per_second: Option<u64>,
@@ -356,6 +378,8 @@ pub fn run() {
             start_queue,
             stop_queue,
             set_download_checksum,
+            verify_download_checksum,
+            set_download_schedule,
             set_download_transfer_options,
             set_download_completion_options,
             record_host_telemetry,

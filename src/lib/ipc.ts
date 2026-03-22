@@ -203,6 +203,7 @@ export interface IpcAddArgs {
   sizeHintBytes?: number;
   rangeSupportedHint?: boolean;
   resumableHint?: boolean;
+  scheduledFor?: number | null;
   startImmediately?: boolean;
 }
 
@@ -226,6 +227,7 @@ export async function ipcAddDownload(args: IpcAddArgs): Promise<Download> {
     sizeHintBytes: args.sizeHintBytes ?? null,
     rangeSupportedHint: args.rangeSupportedHint ?? null,
     resumableHint: args.resumableHint ?? null,
+    scheduledFor: args.scheduledFor ?? null,
     startImmediately: args.startImmediately ?? true,
   };
 
@@ -270,6 +272,16 @@ export async function ipcStopQueue(): Promise<QueueState> {
 
 export async function ipcSetDownloadChecksum(id: string, checksum: ChecksumSpec | null): Promise<Download> {
   const raw = await invoke<RawDownload>("set_download_checksum", { id, checksum });
+  return fromRawDownload(raw);
+}
+
+export async function ipcVerifyDownloadChecksum(id: string): Promise<Download> {
+  const raw = await invoke<RawDownload>("verify_download_checksum", { id });
+  return fromRawDownload(raw);
+}
+
+export async function ipcSetDownloadSchedule(id: string, scheduledFor: number | null): Promise<Download> {
+  const raw = await invoke<RawDownload>("set_download_schedule", { id, scheduledFor });
   return fromRawDownload(raw);
 }
 

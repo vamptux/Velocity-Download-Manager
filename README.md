@@ -28,6 +28,7 @@ Velocity Is a Rust Based Download Manager in rust focused on speed, stability an
 - `src/`: React UI for queue management, monitoring, diagnostics, and update surfaces.
 - `extensions/vdm-catcher/`: Chrome MV3 capture extension.
 - `src/types/generated/backend/`: `ts-rs` generated frontend bindings.
+- `docs/roadmap.md`: current roadmap, phase tracking, and session handoff notes.
 
 ## Prerequisites
 

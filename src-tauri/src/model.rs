@@ -464,6 +464,8 @@ pub struct DownloadRecord {
     pub temp_path: String,
     pub queue: String,
     #[serde(default)]
+    pub scheduled_for: Option<i64>,
+    #[serde(default)]
     pub queue_position: u32,
     #[serde(default = "default_max_connections_fallback")]
     pub max_connections: u32,
@@ -565,6 +567,8 @@ pub struct ProbeDownloadArgs {
 pub enum ReorderDirection {
     Up,
     Down,
+    Top,
+    Bottom,
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -591,6 +595,8 @@ pub struct AddDownloadArgs {
     pub range_supported_hint: Option<bool>,
     #[serde(default)]
     pub resumable_hint: Option<bool>,
+    #[serde(default)]
+    pub scheduled_for: Option<i64>,
     #[serde(default = "default_start_immediately")]
     pub start_immediately: bool,
 }
