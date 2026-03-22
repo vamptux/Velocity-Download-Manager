@@ -31,7 +31,6 @@ import {
   activeConnectionCount,
   CATEGORY_ICONS,
   CATEGORY_ICON_COLORS,
-  checksumAlgorithmLabel,
   failureKindLabel,
   formatCooldownLabel,
   hostLockLabel,
@@ -40,6 +39,7 @@ import {
   statusLabel,
   targetConnectionCount,
 } from "@/lib/downloadPresentation";
+import { checksumAlgorithmLabel } from "../lib/checksum";
 import {
   formatBytes,
   formatBytesPerSecond,
@@ -98,6 +98,10 @@ function formatLogTime(timestamp: number): string {
 function integrityBadgeTone(
   integrity: DownloadIntegrity,
 ): "neutral" | "good" | "warn" | "error" {
+  if (!integrity.expected && integrity.actual) {
+    return "neutral";
+  }
+
   switch (integrity.state) {
     case "verified":
       return "good";
@@ -128,6 +132,24 @@ function integrityActualLabel(integrity: DownloadIntegrity): string {
     case "none":
       return "Not requested";
   }
+}
+
+function integrityStatusValue(integrity: DownloadIntegrity): string {
+  if (!integrity.expected) {
+    if (integrity.state === "verifying") {
+      return "Computing";
+    }
+    if (integrity.actual) {
+      return "Captured";
+    }
+    return "Automatic";
+  }
+
+  return integrityStateLabel(integrity.state);
+}
+
+function integrityAlgorithmValue(integrity: DownloadIntegrity): string {
+  return checksumAlgorithmLabel(integrity.expected?.algorithm ?? "sha256");
 }
 
 function isSensitiveQueryKey(key: string): boolean {
@@ -1213,18 +1235,16 @@ function SingleSelection({
 
         {tab === "log" && (
           <div className="flex flex-col gap-2.5 px-4 py-3">
-            {download.integrity.expected ? (
+            {download.integrity.expected || download.integrity.actual || download.integrity.state === "verifying" ? (
               <Section title="Integrity">
                 <div className="grid grid-cols-3 gap-1.5">
                   <Field
                     label="Status"
-                    value={integrityStateLabel(download.integrity.state)}
+                    value={integrityStatusValue(download.integrity)}
                   />
                   <Field
                     label="Algorithm"
-                    value={checksumAlgorithmLabel(
-                      download.integrity.expected.algorithm,
-                    )}
+                    value={integrityAlgorithmValue(download.integrity)}
                   />
                   <Field
                     label="Hash"

@@ -337,9 +337,7 @@ pub(super) async fn run_unknown_size_stream_runtime(
             engine.emit_download_upsert(&response);
             engine.trigger_download_completion_actions(&response);
             engine.apply_runtime_dispatch_plan(dispatch_plan, min_emit_interval_ms);
-            if response.integrity.expected.is_some() {
-                engine.spawn_checksum_verification(response.id.clone());
-            }
+            engine.spawn_checksum_verification(response.id.clone());
         }
         Err(error) => {
             let runtime_telemetry_snapshot = runtime_telemetry

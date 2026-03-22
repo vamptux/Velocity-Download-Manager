@@ -134,7 +134,7 @@ function CompactTitleBar({
         <img
           src="/veloicon.ico"
           alt="Velocity DM"
-          className="h-[26px] w-[26px] shrink-0 object-contain"
+          className="h-[20px] w-[20px] shrink-0 object-contain"
         />
         <span className="truncate text-[10.5px] font-medium text-foreground/68 tracking-tight">{title}</span>
       </div>

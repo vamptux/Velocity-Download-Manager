@@ -42,6 +42,7 @@ import {
   STATUS_META,
   targetConnectionCount,
 } from "@/lib/downloadPresentation";
+import { checksumAlgorithmLabel, parseChecksumInput } from "../lib/checksum";
 import {
   formatBytes,
   formatBytesPerSecond,
@@ -285,6 +286,10 @@ function formatChecksumCheckedAt(timestamp: number | null | undefined): string {
   });
 }
 
+function formatChecksumActionLabel(download: Download): string {
+  return download.integrity.expected ? "Verify now" : "Recompute SHA-256";
+}
+
 export interface DownloadRowProps {
   download: Download;
   index: number;
@@ -386,6 +391,18 @@ export const DownloadRow = memo(function DownloadRow({
     setCsOpen(true);
   }
 
+  function applyDetectedChecksumInput(rawValue: string): boolean {
+    const parsed = parseChecksumInput(rawValue);
+    if (!parsed.checksum) {
+      return false;
+    }
+
+    setCsAlgorithm(parsed.checksum.algorithm);
+    setCsValue(parsed.checksum.value);
+    setCsError(null);
+    return true;
+  }
+
   function openScheduleDialog() {
     setScheduleValue(formatScheduleInputValue(download.scheduledFor));
     setScheduleError(null);
@@ -397,10 +414,18 @@ export const DownloadRow = memo(function DownloadRow({
     setCsBusyAction("save");
     setCsError(null);
     try {
+      const parsedChecksum = parseChecksumInput(csValue);
+      if (csValue.trim() && !parsedChecksum.checksum) {
+        throw new Error(parsedChecksum.error ?? "Failed to parse checksum.");
+      }
+      if (parsedChecksum.checksum) {
+        setCsAlgorithm(parsedChecksum.checksum.algorithm);
+        setCsValue(parsedChecksum.checksum.value);
+      }
       await ipcSetDownloadChecksum(
         download.id,
-        csValue.trim()
-          ? { algorithm: csAlgorithm, value: csValue.trim() }
+        parsedChecksum.checksum
+          ? parsedChecksum.checksum
           : null,
       );
       setCsOpen(false);
@@ -787,9 +812,11 @@ export const DownloadRow = memo(function DownloadRow({
                 <div>
                   {download.integrity.expected
                     ? (download.integrity.message ?? integrityStatusDetail(download) ?? "Checksum ready")
-                    : "Add a checksum once and VDM will verify it automatically after the file finishes."}
+                    : download.integrity.actual
+                      ? (download.integrity.message ?? "VDM computed a SHA-256 fingerprint automatically for this finished file.")
+                      : "VDM computes SHA-256 automatically after completion. Add a published checksum here only when you want a match or mismatch check."}
                 </div>
-                {download.integrity.expected ? (
+                {download.integrity.expected || download.integrity.actual ? (
                   <div className="mt-1 text-muted-foreground/58">
                     Last checked: {formatChecksumCheckedAt(download.integrity.checkedAt)}
                   </div>
@@ -811,11 +838,17 @@ export const DownloadRow = memo(function DownloadRow({
                   </label>
                   <input
                     type="text"
-                    placeholder="Leave blank to clear"
+                    placeholder="Paste raw hash, sha256:..., or checksum-file line"
                     value={csValue}
                     onChange={(e) => {
                       setCsValue(e.target.value);
                       setCsError(null);
+                    }}
+                    onPaste={(event) => {
+                      const pastedText = event.clipboardData.getData("text");
+                      if (applyDetectedChecksumInput(pastedText)) {
+                        event.preventDefault();
+                      }
                     }}
                     spellCheck={false}
                     autoCapitalize="none"
@@ -832,12 +865,14 @@ export const DownloadRow = memo(function DownloadRow({
                   {download.integrity.expected ? (
                     <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
                       <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Expected</div>
+                      <div className="mt-1 text-[10px] text-muted-foreground/45">{checksumAlgorithmLabel(download.integrity.expected.algorithm)}</div>
                       <div className="mt-1 break-all text-foreground/80">{download.integrity.expected.value}</div>
                     </div>
                   ) : null}
                   {download.integrity.actual ? (
                     <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
                       <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Computed</div>
+                      <div className="mt-1 text-[10px] text-muted-foreground/45">{checksumAlgorithmLabel(download.integrity.expected?.algorithm ?? "sha256")}</div>
                       <div className="mt-1 break-all text-foreground/80">{download.integrity.actual}</div>
                     </div>
                   ) : null}
@@ -867,7 +902,6 @@ export const DownloadRow = memo(function DownloadRow({
                   disabled={
                     csBusyAction !== null
                     || download.status !== "finished"
-                    || !download.integrity.expected
                     || download.integrity.state === "verifying"
                   }
                   className="h-7 px-3 rounded-md border border-border text-[12px] text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:opacity-40"
@@ -877,7 +911,7 @@ export const DownloadRow = memo(function DownloadRow({
                       <RefreshCw size={11} className="animate-spin" strokeWidth={1.8} />
                       Verifying…
                     </span>
-                  ) : "Verify now"}
+                  ) : formatChecksumActionLabel(download)}
                 </button>
                 <Dialog.Close asChild>
                   <button
@@ -892,7 +926,7 @@ export const DownloadRow = memo(function DownloadRow({
                   disabled={csBusyAction !== null}
                   className="h-7 px-4 rounded-md bg-primary hover:bg-primary/90 text-primary-foreground text-[12px] font-medium transition-colors disabled:opacity-40"
                 >
-                  {csBusyAction === "save" ? "Saving…" : "Save checksum"}
+                  {csBusyAction === "save" ? "Saving…" : "Save expected hash"}
                 </button>
               </div>
             </form>

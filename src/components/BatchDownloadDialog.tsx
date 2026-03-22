@@ -323,7 +323,7 @@ export function BatchDownloadDialog({
                             <input
                               value={draftRowByLine.get(row.lineNumber)?.checksumInput ?? row.checksumInput}
                               onChange={(event) => updateDraftRow(row.lineNumber, { checksumInput: event.target.value })}
-                              placeholder="sha256:..."
+                              placeholder="sha256:..., raw hash, or checksum-file line"
                               className="rounded-md border border-border/60 bg-black/20 px-2.5 py-2 text-[11.5px] normal-case tracking-normal text-foreground outline-none transition-colors focus:border-primary/50 focus:bg-black/35"
                               disabled={submitting}
                             />

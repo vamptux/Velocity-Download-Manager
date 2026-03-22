@@ -78,7 +78,7 @@ export function TitleBar({
         <img
           src="/veloicon.ico"
           alt="Velocity DM"
-          className="mr-2 h-[32px] w-[32px] shrink-0 scale-[1.08] object-contain select-none pointer-events-none"
+          className="mr-2 h-[24px] w-[24px] shrink-0 object-contain select-none pointer-events-none"
         />
         
         <DropdownMenu.Root>

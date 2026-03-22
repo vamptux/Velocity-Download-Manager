@@ -1210,15 +1210,22 @@ impl EngineState {
 
         let checksum = checksum.map(normalize_checksum_spec).transpose()?;
         reset_integrity_for_expected(&mut download.integrity, checksum);
-        let should_verify_now = matches!(download.status, DownloadStatus::Finished)
-            && download.integrity.expected.is_some();
+        let should_verify_now = matches!(download.status, DownloadStatus::Finished);
         if should_verify_now {
             mark_integrity_verifying(&mut download.integrity);
             append_download_log(
                 download,
                 DownloadLogLevel::Info,
-                "integrity.verify-requested",
-                "Queued immediate checksum verification for the completed file.",
+                if download.integrity.expected.is_some() {
+                    "integrity.verify-requested"
+                } else {
+                    "integrity.fingerprint-requested"
+                },
+                if download.integrity.expected.is_some() {
+                    "Queued immediate checksum verification for the completed file."
+                } else {
+                    "Queued immediate SHA-256 calculation for the completed file."
+                },
             );
         } else if download.integrity.expected.is_some() {
             append_download_log(
@@ -1232,7 +1239,7 @@ impl EngineState {
                 download,
                 DownloadLogLevel::Info,
                 "integrity.cleared",
-                "Removed the configured checksum from this download.",
+                "Removed the configured checksum. VDM will keep automatic SHA-256 calculation enabled.",
             );
         }
         let response = download.clone();
@@ -1262,9 +1269,6 @@ impl EngineState {
             return Err(format!("No download found for id '{id}'."));
         };
 
-        if download.integrity.expected.is_none() {
-            return Err("Configure a checksum before requesting verification.".to_string());
-        }
         if !matches!(download.status, DownloadStatus::Finished) {
             return Err("Checksum verification is only available after the download finishes.".to_string());
         }
@@ -1273,8 +1277,16 @@ impl EngineState {
         append_download_log(
             download,
             DownloadLogLevel::Info,
-            "integrity.verify-requested",
-            "Queued manual checksum verification for the completed file.",
+            if download.integrity.expected.is_some() {
+                "integrity.verify-requested"
+            } else {
+                "integrity.fingerprint-requested"
+            },
+            if download.integrity.expected.is_some() {
+                "Queued manual checksum verification for the completed file."
+            } else {
+                "Queued manual SHA-256 recomputation for the completed file."
+            },
         );
         let response = download.clone();
 

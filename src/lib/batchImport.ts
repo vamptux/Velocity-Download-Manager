@@ -5,7 +5,8 @@ import {
   normalizeComparableUrl,
   suggestedNameFromUrl,
 } from "@/lib/downloadDuplicates";
-import type { ChecksumAlgorithm, ChecksumSpec, DownloadContentCategory } from "@/types/download";
+import { parseChecksumInput } from "./checksum";
+import type { ChecksumSpec, DownloadContentCategory } from "@/types/download";
 
 export type BatchImportFormat = "lines" | "csv" | "tsv";
 
@@ -135,38 +136,6 @@ function detectFormat(lines: string[]): BatchImportFormat {
   return "lines";
 }
 
-function parseChecksum(rawValue: string): { checksum: ChecksumSpec | null; error: string | null } {
-  const trimmed = rawValue.trim();
-  if (!trimmed) {
-    return { checksum: null, error: null };
-  }
-
-  const [algorithm, value] = trimmed.split(/:(.+)/, 2);
-  const normalizedAlgorithm = algorithm?.trim().toLowerCase();
-  const normalizedValue = value?.trim();
-  if (!normalizedAlgorithm || !normalizedValue) {
-    return {
-      checksum: null,
-      error: "Checksum must use the format algorithm:value.",
-    };
-  }
-
-  if (!["md5", "sha1", "sha256", "sha512"].includes(normalizedAlgorithm)) {
-    return {
-      checksum: null,
-      error: `Unsupported checksum algorithm '${algorithm}'.`,
-    };
-  }
-
-  return {
-    checksum: {
-      algorithm: normalizedAlgorithm as ChecksumAlgorithm,
-      value: normalizedValue,
-    },
-    error: null,
-  };
-}
-
 function parseStartMode(rawValue: string): { startImmediately: boolean; error: string | null } {
   const trimmed = rawValue.trim().toLowerCase();
   if (!trimmed) {
@@ -228,7 +197,7 @@ function finalizeRow(
   }
 
   const checksumInput = row.checksumInput.trim();
-  const { checksum, error: checksumError } = parseChecksum(checksumInput);
+  const { checksum, error: checksumError } = parseChecksumInput(checksumInput);
   if (checksumError) {
     errors.push(checksumError);
   }

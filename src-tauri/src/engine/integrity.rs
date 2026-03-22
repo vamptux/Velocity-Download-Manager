@@ -11,10 +11,13 @@ use crate::model::{ChecksumAlgorithm, ChecksumSpec, DownloadIntegrity, Integrity
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 pub(super) const INTEGRITY_PENDING_MESSAGE: &str = "Checksum validation will run after completion.";
-pub(super) const INTEGRITY_VERIFYING_MESSAGE: &str = "Verifying completed file checksum.";
+const AUTOMATIC_CHECKSUM_MESSAGE: &str = "VDM will compute a SHA-256 fingerprint after completion.";
 const INTEGRITY_VERIFIED_MESSAGE: &str = "Checksum verified successfully.";
 const INTEGRITY_MISMATCH_MESSAGE: &str = "Checksum mismatch detected.";
+const AUTOMATIC_CHECKSUM_READY_MESSAGE: &str = "SHA-256 fingerprint captured.";
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+pub(super) const AUTOMATIC_CHECKSUM_ALGORITHM: ChecksumAlgorithm = ChecksumAlgorithm::Sha256;
 
 fn clear_integrity_actual(integrity: &mut DownloadIntegrity) {
     integrity.actual = None;
@@ -60,50 +63,66 @@ pub(super) fn reset_integrity_for_expected(
         integrity.message = Some(INTEGRITY_PENDING_MESSAGE.to_string());
     } else {
         integrity.state = IntegrityState::None;
-        integrity.message = None;
+        integrity.message = Some(AUTOMATIC_CHECKSUM_MESSAGE.to_string());
     }
 }
 
 pub(super) fn mark_integrity_verifying(integrity: &mut DownloadIntegrity) {
     clear_integrity_actual(integrity);
     integrity.state = IntegrityState::Verifying;
-    integrity.message = Some(INTEGRITY_VERIFYING_MESSAGE.to_string());
+    integrity.message = Some(if let Some(expected) = integrity.expected.as_ref() {
+        format!(
+            "Verifying completed {} checksum.",
+            algorithm_label(&expected.algorithm)
+        )
+    } else {
+        "Computing completed file SHA-256 fingerprint.".to_string()
+    });
 }
 
 pub(super) fn apply_integrity_result(
     integrity: &mut DownloadIntegrity,
     actual: String,
-    matched: bool,
+    matched: Option<bool>,
     checked_at: i64,
 ) {
     integrity.actual = Some(actual);
     integrity.checked_at = Some(checked_at);
-    integrity.state = if matched {
-        IntegrityState::Verified
-    } else {
-        IntegrityState::Mismatch
-    };
-    integrity.message = Some(if matched {
-        INTEGRITY_VERIFIED_MESSAGE.to_string()
-    } else {
-        INTEGRITY_MISMATCH_MESSAGE.to_string()
-    });
+    match matched {
+        Some(true) => {
+            integrity.state = IntegrityState::Verified;
+            integrity.message = Some(INTEGRITY_VERIFIED_MESSAGE.to_string());
+        }
+        Some(false) => {
+            integrity.state = IntegrityState::Mismatch;
+            integrity.message = Some(INTEGRITY_MISMATCH_MESSAGE.to_string());
+        }
+        None => {
+            integrity.state = IntegrityState::Verified;
+            integrity.message = Some(AUTOMATIC_CHECKSUM_READY_MESSAGE.to_string());
+        }
+    }
 }
 
 pub(super) fn mark_integrity_failure(integrity: &mut DownloadIntegrity, error: &str, checked_at: i64) {
     clear_integrity_actual(integrity);
     integrity.checked_at = Some(checked_at);
-    integrity.state = IntegrityState::Pending;
-    integrity.message = Some(format!("Checksum verification failed: {error}"));
+    if integrity.expected.is_some() {
+        integrity.state = IntegrityState::Pending;
+        integrity.message = Some(format!("Checksum verification failed: {error}"));
+    } else {
+        integrity.state = IntegrityState::None;
+        integrity.message = Some(format!("Automatic SHA-256 calculation failed: {error}"));
+    }
 }
 
-pub(super) async fn compute_checksum(path: PathBuf, spec: ChecksumSpec) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || compute_checksum_sync(path, spec))
+pub(super) async fn compute_checksum(path: PathBuf, algorithm: ChecksumAlgorithm) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || compute_checksum_sync(path, algorithm))
         .await
         .map_err(|error| format!("Checksum worker failed: {error}"))?
 }
 
-fn compute_checksum_sync(path: PathBuf, spec: ChecksumSpec) -> Result<String, String> {
+fn compute_checksum_sync(path: PathBuf, algorithm: ChecksumAlgorithm) -> Result<String, String> {
     let mut file = File::open(&path).map_err(|error| {
         format!(
             "Failed opening '{}' for checksum verification: {error}",
@@ -111,7 +130,7 @@ fn compute_checksum_sync(path: PathBuf, spec: ChecksumSpec) -> Result<String, St
         )
     })?;
 
-    match spec.algorithm {
+    match algorithm {
         ChecksumAlgorithm::Md5 => hash_file::<Md5>(&mut file),
         ChecksumAlgorithm::Sha1 => hash_file::<Sha1>(&mut file),
         ChecksumAlgorithm::Sha256 => hash_file::<Sha256>(&mut file),

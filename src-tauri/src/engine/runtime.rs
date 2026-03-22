@@ -2059,9 +2059,7 @@ impl EngineState {
             self.emit_download_upsert(&response);
             self.trigger_download_completion_actions(&response);
             self.apply_runtime_dispatch_plan(dispatch_plan, min_emit_interval_ms);
-            if response.integrity.expected.is_some() {
-                self.spawn_checksum_verification(response.id.clone());
-            }
+            self.spawn_checksum_verification(response.id.clone());
         }
         Ok(())
     }

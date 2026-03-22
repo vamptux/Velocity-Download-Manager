@@ -64,7 +64,7 @@ use host_planner::{
 };
 use integrity::{
     apply_integrity_result, compute_checksum, mark_integrity_failure, mark_integrity_verifying,
-    normalize_checksum_spec, reset_integrity_for_expected,
+    normalize_checksum_spec, reset_integrity_for_expected, AUTOMATIC_CHECKSUM_ALGORITHM,
 };
 use persistence::{load_registry_snapshot, snapshot_path};
 use persistence_queue::{PersistPriority, SnapshotPersistQueue};
@@ -1057,16 +1057,13 @@ impl EngineState {
     }
 
     async fn run_checksum_verification(&self, id: &str) -> Result<(), String> {
-        let (target_path, expected) = {
+        let (target_path, expected, algorithm) = {
             let mut registry = self.registry_guard()?;
             let Some(download) = registry
                 .downloads
                 .iter_mut()
                 .find(|download| download.id == id)
             else {
-                return Ok(());
-            };
-            let Some(expected) = download.integrity.expected.clone() else {
                 return Ok(());
             };
             if !matches!(download.status, DownloadStatus::Finished) {
@@ -1077,18 +1074,31 @@ impl EngineState {
             append_download_log(
                 download,
                 DownloadLogLevel::Info,
-                "integrity.verify-started",
-                "Started checksum verification for the completed file.",
+                if download.integrity.expected.is_some() {
+                    "integrity.verify-started"
+                } else {
+                    "integrity.fingerprint-started"
+                },
+                if download.integrity.expected.is_some() {
+                    "Started checksum verification for the completed file."
+                } else {
+                    "Started automatic SHA-256 calculation for the completed file."
+                },
             );
 
             let response = download.clone();
             self.persist_registry(&registry)?;
             drop(registry);
             self.emit_download_upsert(&response);
-            (PathBuf::from(response.target_path), expected)
+            let expected = response.integrity.expected.clone();
+            let algorithm = expected
+                .as_ref()
+                .map(|value| value.algorithm.clone())
+                .unwrap_or(AUTOMATIC_CHECKSUM_ALGORITHM);
+            (PathBuf::from(response.target_path), expected, algorithm)
         };
 
-        let actual_result = compute_checksum(target_path, expected.clone()).await;
+        let actual_result = compute_checksum(target_path, algorithm.clone()).await;
 
         let mut registry = self.registry_guard()?;
         let Some(download) = registry
@@ -1101,23 +1111,23 @@ impl EngineState {
         if !matches!(download.status, DownloadStatus::Finished) {
             return Ok(());
         }
-        if download.integrity.expected.as_ref() != Some(&expected) {
+        if download.integrity.expected != expected {
             return Ok(());
         }
 
         match actual_result {
             Ok(actual) => {
-                let matched = actual == expected.value;
-                let detail = if matched {
-                    format!(
+                let matched = expected.as_ref().map(|value| actual == value.value);
+                let detail = match (&expected, matched) {
+                    (Some(expected), Some(true)) => format!(
                         "Verified {} checksum for the completed file.",
                         expected.value
-                    )
-                } else {
-                    format!(
+                    ),
+                    (Some(expected), Some(false)) => format!(
                         "Checksum mismatch: expected {} but computed {}.",
                         expected.value, actual
-                    )
+                    ),
+                    _ => "Computed SHA-256 fingerprint for the completed file.".to_string(),
                 };
                 apply_integrity_result(
                     &mut download.integrity,
@@ -1127,19 +1137,19 @@ impl EngineState {
                 );
                 append_download_log(
                     download,
-                    if matched {
+                    if matched.unwrap_or(true) {
                         DownloadLogLevel::Info
                     } else {
                         DownloadLogLevel::Warn
                     },
-                    if matched {
-                        "integrity.verified"
-                    } else {
-                        "integrity.mismatch"
+                    match matched {
+                        Some(true) => "integrity.verified",
+                        Some(false) => "integrity.mismatch",
+                        None => "integrity.fingerprint-ready",
                     },
                     detail.clone(),
                 );
-                if !matched
+                if matched == Some(false)
                     && !download
                         .diagnostics
                         .warnings
@@ -1150,12 +1160,20 @@ impl EngineState {
                 }
             }
             Err(error) => {
-                let detail = format!("Checksum verification failed: {error}");
+                let detail = if expected.is_some() {
+                    format!("Checksum verification failed: {error}")
+                } else {
+                    format!("Automatic SHA-256 calculation failed: {error}")
+                };
                 mark_integrity_failure(&mut download.integrity, &error, unix_epoch_millis());
                 append_download_log(
                     download,
                     DownloadLogLevel::Error,
-                    "integrity.verify-failed",
+                    if expected.is_some() {
+                        "integrity.verify-failed"
+                    } else {
+                        "integrity.fingerprint-failed"
+                    },
                     detail.clone(),
                 );
                 if !download

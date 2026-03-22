@@ -14,9 +14,9 @@ import {
   StopCircle,
   type LucideIcon,
 } from "lucide-react";
+import { checksumAlgorithmLabel } from "./checksum";
 import { formatDurationShort } from "@/lib/format";
 import type {
-  ChecksumAlgorithm,
   Download,
   DownloadCategory,
   DownloadFailureKind,
@@ -127,24 +127,17 @@ export function targetConnectionCount(download: Download): number {
   return Math.max(download.targetConnections, 1);
 }
 
-export function checksumAlgorithmLabel(algorithm: ChecksumAlgorithm): string {
-  switch (algorithm) {
-    case "md5":
-      return "MD5";
-    case "sha1":
-      return "SHA-1";
-    case "sha256":
-      return "SHA-256";
-    case "sha512":
-      return "SHA-512";
-  }
-}
-
 export function integritySummaryLabel(
   download: Pick<Download, "integrity">,
 ): string | null {
   const expected = download.integrity.expected;
   if (!expected) {
+    if (download.integrity.state === "verifying") {
+      return "Hashing SHA-256";
+    }
+    if (download.integrity.actual) {
+      return "SHA-256 ready";
+    }
     return null;
   }
 
@@ -165,6 +158,16 @@ export function integritySummaryLabel(
 export function integrityStatusDetail(
   download: Pick<Download, "integrity">,
 ): string | null {
+  if (!download.integrity.expected) {
+    if (download.integrity.state === "verifying") {
+      return "Hashing SHA-256";
+    }
+    if (download.integrity.actual) {
+      return "SHA-256 ready";
+    }
+    return null;
+  }
+
   switch (download.integrity.state) {
     case "verified":
       return "Verified";
@@ -214,6 +217,12 @@ export function integrityBadgeLabel(
   integrity: DownloadIntegrity,
 ): string | null {
   if (!integrity.expected) {
+    if (integrity.state === "verifying") {
+      return "Computing SHA-256";
+    }
+    if (integrity.actual) {
+      return "SHA-256 fingerprint ready";
+    }
     return null;
   }
 
