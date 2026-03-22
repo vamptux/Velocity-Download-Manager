@@ -1,8 +1,10 @@
 import { useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Minus, X, Search, Maximize2 } from "lucide-react";
+import { CheckCircle2, ExternalLink, Minus, RefreshCw, Search, Maximize2, X } from "lucide-react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { readText } from "@tauri-apps/plugin-clipboard-manager";
+import { readClipboardText } from "@/lib/clipboard";
+
+const GITHUB_REPOSITORY_URL = "https://github.com/vamptux/Velocity-Download-Manager";
 
 function tauriWindow() {
   try {
@@ -19,6 +21,8 @@ interface TitleBarProps {
   onStartQueue?: () => void;
   onStopQueue?: () => void;
   onBatchDownload?: () => void;
+  onCheckForUpdates?: () => void;
+  checkingForUpdates?: boolean;
   queueRunning?: boolean;
 }
 
@@ -29,6 +33,8 @@ export function TitleBar({
   onStartQueue,
   onStopQueue,
   onBatchDownload,
+  onCheckForUpdates,
+  checkingForUpdates = false,
   queueRunning
 }: TitleBarProps) {
   const [search, setSearch] = useState("");
@@ -38,12 +44,15 @@ export function TitleBar({
 
   const handlePasteAndAdd = async () => {
     try {
-      const text = await readText();
+      const text = (await readClipboardText()).trim();
       if (text && onNewDownload) {
         onNewDownload(text);
+      } else {
+        onNewDownload?.();
       }
     } catch (err) {
       console.error("Failed to read clipboard:", err);
+      onNewDownload?.();
     }
   };
 
@@ -70,14 +79,14 @@ export function TitleBar({
           </DropdownMenu.Trigger>
           <DropdownMenu.Portal>
             <DropdownMenu.Content className="z-50 min-w-[180px] overflow-hidden rounded-md border bg-popover/90 backdrop-blur-md p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2" sideOffset={0} align="start">
-              <DropdownMenu.Item className={itemClass} onClick={() => onNewDownload?.()}>
+              <DropdownMenu.Item className={itemClass} onSelect={() => onNewDownload?.()}>
                 New Download...
               </DropdownMenu.Item>
-              <DropdownMenu.Item className={itemClass} onClick={handlePasteAndAdd}>
+              <DropdownMenu.Item className={itemClass} onSelect={() => void handlePasteAndAdd()}>
                 Paste Link from Clipboard
               </DropdownMenu.Item>
               <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border/50" />
-              <DropdownMenu.Item className={itemClass} onClick={close}>
+              <DropdownMenu.Item className={itemClass} onSelect={() => void close()}>
                 Exit
               </DropdownMenu.Item>
             </DropdownMenu.Content>
@@ -92,7 +101,7 @@ export function TitleBar({
           </DropdownMenu.Trigger>
           <DropdownMenu.Portal>
             <DropdownMenu.Content className="z-50 min-w-[180px] overflow-hidden rounded-md border bg-popover/90 backdrop-blur-md p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2" sideOffset={0} align="start">
-              <DropdownMenu.Item className={itemClass} onClick={() => queueRunning ? onStopQueue?.() : onStartQueue?.()}>
+              <DropdownMenu.Item className={itemClass} onSelect={() => queueRunning ? onStopQueue?.() : onStartQueue?.()}>
                 {queueRunning ? "Stop Main Queue" : "Start Main Queue"}
               </DropdownMenu.Item>
             </DropdownMenu.Content>
@@ -107,10 +116,10 @@ export function TitleBar({
           </DropdownMenu.Trigger>
           <DropdownMenu.Portal>
             <DropdownMenu.Content className="z-50 min-w-[180px] overflow-hidden rounded-md border bg-popover/90 backdrop-blur-md p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2" sideOffset={0} align="start">
-              <DropdownMenu.Item className={itemClass} onClick={() => onOpenSettings?.()}>
+              <DropdownMenu.Item className={itemClass} onSelect={() => onOpenSettings?.()}>
                 Settings
               </DropdownMenu.Item>
-              <DropdownMenu.Item className={itemClass} onClick={() => onBatchDownload?.()}>
+              <DropdownMenu.Item className={itemClass} onSelect={() => onBatchDownload?.()}>
                 Batch Download
               </DropdownMenu.Item>
             </DropdownMenu.Content>
@@ -125,8 +134,22 @@ export function TitleBar({
           </DropdownMenu.Trigger>
           <DropdownMenu.Portal>
             <DropdownMenu.Content className="z-50 min-w-[180px] overflow-hidden rounded-md border bg-popover/90 backdrop-blur-md p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2" sideOffset={0} align="start">
-              <DropdownMenu.Item className={itemClass} onClick={() => window.open("https://github.com/vamptux/Velocity-Download-Manager", "_blank")}>
+              <DropdownMenu.Item className={itemClass} onSelect={() => window.open(GITHUB_REPOSITORY_URL, "_blank", "noopener,noreferrer")}>
+                <ExternalLink size={12} strokeWidth={1.8} className="mr-2 shrink-0" />
                 GitHub Repository
+              </DropdownMenu.Item>
+              <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border/50" />
+              <DropdownMenu.Item
+                className={itemClass}
+                disabled={checkingForUpdates}
+                onSelect={() => onCheckForUpdates?.()}
+              >
+                {checkingForUpdates ? (
+                  <RefreshCw size={12} strokeWidth={1.8} className="mr-2 shrink-0 animate-spin" />
+                ) : (
+                  <CheckCircle2 size={12} strokeWidth={1.8} className="mr-2 shrink-0" />
+                )}
+                {checkingForUpdates ? "Checking for Updates..." : "Check for Updates"}
               </DropdownMenu.Item>
             </DropdownMenu.Content>
           </DropdownMenu.Portal>

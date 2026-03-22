@@ -373,6 +373,9 @@ export function App() {
     error: null,
     dismissedVersion: null,
   }));
+  const [appUpdateCheckPending, setAppUpdateCheckPending] = useState(false);
+  const [appUpdateNotice, setAppUpdateNotice] = useState<string | null>(null);
+  const [appUpdateCheckError, setAppUpdateCheckError] = useState<string | null>(null);
   const completionTimers = useRef<Map<string, number>>(new Map());
   const lastRealtimeSyncAt = useRef(Date.now());
   const eventBridgeAttached = useRef(false);
@@ -603,18 +606,20 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!settingsNotice) {
+    if (!settingsNotice && !appUpdateNotice && !appUpdateCheckError) {
       return;
     }
 
     const timeoutId = window.setTimeout(() => {
       setSettingsNotice(null);
+      setAppUpdateNotice(null);
+      setAppUpdateCheckError(null);
     }, 4200);
 
     return () => {
       window.clearTimeout(timeoutId);
     };
-  }, [settingsNotice]);
+  }, [appUpdateCheckError, appUpdateNotice, settingsNotice]);
 
   useEffect(() => {
     if (!bootstrapState.error) {
@@ -1110,6 +1115,55 @@ export function App() {
     }
   }, []);
 
+  const handleCheckForUpdates = useCallback(async () => {
+    if (appUpdateCheckPending || import.meta.env.DEV) {
+      return;
+    }
+
+    setAppUpdateCheckPending(true);
+    setAppUpdateNotice(null);
+    setAppUpdateCheckError(null);
+
+    try {
+      const update = await ipcCheckAppUpdate();
+      writeStoredString(updateLastCheckKey, String(Date.now()));
+
+      if (!update) {
+        setAppUpdate((prev) => ({
+          ...prev,
+          stage: "up-to-date",
+          info: null,
+          downloadedBytes: 0,
+          totalBytes: null,
+          error: null,
+        }));
+        setAppUpdateNotice("You already have the latest available build.");
+        return;
+      }
+
+      setAppUpdate((prev) => ({
+        ...prev,
+        stage: prev.dismissedVersion === update.version ? "idle" : "available",
+        info: update,
+        downloadedBytes: 0,
+        totalBytes: null,
+        error: null,
+      }));
+    } catch (error) {
+      setAppUpdate((prev) => ({
+        ...prev,
+        error: null,
+      }));
+      setAppUpdateCheckError(
+        simplifyUserMessage(
+          getActionErrorMessage(error, "Velocity Download Manager could not check for updates."),
+        ),
+      );
+    } finally {
+      setAppUpdateCheckPending(false);
+    }
+  }, [appUpdateCheckPending, updateLastCheckKey]);
+
   // Keyboard shortcuts: Ctrl+N, Delete, Space
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -1349,6 +1403,36 @@ export function App() {
       });
     }
 
+    if (appUpdateNotice) {
+      alerts.push({
+        id: `app-update-notice:${appUpdateNotice}`,
+        tone: "info",
+        eyebrow: "Update",
+        title: "No updates found",
+        message: appUpdateNotice,
+        onDismiss: () => {
+          setAppUpdateNotice(null);
+        },
+      });
+    }
+
+    if (appUpdateCheckError) {
+      alerts.push({
+        id: `app-update-check-error:${appUpdateCheckError}`,
+        tone: "error",
+        eyebrow: "Update",
+        title: "Update check failed",
+        message: appUpdateCheckError,
+        actionLabel: "Retry",
+        onAction: () => {
+          void handleCheckForUpdates();
+        },
+        onDismiss: () => {
+          setAppUpdateCheckError(null);
+        },
+      });
+    }
+
     return alerts;
   }, [
     bootstrapState.error,
@@ -1368,7 +1452,10 @@ export function App() {
     appUpdateProgressPercent,
     appUpdateVersionMeta,
     handleDismissAppUpdate,
+    appUpdateCheckError,
+    appUpdateNotice,
     handleInstallAppUpdate,
+    handleCheckForUpdates,
     handleRestartAppUpdate,
     handleRetryBootstrap,
     settingsError,
@@ -1391,6 +1478,8 @@ export function App() {
           onBatchDownload={() => setBatchDownloadOpen(true)}
           onStartQueue={() => void handleStartQueue()}
           onStopQueue={() => void handleStopQueue()}
+          onCheckForUpdates={() => void handleCheckForUpdates()}
+          checkingForUpdates={appUpdateCheckPending}
           queueRunning={queueState.running}
         />
         <div id="vdm-content" className="flex flex-1 overflow-hidden">

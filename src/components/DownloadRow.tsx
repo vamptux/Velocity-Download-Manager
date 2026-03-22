@@ -55,6 +55,7 @@ import {
   ipcResumeDownload,
   ipcSetDownloadChecksum,
 } from "@/lib/ipc";
+import { writeClipboardText } from "@/lib/clipboard";
 import type { ChecksumAlgorithm, Download } from "@/types/download";
 
 const CHECKSUM_ALGORITHMS: { value: ChecksumAlgorithm; label: string }[] = [
@@ -254,9 +255,14 @@ export const DownloadRow = memo(function DownloadRow({
   onOpenFolder,
   onRefresh,
 }: DownloadRowProps) {
-  const { label, color, Icon } = STATUS_META[download.status];
+  const { label: baseLabel, color, Icon } = STATUS_META[download.status];
   const CategoryIcon = CATEGORY_ICONS[download.category];
   const categoryIconColor = CATEGORY_ICON_COLORS[download.category];
+  const isFinalizing =
+    download.status === "downloading"
+    && download.size > 0
+    && download.downloaded >= download.size;
+  const label = isFinalizing ? "Finalizing" : baseLabel;
   const pct = calculateDisplayProgress(
     download.downloaded,
     download.size,
@@ -302,6 +308,7 @@ export const DownloadRow = memo(function DownloadRow({
     stallReason
     ?? integrityStatusDetail(download)
     ?? restartLabel
+    ?? (isFinalizing ? "Flushing to disk" : null)
     ?? (showProgress && pct > 0 ? `${Math.round(smoothedPct)}%` : null);
 
   const [csOpen, setCsOpen] = useState(false);
@@ -345,7 +352,7 @@ export const DownloadRow = memo(function DownloadRow({
   }
 
   function copyUrl() {
-    navigator.clipboard.writeText(download.url).catch(() => null);
+    void writeClipboardText(download.url).catch(() => null);
   }
 
   async function handleResume() {

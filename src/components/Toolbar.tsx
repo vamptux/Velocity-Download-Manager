@@ -14,6 +14,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { readClipboardText } from "@/lib/clipboard";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 export interface ToolbarProps {
@@ -118,7 +119,7 @@ function NewDownloadSplitButton({ onNewDownload }: { onNewDownload: (prefillUrl?
   async function pasteFromClipboard() {
     setOpen(false);
     try {
-      const text = await navigator.clipboard.readText();
+      const text = await readClipboardText();
       onNewDownload(text.trim() || undefined);
     } catch {
       onNewDownload();

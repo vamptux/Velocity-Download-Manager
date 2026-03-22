@@ -196,20 +196,13 @@ fn validate_range_response(
             Ok(())
         }
         StatusCode::OK => {
-            if let Some((start, end, _)) = parse_content_range_bounds(content_range)
-                && start == request.start
-                && end == request.end
-            {
-                return Ok(());
-            }
-
             let content_length = header_to_u64(headers.get(CONTENT_LENGTH));
             if request.start == 0 && content_length == Some(requested_len) {
                 return Ok(());
             }
 
             Err(format!(
-                "Server ignored the requested byte range {}-{} and returned HTTP 200 without a matching Content-Range.",
+                "Server ignored the requested byte range {}-{} and returned HTTP 200 instead of HTTP 206 Partial Content.",
                 request.start, request.end
             ))
         }
@@ -1186,4 +1179,37 @@ fn parse_retry_after_delay_ms(value: &reqwest::header::HeaderValue) -> Option<u6
     let raw = value.to_str().ok()?.trim();
     let seconds = raw.parse::<u64>().ok()?.min(RETRY_AFTER_MAX_SECONDS);
     Some(seconds.saturating_mul(1_000))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(start: u64, end: u64) -> FetchSegmentRequest {
+        FetchSegmentRequest {
+            start,
+            end,
+            connection_reused_hint: false,
+        }
+    }
+
+    #[test]
+    fn rejects_http_200_even_with_matching_content_range() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 10-19/20"));
+
+        let result = validate_range_response(StatusCode::OK, &headers, request(10, 19));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accepts_http_200_for_exact_full_entity_from_zero_offset() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("10"));
+
+        let result = validate_range_response(StatusCode::OK, &headers, request(0, 9));
+
+        assert!(result.is_ok());
+    }
 }
