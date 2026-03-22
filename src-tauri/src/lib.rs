@@ -3,6 +3,8 @@ mod capture_bridge;
 mod engine;
 mod model;
 
+use std::process::Command;
+
 use engine::{
     AppStateRowSnapshot, AppStateSnapshot, DownloadDetailSnapshot, EngineBootstrapState,
     EngineState, StartupSnapshot,
@@ -67,6 +69,47 @@ async fn install_app_update(
 #[tauri::command]
 fn restart_app(app: AppHandle) {
     app.restart();
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> CommandResult<()> {
+    let parsed = reqwest::Url::parse(&url)
+        .map_err(|error| format!("Failed parsing external URL '{url}': {error}"))?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "Refusing to open unsupported external URL scheme '{other}'."
+            ));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer.exe")
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|error| format!("Failed opening external URL: {error}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|error| format!("Failed opening external URL: {error}"))?;
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|error| format!("Failed opening external URL: {error}"))?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -229,8 +272,8 @@ async fn update_engine_settings(
 }
 
 #[tauri::command]
-fn take_pending_capture_payload() -> Option<capture_bridge::CapturePayload> {
-    capture_bridge::take_pending_capture()
+fn take_pending_capture_payload(window_label: Option<String>) -> Option<capture_bridge::CapturePayload> {
+    capture_bridge::take_pending_capture(window_label.as_deref())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -283,6 +326,7 @@ pub fn run() {
             check_app_update,
             install_app_update,
             restart_app,
+            open_external_url,
             get_app_state,
             get_app_state_rows,
             get_startup_snapshot,

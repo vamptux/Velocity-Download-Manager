@@ -1116,7 +1116,7 @@ export function App() {
   }, []);
 
   const handleCheckForUpdates = useCallback(async () => {
-    if (appUpdateCheckPending || import.meta.env.DEV) {
+    if (appUpdateCheckPending) {
       return;
     }
 
@@ -1137,7 +1137,11 @@ export function App() {
           totalBytes: null,
           error: null,
         }));
-        setAppUpdateNotice("You already have the latest available build.");
+        setAppUpdateNotice(
+          import.meta.env.DEV
+            ? "No newer published release is available for this build yet."
+            : "You already have the latest available build.",
+        );
         return;
       }
 

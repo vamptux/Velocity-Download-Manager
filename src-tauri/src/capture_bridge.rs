@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
@@ -15,7 +16,9 @@ use ts_rs::TS;
 
 use crate::model::{DownloadRequestField, DownloadRequestMethod};
 
-static PENDING_CAPTURE: Mutex<Option<CapturePayload>> = Mutex::new(None);
+static PENDING_CAPTURE: LazyLock<Mutex<BTreeMap<String, CapturePayload>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static CAPTURE_WINDOW_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -239,17 +242,36 @@ impl CaptureBridgeState {
     }
 }
 
-pub fn take_pending_capture() -> Option<CapturePayload> {
-    match PENDING_CAPTURE.lock() {
-        Ok(mut slot) => slot.take(),
-        Err(_) => None,
+pub fn take_pending_capture(window_label: Option<&str>) -> Option<CapturePayload> {
+    let Ok(mut pending) = PENDING_CAPTURE.lock() else {
+        return None;
+    };
+
+    if let Some(label) = window_label {
+        return pending.remove(label);
+    }
+
+    let first_label = pending.keys().next().cloned()?;
+    pending.remove(&first_label)
+}
+
+fn set_pending_capture(window_label: &str, payload: CapturePayload) {
+    if let Ok(mut pending) = PENDING_CAPTURE.lock() {
+        pending.insert(window_label.to_string(), payload);
     }
 }
 
-fn set_pending_capture(payload: CapturePayload) {
-    if let Ok(mut slot) = PENDING_CAPTURE.lock() {
-        *slot = Some(payload);
+fn clear_pending_capture(window_label: &str) {
+    if let Ok(mut pending) = PENDING_CAPTURE.lock() {
+        pending.remove(window_label);
     }
+}
+
+fn next_capture_window_label() -> String {
+    format!(
+        "capture-{}",
+        CAPTURE_WINDOW_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 pub fn spawn_capture_server(app: AppHandle, state: CaptureBridgeState) {
@@ -405,21 +427,11 @@ async fn write_unauthorized_response(
 }
 
 fn show_capture_window(app: &AppHandle, payload: &CapturePayload) {
-    set_pending_capture(payload.clone());
-
-    if let Some(capture_window) = app.get_webview_window("capture") {
-        let _ = capture_window.show();
-        let _ = capture_window.unminimize();
-        let _ = capture_window.set_focus();
-
-        if let Err(err) = capture_window.emit("extension://capture", payload) {
-            eprintln!("[VDM] capture bridge: emit failed: {err}");
-        }
-        return;
-    }
+    let window_label = next_capture_window_label();
+    set_pending_capture(&window_label, payload.clone());
 
     let url = WebviewUrl::App("index.html?window=capture".into());
-    let capture_window = match WebviewWindowBuilder::new(app, "capture", url)
+    let capture_window = match WebviewWindowBuilder::new(app, &window_label, url)
         .title("Add Download")
         .inner_size(460.0, 316.0)
         .min_inner_size(420.0, 280.0)
@@ -430,6 +442,7 @@ fn show_capture_window(app: &AppHandle, payload: &CapturePayload) {
     {
         Ok(window) => window,
         Err(err) => {
+            clear_pending_capture(&window_label);
             eprintln!("[VDM] capture bridge: could not create capture window: {err}");
             return;
         }

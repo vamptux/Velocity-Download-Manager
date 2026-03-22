@@ -120,6 +120,10 @@ export async function ipcRestartApp(): Promise<void> {
   await invoke("restart_app");
 }
 
+export async function ipcOpenExternalUrl(url: string): Promise<void> {
+  await invoke("open_external_url", { url });
+}
+
 export async function ipcGetAppState(): Promise<AppState> {
   const raw = await invoke<RawAppState>("get_app_state");
   return {
@@ -197,8 +201,10 @@ export interface IpcAddArgs {
   startImmediately?: boolean;
 }
 
-export async function ipcTakePendingCapturePayload(): Promise<CapturePayload | null> {
-  return invoke<CapturePayload | null>("take_pending_capture_payload");
+export async function ipcTakePendingCapturePayload(windowLabel?: string): Promise<CapturePayload | null> {
+  return invoke<CapturePayload | null>("take_pending_capture_payload", {
+    windowLabel: windowLabel ?? null,
+  });
 }
 
 export async function ipcAddDownload(args: IpcAddArgs): Promise<Download> {

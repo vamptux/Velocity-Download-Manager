@@ -129,14 +129,13 @@ function CompactTitleBar({
   onMinimize: () => void;
 }) {
   return (
-    <div className="flex h-[28px] shrink-0 items-stretch justify-between border-b border-border bg-[hsl(var(--toolbar))] select-none">
+    <div className="flex h-[36px] shrink-0 items-stretch justify-between border-b border-border bg-[hsl(var(--toolbar))] select-none">
       <div data-tauri-drag-region className="flex flex-1 items-center gap-1.5 min-w-0 pl-2.5">
-        <div
-          className="flex h-[13px] w-[13px] shrink-0 items-center justify-center rounded-[3px]"
-          style={{ background: "linear-gradient(135deg, hsl(var(--accent-h) 25% 38%), hsl(var(--accent-h) 18% 26%))" }}
-        >
-          <ArrowDownToLine size={7} className="text-white" strokeWidth={2.5} />
-        </div>
+        <img
+          src="/veloicon.ico"
+          alt="Velocity DM"
+          className="h-[36px] w-[36px] shrink-0 scale-[1.08] object-contain"
+        />
         <span className="truncate text-[10.5px] font-medium text-foreground/68 tracking-tight">{title}</span>
       </div>
       <div className="flex shrink-0 items-stretch border-l border-white/[0.06]">
@@ -144,7 +143,7 @@ function CompactTitleBar({
           type="button"
           onClick={onMinimize}
           aria-label="Minimize"
-          className="flex w-[32px] items-center justify-center text-muted-foreground/55 hover:text-foreground/85 hover:bg-white/[0.1] transition-colors"
+          className="flex w-[34px] items-center justify-center text-muted-foreground/55 transition-colors hover:bg-white/[0.1] hover:text-foreground/85"
         >
           <Minus size={11} strokeWidth={1.7} />
         </button>
@@ -152,7 +151,7 @@ function CompactTitleBar({
           type="button"
           onClick={onClose}
           aria-label="Close"
-          className="flex w-[32px] items-center justify-center text-muted-foreground/55 hover:text-white hover:bg-[hsl(0,66%,46%)] transition-colors"
+          className="flex w-[34px] items-center justify-center text-muted-foreground/55 transition-colors hover:bg-[hsl(0,66%,46%)] hover:text-white"
         >
           <X size={11} strokeWidth={1.9} />
         </button>
@@ -207,6 +206,7 @@ export function CompactCaptureWindow() {
   const abortRef = useRef<AbortController | null>(null);
   const savePathRef = useRef("");
   const lastPayloadKeyRef = useRef("");
+  const windowLabelRef = useRef<string | null>(null);
   const monitorDownloadId = monitorDownload?.id ?? null;
   const monitorDownloadSpeedLimit = monitorDownload?.speedLimitBytesPerSecond ?? null;
 
@@ -324,6 +324,10 @@ export function CompactCaptureWindow() {
     void getCurrentWindow().minimize().catch(() => null);
   }, []);
 
+  useEffect(() => {
+    windowLabelRef.current = getCurrentWindow().label;
+  }, []);
+
   const runProbe = useCallback(async (
     url: string,
     hintName: string,
@@ -389,7 +393,7 @@ export function CompactCaptureWindow() {
     const unlistenPromise = listen<CapturePayload>("extension://capture", (event) => {
       applyIncomingPayload(event.payload);
     });
-    void ipcTakePendingCapturePayload()
+    void ipcTakePendingCapturePayload(windowLabelRef.current ?? undefined)
       .then((pending) => { if (pending) applyIncomingPayload(pending); })
       .catch(() => null);
     return () => { void unlistenPromise.then((u) => u()); };
@@ -720,7 +724,7 @@ export function CompactCaptureWindow() {
           <button
             type="button"
             onClick={() => {
-              void ipcTakePendingCapturePayload()
+              void ipcTakePendingCapturePayload(windowLabelRef.current ?? undefined)
                 .then((pending) => { if (pending) applyIncomingPayload(pending); })
                 .catch(() => null);
             }}

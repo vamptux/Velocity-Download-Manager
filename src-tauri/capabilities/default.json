@@ -4,7 +4,7 @@
   "description": "Default window capability",
   "windows": [
     "main",
-    "capture"
+    "capture-*"
   ],
   "permissions": [
     "core:default",

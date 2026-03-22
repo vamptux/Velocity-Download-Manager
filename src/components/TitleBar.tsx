@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { CheckCircle2, ExternalLink, Minus, RefreshCw, Search, Maximize2, X } from "lucide-react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { readClipboardText } from "@/lib/clipboard";
+import { ipcOpenExternalUrl } from "@/lib/ipc";
 
 const GITHUB_REPOSITORY_URL = "https://github.com/vamptux/Velocity-Download-Manager";
 
@@ -56,24 +57,33 @@ export function TitleBar({
     }
   };
 
+  const handleOpenRepository = async () => {
+    try {
+      await ipcOpenExternalUrl(GITHUB_REPOSITORY_URL);
+    } catch (error) {
+      console.error("Failed to open repository URL:", error);
+      window.open(GITHUB_REPOSITORY_URL, "_blank", "noopener,noreferrer");
+    }
+  };
+
   const itemClass = "relative flex cursor-default select-none items-center rounded-sm px-2 py-1.5 text-xs outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 transition-colors";
 
   return (
     <header
       data-tauri-drag-region
-      className="flex h-9 shrink-0 items-center border-b border-border/60 select-none"
+      className="flex h-11 shrink-0 items-center border-b border-border/60 select-none"
       style={{ background: "hsl(var(--toolbar))" }}
     >
-      <div className="flex items-center pl-2.5 z-50">
+      <div className="z-50 flex items-center pl-2">
         <img
           src="/veloicon.ico"
           alt="Velocity DM"
-          className="mr-2 h-[20px] w-[20px] shrink-0 object-contain select-none pointer-events-none"
+          className="mr-2 h-[32px] w-[32px] shrink-0 scale-[1.08] object-contain select-none pointer-events-none"
         />
         
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>
-            <button className="h-9 px-2.5 text-[11px] text-muted-foreground/55 hover:bg-white/[0.055] hover:text-foreground/85 transition-colors data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85 outline-none">
+            <button className="h-11 px-2.5 text-[11px] text-muted-foreground/55 transition-colors outline-none hover:bg-white/[0.055] hover:text-foreground/85 data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85">
               File
             </button>
           </DropdownMenu.Trigger>
@@ -95,7 +105,7 @@ export function TitleBar({
 
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>
-            <button className="h-9 px-2.5 text-[11px] text-muted-foreground/55 hover:bg-white/[0.055] hover:text-foreground/85 transition-colors data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85 outline-none">
+            <button className="h-11 px-2.5 text-[11px] text-muted-foreground/55 transition-colors outline-none hover:bg-white/[0.055] hover:text-foreground/85 data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85">
               Tasks
             </button>
           </DropdownMenu.Trigger>
@@ -110,7 +120,7 @@ export function TitleBar({
 
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>
-            <button className="h-9 px-2.5 text-[11px] text-muted-foreground/55 hover:bg-white/[0.055] hover:text-foreground/85 transition-colors data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85 outline-none">
+            <button className="h-11 px-2.5 text-[11px] text-muted-foreground/55 transition-colors outline-none hover:bg-white/[0.055] hover:text-foreground/85 data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85">
               Tools
             </button>
           </DropdownMenu.Trigger>
@@ -128,13 +138,13 @@ export function TitleBar({
 
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>
-            <button className="h-9 px-2.5 text-[11px] text-muted-foreground/55 hover:bg-white/[0.055] hover:text-foreground/85 transition-colors data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85 outline-none">
+            <button className="h-11 px-2.5 text-[11px] text-muted-foreground/55 transition-colors outline-none hover:bg-white/[0.055] hover:text-foreground/85 data-[state=open]:bg-white/[0.055] data-[state=open]:text-foreground/85">
               Help
             </button>
           </DropdownMenu.Trigger>
           <DropdownMenu.Portal>
             <DropdownMenu.Content className="z-50 min-w-[180px] overflow-hidden rounded-md border bg-popover/90 backdrop-blur-md p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2" sideOffset={0} align="start">
-              <DropdownMenu.Item className={itemClass} onSelect={() => window.open(GITHUB_REPOSITORY_URL, "_blank", "noopener,noreferrer")}>
+              <DropdownMenu.Item className={itemClass} onSelect={() => void handleOpenRepository()}>
                 <ExternalLink size={12} strokeWidth={1.8} className="mr-2 shrink-0" />
                 GitHub Repository
               </DropdownMenu.Item>
@@ -179,7 +189,7 @@ export function TitleBar({
             onSearch?.(e.target.value);
           }}
           placeholder="Search downloads…"
-          className="h-[24px] w-[140px] rounded-[6px] border border-white/[0.08] bg-black/20 pl-7 pr-2.5 text-[11.5px] text-foreground placeholder:text-muted-foreground/35 outline-none focus:w-[200px] focus:border-primary/50 focus:bg-black/40 transition-all duration-200 ease-out shadow-inner"
+          className="h-[28px] w-[140px] rounded-[6px] border border-white/[0.08] bg-black/20 pl-7 pr-2.5 text-[11.5px] text-foreground placeholder:text-muted-foreground/35 outline-none shadow-inner transition-all duration-200 ease-out focus:w-[200px] focus:border-primary/50 focus:bg-black/40"
         />
         {search && (
           <button 
@@ -195,21 +205,21 @@ export function TitleBar({
         <button
           onClick={minimize}
           aria-label="Minimize"
-          className="group flex w-[42px] items-center justify-center text-muted-foreground/58 hover:bg-white/[0.1] hover:text-foreground/90 transition-colors"
+          className="group flex w-[44px] items-center justify-center text-muted-foreground/58 transition-colors hover:bg-white/[0.1] hover:text-foreground/90"
         >
           <Minus size={14} strokeWidth={1.8} />
         </button>
         <button
           onClick={maximize}
           aria-label="Maximize"
-          className="group flex w-[42px] items-center justify-center text-muted-foreground/58 hover:bg-white/[0.1] hover:text-foreground/90 transition-colors"
+          className="group flex w-[44px] items-center justify-center text-muted-foreground/58 transition-colors hover:bg-white/[0.1] hover:text-foreground/90"
         >
           <Maximize2 size={11} strokeWidth={1.8} />
         </button>
         <button
           onClick={close}
           aria-label="Close"
-          className="group flex w-[46px] items-center justify-center text-muted-foreground/58 hover:bg-[hsl(0,66%,46%)] hover:text-white transition-colors"
+          className="group flex w-[48px] items-center justify-center text-muted-foreground/58 transition-colors hover:bg-[hsl(0,66%,46%)] hover:text-white"
         >
           <X size={13} strokeWidth={1.9} />
         </button>
