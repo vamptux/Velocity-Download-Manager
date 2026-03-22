@@ -1,15 +1,19 @@
-import type { Download } from "@/types/download";
+import { canRestartDownload, canResumeDownload } from "@/lib/downloadActions";
+import type { Download, ResumeValidators } from "@/types/download";
 
 export interface DuplicateLookupInput {
   url?: string | null;
   finalUrl?: string | null;
   targetPath?: string | null;
+  validators?: ResumeValidators | null;
 }
 
 export interface DuplicateMatch {
   download: Download;
-  reason: "url" | "targetPath";
+  reason: "url" | "validators" | "targetPath";
 }
+
+export type DuplicateResolutionKind = "resume" | "restart" | "reveal" | "inspect";
 
 export function normalizeComparableUrl(url: string | null | undefined): string | null {
   const trimmed = url?.trim();
@@ -76,6 +80,49 @@ export function joinTargetPathPreview(savePath: string, name: string): string | 
   return `${base}${separator}${trimmedName}`;
 }
 
+function normalizeValidatorToken(
+  value: string | null | undefined,
+  lowerCase: boolean = false,
+): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  return lowerCase ? trimmed.toLowerCase() : trimmed;
+}
+
+function validatorsMatch(
+  existing: ResumeValidators | null | undefined,
+  candidate: ResumeValidators | null | undefined,
+): boolean {
+  if (!existing || !candidate) {
+    return false;
+  }
+
+  if (existing.contentLength == null || candidate.contentLength == null) {
+    return false;
+  }
+
+  if (existing.contentLength !== candidate.contentLength) {
+    return false;
+  }
+
+  const existingEtag = normalizeValidatorToken(existing.etag);
+  const candidateEtag = normalizeValidatorToken(candidate.etag);
+  if (existingEtag && candidateEtag && existingEtag === candidateEtag) {
+    return true;
+  }
+
+  const existingLastModified = normalizeValidatorToken(existing.lastModified, true);
+  const candidateLastModified = normalizeValidatorToken(candidate.lastModified, true);
+  return Boolean(
+    existingLastModified
+      && candidateLastModified
+      && existingLastModified === candidateLastModified,
+  );
+}
+
 export function findDuplicateDownload(
   downloads: Download[],
   input: DuplicateLookupInput,
@@ -85,22 +132,27 @@ export function findDuplicateDownload(
       (value): value is string => value != null,
     ),
   );
+  const candidateValidators = input.validators;
   const candidateTargetPath = normalizeComparablePath(input.targetPath);
 
   for (const download of downloads) {
-    if (candidateTargetPath) {
-      const existingTargetPath = normalizeComparablePath(download.targetPath);
-      if (existingTargetPath && existingTargetPath === candidateTargetPath) {
-        return { download, reason: "targetPath" };
-      }
-    }
-
     if (candidateUrls.size > 0) {
       const existingUrls = [download.url, download.finalUrl]
         .map((value) => normalizeComparableUrl(value))
         .filter((value): value is string => value != null);
       if (existingUrls.some((value) => candidateUrls.has(value))) {
         return { download, reason: "url" };
+      }
+    }
+
+    if (validatorsMatch(download.validators, candidateValidators)) {
+      return { download, reason: "validators" };
+    }
+
+    if (candidateTargetPath) {
+      const existingTargetPath = normalizeComparablePath(download.targetPath);
+      if (existingTargetPath && existingTargetPath === candidateTargetPath) {
+        return { download, reason: "targetPath" };
       }
     }
   }
@@ -113,5 +165,57 @@ export function describeDuplicateMatch(match: DuplicateMatch): string {
     return `${match.download.name} is already using this target path.`;
   }
 
+  if (match.reason === "validators") {
+    return `${match.download.name} already matches this remote file's size and resume validators.`;
+  }
+
   return `${match.download.name} already tracks this source URL.`;
+}
+
+export function getDuplicateResolution(match: DuplicateMatch): DuplicateResolutionKind {
+  if (match.download.status === "finished") {
+    return "reveal";
+  }
+
+  if (canResumeDownload(match.download)) {
+    return "resume";
+  }
+
+  if (canRestartDownload(match.download)) {
+    return "restart";
+  }
+
+  return "inspect";
+}
+
+export function duplicateResolutionLabel(
+  kind: DuplicateResolutionKind,
+  surface: "dialog" | "compact",
+): string {
+  switch (kind) {
+    case "resume":
+      return "Resume existing";
+    case "restart":
+      return "Restart existing";
+    case "reveal":
+      return "Open folder";
+    case "inspect":
+      return surface === "dialog" ? "Select existing" : "Monitor existing";
+    default:
+      return "Review existing";
+  }
+}
+
+export function suggestAlternativeFilename(name: string): string {
+  const trimmedName = name.trim();
+  if (!trimmedName) {
+    return "download (2).bin";
+  }
+
+  const dotIndex = trimmedName.lastIndexOf(".");
+  if (dotIndex > 0) {
+    return `${trimmedName.slice(0, dotIndex)} (2)${trimmedName.slice(dotIndex)}`;
+  }
+
+  return `${trimmedName} (2)`;
 }

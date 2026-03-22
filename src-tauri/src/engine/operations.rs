@@ -4,7 +4,7 @@ use tauri::AppHandle;
 
 use super::probe::DownloadProbeData;
 use super::*;
-use crate::model::RecentProbeCacheEntry;
+use crate::model::{RecentProbeCacheEntry, ResumeValidators};
 
 const LOW_SPACE_UNKNOWN_SIZE_WARNING_BYTES: u64 = 512 * 1024 * 1024;
 const PROBE_SOURCE_WARNING_LIVE: &str = "Probe metadata source: live network probe.";
@@ -32,6 +32,32 @@ fn urls_overlap(existing: &DownloadRecord, requested_url: &str, final_url: &str)
     })
 }
 
+fn etag_matches(left: &str, right: &str) -> bool {
+    left.trim() == right.trim()
+}
+
+fn last_modified_matches(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn validators_match(existing: &ResumeValidators, requested: &ResumeValidators) -> bool {
+    let (Some(existing_length), Some(requested_length)) =
+        (existing.content_length, requested.content_length)
+    else {
+        return false;
+    };
+
+    if existing_length != requested_length {
+        return false;
+    }
+
+    matches!((&existing.etag, &requested.etag), (Some(left), Some(right)) if etag_matches(left, right))
+        || matches!(
+            (&existing.last_modified, &requested.last_modified),
+            (Some(left), Some(right)) if last_modified_matches(left, right)
+        )
+}
+
 fn duplicate_download_message(existing: &DownloadRecord, reason: &str) -> String {
     format!(
         "Download already exists: '{}' is already {}. Existing status: {:?}.",
@@ -43,15 +69,22 @@ fn find_duplicate_download<'a>(
     downloads: &'a [DownloadRecord],
     requested_url: &str,
     final_url: &str,
+    requested_validators: Option<&ResumeValidators>,
     target_path: &str,
 ) -> Option<(&'a DownloadRecord, &'static str)> {
     for existing in downloads {
-        if target_path_matches(&existing.target_path, target_path) {
-            return Some((existing, "using the same target file"));
-        }
-
         if urls_overlap(existing, requested_url, final_url) {
             return Some((existing, "tracking the same source URL"));
+        }
+
+        if requested_validators
+            .is_some_and(|requested| validators_match(&existing.validators, requested))
+        {
+            return Some((existing, "matching the same remote file validators"));
+        }
+
+        if target_path_matches(&existing.target_path, target_path) {
+            return Some((existing, "using the same target file"));
         }
     }
 
@@ -488,6 +521,15 @@ impl EngineState {
             planned_connections,
             suggested_category: classify_category(&suggested_name),
             warnings,
+            validators: probe
+                .as_ref()
+                .map(|value| value.validators.clone())
+                .or_else(|| {
+                    cached_recent_probe
+                        .as_ref()
+                        .map(|cached| cached.validators.clone())
+                })
+                .unwrap_or_default(),
             compatibility,
         })
     }
@@ -552,9 +594,13 @@ impl EngineState {
         let max_connections =
             effective_connection_target_for_scope(16, &settings, host_profile, Some(&scope_key));
         let target_path = join_target_path(&save_path, &name);
-        if let Some((existing, reason)) =
-            find_duplicate_download(&registry.downloads, &url, &final_url, &target_path)
-        {
+        if let Some((existing, reason)) = find_duplicate_download(
+            &registry.downloads,
+            &url,
+            &final_url,
+            probe.as_ref().map(|value| &value.validators),
+            &target_path,
+        ) {
             return Err(duplicate_download_message(existing, reason));
         }
         let available_space = query_available_space(Path::new(&save_path));

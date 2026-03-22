@@ -349,8 +349,11 @@ export function ProbeSummaryStrip({
 
 interface DuplicateActions {
 	active: boolean;
-	onKeepBoth: () => void;
-	onOverwrite: () => void;
+	title?: string;
+	primaryLabel: string;
+	onPrimary: () => void;
+	secondaryLabel?: string;
+	onSecondary?: () => void;
 }
 
 interface DownloadCapturePaneProps {
@@ -544,24 +547,30 @@ export function DownloadCapturePane({
 				<div className="flex flex-col gap-1">
 					<div className="flex items-center gap-1.5">
 						<AlertTriangle size={10} className="shrink-0 text-[hsl(var(--status-error))]" />
-						<span className="text-[11px] text-[hsl(var(--status-error))]">Download already exists</span>
+						<span className="text-[11px] text-[hsl(var(--status-error))]">
+							{duplicateActions?.title ?? "Download already exists"}
+						</span>
 					</div>
-					<div className="flex gap-2">
+					<div className="flex flex-wrap gap-2">
 						<button
 							type="button"
-							onClick={duplicateActions?.onKeepBoth}
+							onClick={duplicateActions?.onPrimary}
 							className="text-[10.5px] text-primary/80 hover:text-primary underline underline-offset-2 transition-colors"
 						>
-							Keep both
+							{duplicateActions?.primaryLabel}
 						</button>
-						<span className="text-muted-foreground/30 text-[11px]">·</span>
-						<button
-							type="button"
-							onClick={duplicateActions?.onOverwrite}
-							className="text-[10.5px] text-primary/80 hover:text-primary underline underline-offset-2 transition-colors"
-						>
-							Overwrite
-						</button>
+						{duplicateActions?.secondaryLabel && duplicateActions.onSecondary ? (
+							<>
+								<span className="text-muted-foreground/30 text-[11px]">·</span>
+								<button
+									type="button"
+									onClick={duplicateActions.onSecondary}
+									className="text-[10.5px] text-primary/80 hover:text-primary underline underline-offset-2 transition-colors"
+								>
+									{duplicateActions.secondaryLabel}
+								</button>
+							</>
+						) : null}
 					</div>
 				</div>
 			) : null}

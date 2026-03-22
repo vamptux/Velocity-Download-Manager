@@ -2,5 +2,6 @@
 import type { DownloadCategory } from "./DownloadCategory";
 import type { DownloadCompatibility } from "./DownloadCompatibility";
 import type { HostDiagnosticsSummary } from "./HostDiagnosticsSummary";
+import type { ResumeValidators } from "./ResumeValidators";
 
-export type ProbeResult = { originalUrl: string, finalUrl: string, host: string, hostMaxConnections: number | null, hostAverageTtfbMs: bigint | null, hostAverageThroughputBytesPerSecond: bigint | null, hostDiagnostics: HostDiagnosticsSummary, suggestedName: string, targetPath: string | null, size: bigint | null, mimeType: string | null, availableSpace: bigint | null, resumable: boolean, rangeSupported: boolean, segmented: boolean, plannedConnections: number, suggestedCategory: DownloadCategory, warnings: Array<string>, compatibility: DownloadCompatibility, };
+export type ProbeResult = { originalUrl: string, finalUrl: string, host: string, hostMaxConnections: number | null, hostAverageTtfbMs: bigint | null, hostAverageThroughputBytesPerSecond: bigint | null, hostDiagnostics: HostDiagnosticsSummary, suggestedName: string, targetPath: string | null, size: bigint | null, mimeType: string | null, availableSpace: bigint | null, resumable: boolean, rangeSupported: boolean, segmented: boolean, plannedConnections: number, suggestedCategory: DownloadCategory, warnings: Array<string>, validators: ResumeValidators, compatibility: DownloadCompatibility, };

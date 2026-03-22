@@ -3,7 +3,13 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { X, Link, ArrowDownToLine } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { ipcAddDownload, ipcProbeDownload } from "@/lib/ipc";
+import {
+  ipcAddDownload,
+  ipcOpenDownloadFolder,
+  ipcProbeDownload,
+  ipcRestartDownload,
+  ipcResumeDownload,
+} from "@/lib/ipc";
 import { InlineNotice } from "@/components/ui/inline-notice";
 import type { Download, DownloadContentCategory, DownloadProbe } from "@/types/download";
 import {
@@ -15,8 +21,11 @@ import {
 import { getCaptureErrorMessage, useDefaultCaptureSavePath } from "@/lib/captureUtils";
 import {
   describeDuplicateMatch,
+  duplicateResolutionLabel,
   findDuplicateDownload,
+  getDuplicateResolution,
   joinTargetPathPreview,
+  suggestAlternativeFilename,
 } from "@/lib/downloadDuplicates";
 
 interface NewDownloadDialogProps {
@@ -45,6 +54,7 @@ export function NewDownloadDialog({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [categoryDirty, setCategoryDirty] = useState(false);
   const [filenameDirty, setFilenameDirty] = useState(false);
+  const [duplicateActionPending, setDuplicateActionPending] = useState(false);
 
   useDefaultCaptureSavePath(open, savePath, setSavePath);
 
@@ -114,7 +124,56 @@ export function NewDownloadDialog({
     url,
     finalUrl: probe?.finalUrl,
     targetPath: joinTargetPathPreview(savePath, effectiveFilename),
-  }), [effectiveFilename, existingDownloads, probe?.finalUrl, savePath, url]);
+    validators: probe?.validators,
+  }), [effectiveFilename, existingDownloads, probe?.finalUrl, probe?.validators, savePath, url]);
+  const duplicateResolution = useMemo(
+    () => (duplicateMatch ? getDuplicateResolution(duplicateMatch) : null),
+    [duplicateMatch],
+  );
+
+  function closeWithExisting(download: Download) {
+    onDownloadAdded?.(download);
+    onOpenChange(false);
+    setUrl("");
+    setFilename("");
+    setProbe(null);
+    setProbeError(null);
+    setSubmitError(null);
+    setCategoryDirty(false);
+    setFilenameDirty(false);
+  }
+
+  async function handleDuplicatePrimaryAction() {
+    if (!duplicateMatch || !duplicateResolution || duplicateActionPending) {
+      return;
+    }
+
+    setDuplicateActionPending(true);
+    setSubmitError(null);
+    try {
+      switch (duplicateResolution) {
+        case "resume":
+          await ipcResumeDownload(duplicateMatch.download.id);
+          closeWithExisting(duplicateMatch.download);
+          break;
+        case "restart":
+          await ipcRestartDownload(duplicateMatch.download.id);
+          closeWithExisting(duplicateMatch.download);
+          break;
+        case "reveal":
+          await ipcOpenDownloadFolder(duplicateMatch.download.id);
+          closeWithExisting(duplicateMatch.download);
+          break;
+        case "inspect":
+          closeWithExisting(duplicateMatch.download);
+          break;
+      }
+    } catch (error) {
+      setSubmitError(getCaptureErrorMessage(error));
+    } finally {
+      setDuplicateActionPending(false);
+    }
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -258,11 +317,40 @@ export function NewDownloadDialog({
             />
 
             {duplicateMatch ? (
-              <InlineNotice
-                tone="warning"
-                title="Potential duplicate"
-                message={describeDuplicateMatch(duplicateMatch)}
-              />
+              <div className="flex flex-col gap-2 rounded-md border border-[hsl(var(--status-paused)/0.22)] bg-[hsl(var(--status-paused)/0.08)] px-3 py-2.5">
+                <InlineNotice
+                  tone="warning"
+                  title="Potential duplicate"
+                  message={describeDuplicateMatch(duplicateMatch)}
+                />
+                <div className="flex flex-wrap items-center gap-2 px-0.5">
+                  <button
+                    type="button"
+                    onClick={() => void handleDuplicatePrimaryAction()}
+                    disabled={duplicateActionPending || submitting}
+                    className="rounded-md border border-[hsl(var(--primary)/0.28)] px-2.5 py-1.5 text-[11.5px] font-medium text-foreground/84 transition-colors hover:bg-[hsl(var(--primary)/0.08)] disabled:pointer-events-none disabled:opacity-45"
+                  >
+                    {duplicateActionPending && duplicateResolution !== "inspect"
+                      ? "Working..."
+                      : duplicateResolution
+                        ? duplicateResolutionLabel(duplicateResolution, "dialog")
+                        : "Select existing"}
+                  </button>
+                  {duplicateMatch.reason === "targetPath" ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFilename(suggestAlternativeFilename(effectiveFilename || duplicateMatch.download.name));
+                        setFilenameDirty(true);
+                        setSubmitError(null);
+                      }}
+                      className="rounded-md border border-border/70 px-2.5 py-1.5 text-[11.5px] text-muted-foreground/72 transition-colors hover:bg-accent hover:text-foreground"
+                    >
+                      Rename target
+                    </button>
+                  ) : null}
+                </div>
+              </div>
             ) : null}
 
             {/* Actions */}
@@ -276,12 +364,21 @@ export function NewDownloadDialog({
                 </button>
               </Dialog.Close>
               <button
-                type="submit"
+                type={duplicateMatch ? "button" : "submit"}
+                onClick={duplicateMatch ? () => void handleDuplicatePrimaryAction() : undefined}
                 style={{ background: "linear-gradient(90deg, hsl(var(--accent-h) 22% 32%) 0%, hsl(var(--accent-h) 15% 25%) 55%, hsl(0,0%,18%) 100%)" }}
                 className="h-8 px-5 rounded-md text-[12.5px] font-semibold text-[hsl(0,0%,93%)] hover:brightness-110 transition-all disabled:opacity-40 disabled:pointer-events-none"
-                disabled={!url.trim() || submitting || duplicateMatch != null}
+                disabled={!url.trim() || submitting || duplicateActionPending}
               >
-                {submitting ? "Adding…" : "Download"}
+                {duplicateMatch
+                  ? duplicateActionPending && duplicateResolution !== "inspect"
+                    ? "Working..."
+                    : duplicateResolution
+                      ? duplicateResolutionLabel(duplicateResolution, "dialog")
+                      : "Select existing"
+                  : submitting
+                    ? "Adding…"
+                    : "Download"}
               </button>
             </div>
           </form>

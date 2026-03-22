@@ -62,17 +62,19 @@ Notes:
 ## Phase 4 - Duplicate handling
 - [ ] Define normalized duplicate identity inputs.
 - [x] Check duplicates by normalized URL.
-- [ ] Check duplicates by validators (`etag`, `last-modified`, content length) when available.
+- [x] Check duplicates by validators (`etag`, `last-modified`, content length) when available.
 - [x] Check duplicates by target path / final path.
-- [ ] Detect duplicates in compact capture window before add.
+- [x] Detect duplicates in compact capture window before add.
 - [x] Detect duplicates in in-app add flow before add.
 - [ ] Add actions: `Resume existing`, `Replace existing`, `Keep both`, `Merge source list`.
 - [ ] Decide safe behavior when a duplicate is partial vs finished.
 
 Notes:
 - Current gap: same file can be added twice without clear duplicate warning in capture popup and in-app add flow.
-- Identity decisions: backend add now rejects normalized URL matches and target-path collisions; the main add dialog warns before submit.
-- Partial duplicate policy:
+- Identity decisions: backend add rejects normalized URL matches and target-path collisions; URL matches now take precedence over path-only matches so the UI does not suggest a rename that the backend would still block.
+- Validator decisions: validator matches now require equal content length plus a matching `etag` or `last-modified`, which keeps the rule conservative enough for production while still catching same-file re-adds across wrapper or redirect URL changes.
+- Current UI actions: main add dialog now routes duplicates to `Select existing`, `Resume existing`, `Restart existing`, or `Open folder`; compact capture offers the same contextual action before submit and can rename target-path-only collisions.
+- Partial duplicate policy: paused and resumable partials prefer `Resume existing`; guarded or restart-required partials prefer `Restart existing`; finished duplicates prefer `Open folder`.
 
 ---
 
@@ -100,13 +102,14 @@ Notes:
 - [ ] Record enough update metadata to diff settings / behavior changes.
 - [ ] Define startup health check after install.
 - [ ] Define rollback trigger if post-update startup health check fails.
-- [ ] Show changelog highlights tied to engine behavior changes.
+- [x] Show changelog highlights tied to engine behavior changes.
 
 Notes:
 - Current updater flow is straightforward and all-or-nothing in `src-tauri/src/app_update.rs`.
 - Channel config decision:
 - Rollback trigger:
 - Skip-version storage: persisted in `EngineSettings.skippedUpdateVersion` and filtered in backend update checks.
+- Update alerts now show current-to-target version metadata plus up to three prioritized highlights from release notes, with engine/backend items ranked ahead of general notes.
 
 ---
 
@@ -124,9 +127,9 @@ Notes:
 ---
 
 ## Session handoff
-- Next recommended step: extend duplicate prevention into compact capture and decide replace/resume semantics before allowing duplicate override actions.
-- Files most relevant next session: `src-tauri/src/engine/operations.rs`, `src/components/BatchDownloadDialog.tsx`, `src/components/NewDownloadDialog.tsx`, `src/App.tsx`, `src/lib/batchImport.ts`, `src/lib/downloadDuplicates.ts`.
-- Decisions that must not be forgotten: skip-version is now backend-persisted, batch import only submits rows with zero validation errors, duplicate detection currently blocks on normalized URL or target path.
+- Next recommended step: decide whether validator-based duplicate matches should auto-link into the same contextual action flow before adding any destructive replace semantics.
+- Files most relevant next session: `src/components/CompactCaptureWindow.tsx`, `src/components/NewDownloadDialog.tsx`, `src/components/DownloadCapturePane.tsx`, `src/App.tsx`, `src/lib/downloadDuplicates.ts`, `src/lib/updatePresentation.ts`.
+- Decisions that must not be forgotten: skip-version is backend-persisted, duplicate URL matches outrank path-only matches, compact capture now keeps a live duplicate cache from download upsert/remove events, and updater alerts prioritize engine-related release-note highlights.
 - Current thresholds / limits: batch preview renders the first 8 rows inline and the first 5 import failures in the summary.
-- Known bugs / risks: CSV/TSV parsing supports quoted fields but not multiline quoted cells; compact capture still depends on backend duplicate rejection rather than proactive list inspection.
-- Quick summary for next agent: this pass shipped backend duplicate guards, a proactive duplicate warning in the main add dialog, a parsed batch import preview with partial success reporting, and durable updater skip-version state. Verified with `bun run lint`, `bun run build`, and `cargo clippy --manifest-path src-tauri/Cargo.toml --target-dir src-tauri/target-clippy --all-targets --all-features -- -D warnings`.
+- Known bugs / risks: CSV/TSV parsing supports quoted fields but not multiline quoted cells; validator duplicate matching intentionally refuses content-length-only matches and will not fire until the probe has both size and either `etag` or `last-modified`.
+- Quick summary for next agent: this pass added proactive duplicate handling to compact capture, contextual duplicate actions in the main add flow, and update alerts that surface prioritized engine-related changelog highlights. Pending work is validator-based duplicate identity and updater safety state beyond skip-version filtering.

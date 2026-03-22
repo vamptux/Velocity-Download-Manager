@@ -254,7 +254,7 @@ pub fn run() {
 
             #[cfg(target_os = "windows")]
             {
-                use window_vibrancy::{apply_mica, apply_acrylic};
+                use window_vibrancy::{apply_acrylic, apply_mica};
                 if let Some(window) = app.get_webview_window("main") {
                     // Try mica first, fallback to acrylic if unsupported
                     if apply_mica(&window, Some(true)).is_err() {

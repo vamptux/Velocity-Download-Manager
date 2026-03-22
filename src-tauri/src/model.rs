@@ -523,6 +523,8 @@ pub struct ProbeResult {
     pub suggested_category: DownloadCategory,
     pub warnings: Vec<String>,
     #[serde(default)]
+    pub validators: ResumeValidators,
+    #[serde(default)]
     pub compatibility: DownloadCompatibility,
 }
 

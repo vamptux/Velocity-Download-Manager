@@ -17,6 +17,7 @@ import {
 } from "@/lib/downloadActions";
 import { useEngineBridge } from "@/hooks/useEngineBridge";
 import { getQueueMoveState } from "@/lib/downloadQueue";
+import { extractUpdateHighlights, summarizeUpdateNotes } from "@/lib/updatePresentation";
 import {
   ipcCheckAppUpdate,
   ipcGetAppStateRows,
@@ -120,25 +121,6 @@ function readStoredNumber(key: string): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 0;
 }
 
-function summarizeUpdateNotes(notes: string | null | undefined): string | null {
-  if (!notes) {
-    return null;
-  }
-
-  const firstMeaningfulLine = notes
-    .split(/\r?\n/)
-    .map((line) => line.replace(/^[\s#>*-]+/, "").trim())
-    .find((line) => line.length > 0);
-
-  if (!firstMeaningfulLine) {
-    return null;
-  }
-
-  return firstMeaningfulLine.length > 160
-    ? `${firstMeaningfulLine.slice(0, 157).trimEnd()}...`
-    : firstMeaningfulLine;
-}
-
 function appUpdateProgressMessage(downloadedBytes: number, totalBytes: number | null): string {
   if (totalBytes && totalBytes > 0) {
     return `${formatBytes(downloadedBytes)} of ${formatBytes(totalBytes)} downloaded.`;
@@ -157,6 +139,8 @@ type FloatingAlert = {
   eyebrow: string;
   title: string;
   message: string;
+  meta?: string;
+  highlights?: string[];
   progressPercent?: number | null;
   actionLabel?: string;
   onAction?: () => void;
@@ -231,7 +215,19 @@ function CompletionNoticeStack({
               {alert.eyebrow}
             </div>
             <div className="mt-1 text-[13px] font-semibold text-foreground/88">{alert.title}</div>
+            {alert.meta ? (
+              <div className="mt-1 text-[10px] uppercase tracking-[0.08em] text-muted-foreground/42">{alert.meta}</div>
+            ) : null}
             <div className="mt-1 text-[11px] leading-relaxed text-muted-foreground/66">{alert.message}</div>
+            {alert.highlights && alert.highlights.length > 0 ? (
+              <div className="mt-2 flex flex-col gap-1">
+                {alert.highlights.map((highlight) => (
+                  <div key={highlight} className="text-[10.5px] leading-relaxed text-foreground/72">
+                    - {highlight}
+                  </div>
+                ))}
+              </div>
+            ) : null}
             {typeof alert.progressPercent === "number" ? (
               <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-black/20">
                 <div
@@ -1145,6 +1141,14 @@ export function App() {
     () => summarizeUpdateNotes(appUpdate.info?.notes),
     [appUpdate.info?.notes],
   );
+  const appUpdateHighlights = useMemo(
+    () => extractUpdateHighlights(appUpdate.info?.notes).filter((line) => line !== appUpdateNotesSummary),
+    [appUpdate.info?.notes, appUpdateNotesSummary],
+  );
+  const appUpdateVersionMeta = useMemo(
+    () => appUpdate.info ? `Current ${appUpdate.info.currentVersion} -> ${appUpdate.info.version}` : undefined,
+    [appUpdate.info],
+  );
   const floatingAlerts = useMemo<FloatingAlert[]>(() => {
     const alerts: FloatingAlert[] = [];
 
@@ -1188,7 +1192,9 @@ export function App() {
         tone: "info",
         eyebrow: "Update",
         title: `Version ${appUpdate.info.version} is ready`,
+        meta: appUpdateVersionMeta,
         message: appUpdateNotesSummary ?? "A new build of Velocity Download Manager is available.",
+        highlights: appUpdateHighlights,
         actionLabel: "Install",
         onAction: () => {
           void handleInstallAppUpdate();
@@ -1203,6 +1209,7 @@ export function App() {
         tone: "info",
         eyebrow: "Update",
         title: `Installing ${appUpdate.info.version}`,
+        meta: appUpdateVersionMeta,
         message: appUpdateProgressMessage(appUpdate.downloadedBytes, appUpdate.totalBytes),
         progressPercent: appUpdateProgressPercent,
       });
@@ -1214,7 +1221,9 @@ export function App() {
         tone: "success",
         eyebrow: "Update",
         title: "Restart to finish the update",
+        meta: appUpdateVersionMeta,
         message: `Velocity Download Manager ${appUpdate.info.version} is installed and ready to apply.`,
+        highlights: appUpdateHighlights,
         actionLabel: "Restart",
         onAction: () => {
           void handleRestartAppUpdate();
@@ -1286,8 +1295,10 @@ export function App() {
     appUpdate.info,
     appUpdate.stage,
     appUpdate.totalBytes,
+    appUpdateHighlights,
     appUpdateNotesSummary,
     appUpdateProgressPercent,
+    appUpdateVersionMeta,
     handleDismissAppUpdate,
     handleInstallAppUpdate,
     handleRestartAppUpdate,

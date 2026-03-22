@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -26,6 +26,7 @@ import { formatBytes, formatBytesPerSecond, formatTimeRemaining } from "@/lib/fo
 import {
   fromRawDownload,
   ipcAddDownload,
+  ipcGetDownloadRows,
   ipcGetEngineSettings,
   ipcOpenDownloadFolder,
   ipcPauseDownload,
@@ -59,11 +60,20 @@ import {
   guessCaptureCategory,
   useDefaultCaptureSavePath,
 } from "@/lib/captureUtils";
+import {
+  describeDuplicateMatch,
+  duplicateResolutionLabel,
+  findDuplicateDownload,
+  getDuplicateResolution,
+  joinTargetPathPreview,
+  suggestAlternativeFilename,
+} from "@/lib/downloadDuplicates";
 import { firstVisibleProbeWarning, simplifyUserMessage } from "@/lib/userFacingMessages";
 import { TransferSegmentStrip } from "@/components/TransferSegmentStrip";
 import { Checkbox } from "@/components/ui/checkbox";
 
 type MonitorTab = "info" | "speed" | "completion";
+type RemovedDownloadEvent = { id: string };
 
 const SPEED_LIMIT_PRESETS_MB = [2, 5, 10, 25, 50, 100] as const;
 const MONITOR_TABS: Array<{ id: MonitorTab; label: string; Icon: typeof Info }> = [
@@ -170,7 +180,8 @@ export function CompactCaptureWindow() {
   const [probeWarningDismissed, setProbeWarningDismissed] = useState(false);
   const [adding, setAdding] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
-  const [isDuplicate, setIsDuplicate] = useState(false);
+  const [duplicateActionPending, setDuplicateActionPending] = useState(false);
+  const [existingDownloads, setExistingDownloads] = useState<Download[]>([]);
 
   const [monitorDownload, setMonitorDownload] = useState<Download | null>(null);
   const [monitorTab, setMonitorTab] = useState<MonitorTab>("info");
@@ -197,6 +208,14 @@ export function CompactCaptureWindow() {
   const lastPayloadKeyRef = useRef("");
   const monitorDownloadId = monitorDownload?.id ?? null;
   const monitorDownloadSpeedLimit = monitorDownload?.speedLimitBytesPerSecond ?? null;
+
+  const refreshExistingDownloads = useCallback(async () => {
+    try {
+      setExistingDownloads(await ipcGetDownloadRows());
+    } catch {
+      // Duplicate checks degrade gracefully if the row snapshot is temporarily unavailable.
+    }
+  }, []);
 
   useEffect(() => {
     savePathRef.current = savePath;
@@ -255,6 +274,43 @@ export function CompactCaptureWindow() {
       void unlistenPromise.then((unlisten) => unlisten()).catch(() => null);
     };
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    void refreshExistingDownloads();
+
+    const unlistenUpsertPromise = listen<RawDownload>("downloads://upsert", (event) => {
+      if (disposed) {
+        return;
+      }
+
+      const updated = fromRawDownload(event.payload);
+      setExistingDownloads((prev) => {
+        const index = prev.findIndex((download) => download.id === updated.id);
+        if (index === -1) {
+          return [updated, ...prev];
+        }
+
+        const next = [...prev];
+        next[index] = updated;
+        return next;
+      });
+    });
+
+    const unlistenRemovePromise = listen<RemovedDownloadEvent>("downloads://remove", (event) => {
+      if (disposed) {
+        return;
+      }
+
+      setExistingDownloads((prev) => prev.filter((download) => download.id !== event.payload.id));
+    });
+
+    return () => {
+      disposed = true;
+      void unlistenUpsertPromise.then((unlisten) => unlisten()).catch(() => null);
+      void unlistenRemovePromise.then((unlisten) => unlisten()).catch(() => null);
+    };
+  }, [refreshExistingDownloads]);
 
   useDefaultCaptureSavePath(true, savePath, setSavePath);
 
@@ -316,7 +372,6 @@ export function CompactCaptureWindow() {
       setProbeError(null);
       setProbeWarningDismissed(false);
       setAddError(null);
-      setIsDuplicate(false);
       void runProbe(
         incoming.url,
         initialName,
@@ -384,13 +439,42 @@ export function CompactCaptureWindow() {
     };
   }, [monitorId]);
 
+  const activateMonitorDownload = useCallback((download: Download) => {
+    setMonitorDownload(download);
+    setLiveSegments(download.segments);
+    setLiveStats({
+      status: download.status,
+      downloaded: download.downloaded,
+      speed: download.speed,
+      timeLeft: download.timeLeft,
+    });
+    setMonitorTab("info");
+    setSegmentsExpanded(false);
+    setAddError(null);
+  }, []);
+
+  const resolvedName = name.trim() || probe?.suggestedName || "";
+  const duplicateMatch = useMemo(
+    () => payload ? findDuplicateDownload(existingDownloads, {
+      url: payload.url,
+      finalUrl: probe?.finalUrl,
+      targetPath: joinTargetPathPreview(savePath, resolvedName),
+      validators: probe?.validators,
+    }) : null,
+    [existingDownloads, payload, probe?.finalUrl, probe?.validators, resolvedName, savePath],
+  );
+  const duplicateResolution = useMemo(
+    () => (duplicateMatch ? getDuplicateResolution(duplicateMatch) : null),
+    [duplicateMatch],
+  );
+
   const handleBrowse = async () => {
     const selected = await openDialog({ directory: true, defaultPath: savePath || undefined });
     if (selected && typeof selected === "string") setSavePath(selected);
   };
 
   const handleAdd = async () => {
-    if (!payload) return;
+    if (!payload || duplicateMatch) return;
     setAdding(true);
     setAddError(null);
     try {
@@ -408,27 +492,48 @@ export function CompactCaptureWindow() {
         resumableHint: probe?.resumable,
         startImmediately: true,
       });
-      // Transition to monitor phase instead of closing.
-      setMonitorDownload(dl);
-      setLiveSegments(dl.segments);
-      setLiveStats({ status: dl.status, downloaded: dl.downloaded, speed: dl.speed, timeLeft: dl.timeLeft });
-      setMonitorTab("info");
-      setSegmentsExpanded(false);
+      activateMonitorDownload(dl);
     } catch (err: unknown) {
       const msg = getCaptureErrorMessage(err);
-      if (msg.toLowerCase().includes("already exists")) setIsDuplicate(true);
+      if (msg.toLowerCase().includes("already exists")) {
+        void refreshExistingDownloads();
+      }
       setAddError(msg);
     } finally {
       setAdding(false);
     }
   };
 
-  const handleRestart = async () => {
-    if (!payload) return;
-    setIsDuplicate(false);
+  const handleDuplicatePrimaryAction = useCallback(async () => {
+    if (!duplicateMatch || !duplicateResolution || duplicateActionPending) {
+      return;
+    }
+
+    setDuplicateActionPending(true);
     setAddError(null);
-    await handleAdd();
-  };
+    try {
+      switch (duplicateResolution) {
+        case "resume":
+          await ipcResumeDownload(duplicateMatch.download.id);
+          break;
+        case "restart":
+          await ipcRestartDownload(duplicateMatch.download.id);
+          break;
+        case "reveal":
+          await ipcOpenDownloadFolder(duplicateMatch.download.id);
+          break;
+        case "inspect":
+          break;
+      }
+
+      activateMonitorDownload(duplicateMatch.download);
+      void refreshExistingDownloads();
+    } catch (error) {
+      setAddError(getCaptureErrorMessage(error));
+    } finally {
+      setDuplicateActionPending(false);
+    }
+  }, [activateMonitorDownload, duplicateActionPending, duplicateMatch, duplicateResolution, refreshExistingDownloads]);
 
   const handleMonitorPause = () => {
     if (!monitorDownload) return;
@@ -1172,7 +1277,6 @@ export function CompactCaptureWindow() {
     : firstVisibleProbeWarning(probe.warnings);
   const captureErrorMessage = addError ?? probeError;
 
-  const resolvedName = name.trim() || probe?.suggestedName || "";
   const sourceBadge = payload ? sourceBadgeLabel(payload.source) : null;
 
   return (
@@ -1261,20 +1365,23 @@ export function CompactCaptureWindow() {
             setAddError(null);
             setProbeError(null);
           }}
-          duplicateActions={{
-            active: isDuplicate,
-            onKeepBoth: () => {
-              setName((prev) => {
-                const dot = prev.lastIndexOf(".");
-                return dot !== -1 ? `${prev.slice(0, dot)} (2)${prev.slice(dot)}` : `${prev} (2)`;
-              });
-              setIsDuplicate(false);
-              setAddError(null);
+          duplicateActions={duplicateMatch && duplicateResolution ? {
+            active: true,
+            title: describeDuplicateMatch(duplicateMatch),
+            primaryLabel: duplicateActionPending && duplicateResolution !== "inspect"
+              ? "Working..."
+              : duplicateResolutionLabel(duplicateResolution, "compact"),
+            onPrimary: () => {
+              void handleDuplicatePrimaryAction();
             },
-            onOverwrite: () => {
-              void handleRestart();
-            },
-          }}
+            secondaryLabel: duplicateMatch.reason === "targetPath" ? "Rename target" : undefined,
+            onSecondary: duplicateMatch.reason === "targetPath"
+              ? () => {
+                setName(suggestAlternativeFilename(resolvedName || duplicateMatch.download.name));
+                setAddError(null);
+              }
+              : undefined,
+          } : undefined}
           hideWarningWhenDuplicate
           fieldIds={{
             category: "capture-category",
@@ -1295,10 +1402,10 @@ export function CompactCaptureWindow() {
         </button>
         <button
           type="button"
-          onClick={handleAdd}
-          disabled={adding || probing}
+          onClick={duplicateMatch ? () => void handleDuplicatePrimaryAction() : handleAdd}
+          disabled={adding || probing || duplicateActionPending}
           style={{
-            background: adding || probing
+            background: adding || probing || duplicateActionPending
               ? "hsl(0,0%,20%)"
               : "linear-gradient(90deg, hsl(var(--accent-h) 22% 32%) 0%, hsl(var(--accent-h) 15% 25%) 55%, hsl(0,0%,18%) 100%)",
           }}
@@ -1308,7 +1415,14 @@ export function CompactCaptureWindow() {
             "disabled:opacity-40 disabled:pointer-events-none",
           )}
         >
-          {adding ? (
+          {duplicateMatch && duplicateResolution ? (
+            <>
+              {duplicateActionPending && duplicateResolution !== "inspect" ? <Loader2 size={10} className="animate-spin" /> : <ArrowDownToLine size={10} />}
+              {duplicateActionPending && duplicateResolution !== "inspect"
+                ? "Working..."
+                : duplicateResolutionLabel(duplicateResolution, "compact")}
+            </>
+          ) : adding ? (
             <><Loader2 size={10} className="animate-spin" /> Adding…</>
           ) : (
             <><ArrowDownToLine size={10} /> Download</>
