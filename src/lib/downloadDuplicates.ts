@@ -127,13 +127,25 @@ export function findDuplicateDownload(
   downloads: Download[],
   input: DuplicateLookupInput,
 ): DuplicateMatch | null {
+  const candidateTargetPath = normalizeComparablePath(input.targetPath);
+
+  if (candidateTargetPath) {
+    for (const download of downloads) {
+      const existingTargetPath = normalizeComparablePath(download.targetPath);
+      if (existingTargetPath && existingTargetPath === candidateTargetPath) {
+        return { download, reason: "targetPath" };
+      }
+    }
+
+    return null;
+  }
+
   const candidateUrls = new Set(
     [normalizeComparableUrl(input.url), normalizeComparableUrl(input.finalUrl)].filter(
       (value): value is string => value != null,
     ),
   );
   const candidateValidators = input.validators;
-  const candidateTargetPath = normalizeComparablePath(input.targetPath);
 
   for (const download of downloads) {
     if (candidateUrls.size > 0) {
@@ -148,13 +160,6 @@ export function findDuplicateDownload(
     if (validatorsMatch(download.validators, candidateValidators)) {
       return { download, reason: "validators" };
     }
-
-    if (candidateTargetPath) {
-      const existingTargetPath = normalizeComparablePath(download.targetPath);
-      if (existingTargetPath && existingTargetPath === candidateTargetPath) {
-        return { download, reason: "targetPath" };
-      }
-    }
   }
 
   return null;
@@ -162,14 +167,14 @@ export function findDuplicateDownload(
 
 export function describeDuplicateMatch(match: DuplicateMatch): string {
   if (match.reason === "targetPath") {
-    return `${match.download.name} is already using this target path.`;
+    return "This file already exists in that folder.";
   }
 
   if (match.reason === "validators") {
-    return `${match.download.name} already matches this remote file's size and resume validators.`;
+    return "This file is already in VDM.";
   }
 
-  return `${match.download.name} already tracks this source URL.`;
+  return "This URL is already in VDM.";
 }
 
 function getExistingDuplicateResolution(match: DuplicateMatch): DuplicateResolutionKind {
@@ -210,7 +215,7 @@ export function duplicateResolutionLabel(
 ): string {
   switch (kind) {
     case "keepBoth":
-      return "Keep both";
+      return surface === "dialog" ? "Use new name" : "Rename copy";
     case "resume":
       return "Resume existing";
     case "restart":

@@ -64,10 +64,19 @@ fn validators_match(existing: &ResumeValidators, requested: &ResumeValidators) -
 }
 
 fn duplicate_download_message(existing: &DownloadRecord, reason: &str) -> String {
-    format!(
-        "Download already exists: '{}' is already {}. Existing status: {:?}.",
-        existing.name, reason, existing.status
-    )
+    match reason {
+        "using the same target file" => format!(
+            "This file already exists as '{}'. Rename it to download another copy.",
+            existing.name
+        ),
+        "tracking the same source URL" => {
+            format!("This URL is already in VDM as '{}'.", existing.name)
+        }
+        "matching the same remote file validators" => {
+            format!("This file is already in VDM as '{}'.", existing.name)
+        }
+        _ => format!("Download already exists: '{}'.", existing.name),
+    }
 }
 
 fn find_duplicate_download<'a>(
@@ -77,6 +86,16 @@ fn find_duplicate_download<'a>(
     requested_validators: Option<&ResumeValidators>,
     target_path: &str,
 ) -> Option<(&'a DownloadRecord, &'static str)> {
+    if !target_path.is_empty() {
+        for existing in downloads {
+            if target_path_matches(&existing.target_path, target_path) {
+                return Some((existing, "using the same target file"));
+            }
+        }
+
+        return None;
+    }
+
     for existing in downloads {
         if urls_overlap(existing, requested_url, final_url) {
             return Some((existing, "tracking the same source URL"));
@@ -86,10 +105,6 @@ fn find_duplicate_download<'a>(
             .is_some_and(|requested| validators_match(&existing.validators, requested))
         {
             return Some((existing, "matching the same remote file validators"));
-        }
-
-        if target_path_matches(&existing.target_path, target_path) {
-            return Some((existing, "using the same target file"));
         }
     }
 
@@ -1304,6 +1319,25 @@ impl EngineState {
 
         self.persist_registry(&registry)?;
         Ok(())
+    }
+
+    pub async fn open_download_file(&self, id: &str) -> Result<(), String> {
+        self.await_bootstrap().await;
+        let registry = self.registry_guard()?;
+        let Some(download) = registry.downloads.iter().find(|d| d.id == id) else {
+            return Err(format!("No download found for id '{id}'."));
+        };
+        if download.status != crate::model::DownloadStatus::Finished {
+            return Err("Cannot open file: download is not finished.".to_string());
+        }
+        let target = Path::new(&download.target_path);
+        if target.exists() {
+            return open_file_with_default_app(target);
+        }
+        Err(format!(
+            "File not found at path '{}'; cannot open.",
+            download.target_path
+        ))
     }
 
     pub async fn open_download_folder(&self, id: &str) -> Result<(), String> {

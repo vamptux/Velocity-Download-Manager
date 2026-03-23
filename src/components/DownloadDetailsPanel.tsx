@@ -43,7 +43,7 @@ import {
   formatTimeRemaining,
 } from "@/lib/format";
 import { calculateDisplayProgress } from "@/lib/downloadProgress";
-import { simplifyUserMessage } from "@/lib/userFacingMessages";
+import { isInternalProbeWarning, simplifyUserMessage } from "@/lib/userFacingMessages";
 import type {
   Download as DownloadItem,
   DownloadLogEntry,
@@ -51,6 +51,7 @@ import type {
   DownloadSegment,
   DownloadStatus,
 } from "@/types/download";
+import { TransferSegmentStrip } from "@/components/TransferSegmentStrip";
 
 interface DownloadDetailsPanelProps {
   selectedDownloads: DownloadItem[];
@@ -134,7 +135,10 @@ function redactUrlDisplay(value: string): string {
 
 function isUserFacingDiagnosticNote(message: string): boolean {
   const lower = message.toLowerCase();
-  return !lower.includes("runtime worker orchestration enabled");
+  return (
+    !lower.includes("runtime worker orchestration enabled") &&
+    !lower.includes("live transfer bootstrap")
+  );
 }
 
 function StatusBadge({ status }: { status: DownloadStatus }) {
@@ -271,72 +275,6 @@ function Field({ label, value }: { label: string; value: string }) {
       <div className="mt-0.5 break-all text-[11px] text-foreground/76">
         {value}
       </div>
-    </div>
-  );
-}
-
-function SegmentRow({
-  segment,
-  sample,
-}: {
-  segment: DownloadSegment;
-  sample?: DownloadItem["runtimeCheckpoint"]["segmentSamples"][number];
-}) {
-  const total = Math.max(segment.end - segment.start + 1, 1);
-  const pct = Math.min(100, (Math.max(0, segment.downloaded) / total) * 100);
-  const isDone = segment.status === "finished";
-  const isActive = segment.status === "downloading";
-  const retryAttempts = sample?.retryAttempts ?? segment.retryAttempts ?? 0;
-  const failureReason = sample?.terminalFailureReason ?? null;
-
-  return (
-    <div
-      className="grid items-center gap-x-2.5 py-[4px]"
-      style={{ gridTemplateColumns: "16px 1fr 14px" }}
-    >
-      <span className="text-right text-[9px] font-mono text-muted-foreground/25 tabular-nums select-none">
-        {segment.id + 1}
-      </span>
-
-      <div className="relative h-[5px] overflow-hidden rounded-full bg-white/[0.06]">
-        <div
-          className={cn(
-            "h-full rounded-full transition-[width] duration-300",
-            isDone
-              ? "bg-[hsl(var(--status-finished))]"
-              : isActive
-                ? "bg-[hsl(var(--status-downloading))]"
-                : "bg-white/[0.12]",
-          )}
-          style={{ width: `${pct}%` }}
-        />
-        {isActive && (
-          <div
-            className="absolute right-0 top-0 h-full w-[14px] rounded-full"
-            style={{
-              background:
-                "linear-gradient(90deg, transparent, hsl(var(--status-downloading)/0.5))",
-            }}
-          />
-        )}
-      </div>
-
-      <span
-        className={cn(
-          "text-center text-[10px] font-bold leading-none",
-          isDone
-            ? "text-[hsl(var(--status-finished)/0.65)]"
-            : isActive
-              ? "text-[hsl(var(--status-downloading)/0.6)]"
-              : failureReason
-                ? "text-[hsl(var(--status-error)/0.5)]"
-                : retryAttempts > 0
-                  ? "text-[hsl(var(--status-paused)/0.55)]"
-                  : "text-muted-foreground/16",
-        )}
-      >
-        {isDone ? "done" : isActive ? "live" : failureReason ? "err" : retryAttempts > 0 ? "r" : "."}
-      </span>
     </div>
   );
 }
@@ -599,6 +537,7 @@ function SingleSelection({
 }) {
   const [tab, setTab] = useState<DetailTab>("general");
   const [panelHeight, setPanelHeight] = useState(210);
+  const [urlCopied, setUrlCopied] = useState(false);
   const isDragging = useRef(false);
 
   function startPanelResize(e: React.MouseEvent) {
@@ -628,16 +567,6 @@ function SingleSelection({
     document.addEventListener("mouseup", onUp);
   }
 
-  const segmentSamplesById = useMemo(
-    () =>
-      new Map(
-        download.runtimeCheckpoint.segmentSamples.map((sample) => [
-          sample.segmentId,
-          sample,
-        ]),
-      ),
-    [download.runtimeCheckpoint.segmentSamples],
-  );
   const progress = calculateDisplayProgress(
     download.downloaded,
     download.size,
@@ -852,7 +781,9 @@ function SingleSelection({
       );
     }
 
-    for (const warning of download.diagnostics.warnings.slice(0, 2)) {
+    for (const warning of download.diagnostics.warnings
+      .filter((w) => !isInternalProbeWarning(w))
+      .slice(0, 2)) {
       push(AlertTriangle, warning, "warn");
     }
 
@@ -1088,12 +1019,18 @@ function SingleSelection({
                     size={10}
                     className="shrink-0 text-muted-foreground/36"
                   />
-                  <span
-                    className="truncate text-muted-foreground/50"
-                    title={displaySourceUrl}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(displaySourceUrl).catch(() => null);
+                      setUrlCopied(true);
+                      window.setTimeout(() => setUrlCopied(false), 1800);
+                    }}
+                    className="min-w-0 truncate text-left text-foreground/60 hover:text-foreground/85 transition-colors"
+                    title={urlCopied ? "Copied!" : `${displaySourceUrl}\nClick to copy`}
                   >
-                    {displaySourceUrl}
-                  </span>
+                    {urlCopied ? "Copied!" : displaySourceUrl}
+                  </button>
                 </div>
               </div>
 
@@ -1151,21 +1088,22 @@ function SingleSelection({
             {download.segments.length > 0 && (
               <>
                 <div className="h-px bg-border/25" />
-                <div className="flex flex-col">
-                  <div className="mb-1.5 text-[9px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/30">
-                    {download.segments.length} Part
-                    {download.segments.length !== 1 ? "s" : ""}
-                  </div>
-                  <div className="flex flex-col divide-y divide-border/15">
-                    {download.segments.map((segment) => (
-                      <SegmentRow
-                        key={segment.id}
-                        segment={segment}
-                        sample={segmentSamplesById.get(segment.id)}
-                      />
-                    ))}
-                  </div>
+                <div className="flex items-center justify-between text-[9px] text-muted-foreground/30 mb-0.5">
+                  <span className="font-semibold uppercase tracking-[0.14em]">
+                    {download.segments.length} Segment{download.segments.length !== 1 ? "s" : ""}
+                  </span>
+                  <span className="tabular-nums">
+                    {download.segments.filter((s) => s.status === "downloading").length} active
+                    {" · "}
+                    {download.segments.filter((s) => s.status === "finished").length} done
+                  </span>
                 </div>
+                <TransferSegmentStrip
+                  segments={download.segments}
+                  compact={false}
+                  barClassName="h-3"
+                  className="gap-[2px]"
+                />
               </>
             )}
           </div>

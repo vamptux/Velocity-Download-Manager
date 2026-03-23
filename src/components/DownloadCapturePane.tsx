@@ -350,6 +350,7 @@ export function ProbeSummaryStrip({
 interface DuplicateActions {
 	active: boolean;
 	title?: string;
+	detail?: string;
 	primaryLabel: string;
 	onPrimary: () => void;
 	secondaryLabel?: string;
@@ -526,12 +527,25 @@ export function DownloadCapturePane({
 
 			<div className="flex flex-col gap-0.5">
 				<CompactFieldLabel htmlFor={ids.filename}>File name</CompactFieldLabel>
-				<CompactInput
-					id={ids.filename}
-					value={filename}
-					onChange={(event) => onFilenameChange(event.target.value)}
-					placeholder={filenamePlaceholder}
-				/>
+				<div className="relative">
+					<CompactInput
+						id={ids.filename}
+						value={filename}
+						onChange={(event) => onFilenameChange(event.target.value)}
+						placeholder={filenamePlaceholder}
+						className={cn(filenameResetVisible && "pr-7")}
+					/>
+					{filenameResetVisible && onFilenameReset ? (
+						<button
+							type="button"
+							title="Reset to auto-detected name"
+							onClick={onFilenameReset}
+							className="absolute right-1 top-1/2 flex h-[18px] w-[18px] -translate-y-1/2 items-center justify-center rounded-[3px] text-muted-foreground/34 transition-colors hover:bg-accent hover:text-foreground/75"
+						>
+							<X size={10} />
+						</button>
+					) : null}
+				</div>
 			</div>
 
 			{showWarning ? (
@@ -544,32 +558,36 @@ export function DownloadCapturePane({
 			) : null}
 
 			{duplicateActive ? (
-				<div className="flex flex-col gap-1">
-					<div className="flex items-center gap-1.5">
-						<AlertTriangle size={10} className="shrink-0 text-[hsl(var(--status-error))]" />
-						<span className="text-[11px] text-[hsl(var(--status-error))]">
-							{duplicateActions?.title ?? "Download already exists"}
-						</span>
+				<div className="flex flex-col gap-1.5 rounded-[4px] border border-[hsl(var(--status-paused)/0.18)] bg-[hsl(var(--status-paused)/0.07)] px-2 py-1.5">
+					<div className="flex items-start gap-1.5">
+						<AlertTriangle size={9} className="mt-[2px] shrink-0 text-[hsl(var(--status-paused))]" />
+						<div className="min-w-0 flex-1">
+							<div className="text-[10.5px] font-medium leading-[1.25] text-foreground/84">
+								{duplicateActions?.title ?? "This file already exists"}
+							</div>
+							{duplicateActions?.detail ? (
+								<div className="mt-[1px] text-[9px] leading-[1.3] text-muted-foreground/46">
+									{duplicateActions.detail}
+								</div>
+							) : null}
+						</div>
 					</div>
-					<div className="flex flex-wrap gap-2">
+					<div className="flex flex-wrap gap-1">
 						<button
 							type="button"
 							onClick={duplicateActions?.onPrimary}
-							className="text-[10.5px] text-primary/80 hover:text-primary underline underline-offset-2 transition-colors"
+							className="rounded-[4px] border border-[hsl(var(--primary)/0.28)] bg-[hsl(var(--primary)/0.08)] px-2 py-[3px] text-[10px] font-medium text-foreground/84 transition-colors hover:bg-[hsl(var(--primary)/0.14)]"
 						>
 							{duplicateActions?.primaryLabel}
 						</button>
 						{duplicateActions?.secondaryLabel && duplicateActions.onSecondary ? (
-							<>
-								<span className="text-muted-foreground/30 text-[11px]">·</span>
-								<button
-									type="button"
-									onClick={duplicateActions.onSecondary}
-									className="text-[10.5px] text-primary/80 hover:text-primary underline underline-offset-2 transition-colors"
-								>
-									{duplicateActions.secondaryLabel}
-								</button>
-							</>
+							<button
+								type="button"
+								onClick={duplicateActions.onSecondary}
+								className="rounded-[4px] border border-border/70 px-2 py-[3px] text-[10px] text-muted-foreground/72 transition-colors hover:bg-accent hover:text-foreground"
+							>
+								{duplicateActions.secondaryLabel}
+							</button>
 						) : null}
 					</div>
 				</div>

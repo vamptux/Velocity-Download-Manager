@@ -297,3 +297,11 @@ export async function ipcSetDownloadCompletionOptions(
 export async function ipcOpenDownloadFolder(id: string): Promise<void> {
   await invoke("open_download_folder", { id });
 }
+
+export async function ipcOpenDownloadFile(id: string): Promise<void> {
+  await invoke("open_download_file", { id });
+}
+
+export async function ipcFocusMainWindow(): Promise<void> {
+  await invoke("focus_main_window");
+}

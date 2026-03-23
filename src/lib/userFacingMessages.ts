@@ -24,6 +24,9 @@ const PROBE_NOISE_PATTERNS = [
   "no content-length",
   "content-length is unavailable",
   "size is unknown",
+  "redirected to a different final url",
+  "transfer startup redirected",
+  "live transfer bootstrap",
 ];
 
 const MESSAGE_REWRITES: Array<{ match: RegExp; replace: string }> = [

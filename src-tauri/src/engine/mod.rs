@@ -48,8 +48,8 @@ use download_identity::{
 };
 use engine_log::append_download_log;
 use file_ops::{
-    acquire_temp_transfer_lock, finalize_download_file, open_in_file_manager,
-    query_available_space, reset_temp_file_path,
+    acquire_temp_transfer_lock, finalize_download_file, open_file_with_default_app,
+    open_in_file_manager, query_available_space, reset_temp_file_path,
 };
 use helpers::{
     clear_download_terminal_state, format_bytes_compact, next_queue_position, non_empty,

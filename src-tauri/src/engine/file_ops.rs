@@ -380,3 +380,34 @@ fn run_file_manager_command(command: &mut Command, path: &Path) -> Result<(), St
         ))
     }
 }
+
+/// Open a file with its default associated application (equivalent to double-clicking in Explorer).
+pub(super) fn open_file_with_default_app(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path_lossy = resolved.to_string_lossy();
+        let clean_path = path_lossy.strip_prefix("\\\\?\\").unwrap_or(&path_lossy).replace('/', "\\");
+        Command::new("cmd")
+            .args(["/c", "start", "", &*clean_path])
+            .spawn()
+            .map_err(|e| format!("Failed to open file '{}': {e}", resolved.display()))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(path.as_os_str())
+            .spawn()
+            .map_err(|e| format!("Failed to open file '{}': {e}", path.display()))?;
+        Ok(())
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(path.as_os_str())
+            .spawn()
+            .map_err(|e| format!("Failed to open file '{}': {e}", path.display()))?;
+        Ok(())
+    }
+}

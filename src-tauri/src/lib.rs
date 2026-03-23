@@ -282,6 +282,20 @@ async fn open_download_folder(id: String, state: State<'_, EngineState>) -> Comm
 }
 
 #[tauri::command]
+async fn open_download_file(id: String, state: State<'_, EngineState>) -> CommandResult<()> {
+    state.inner().open_download_file(&id).await
+}
+
+#[tauri::command]
+fn focus_main_window(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
+#[tauri::command]
 async fn update_engine_settings(
     settings: EngineSettings,
     app: AppHandle,
@@ -359,6 +373,8 @@ pub fn run() {
             set_download_completion_options,
             record_host_telemetry,
             open_download_folder,
+            open_download_file,
+            focus_main_window,
             update_engine_settings,
             take_pending_capture_payload,
         ])

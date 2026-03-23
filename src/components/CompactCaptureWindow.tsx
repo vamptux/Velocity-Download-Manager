@@ -26,8 +26,10 @@ import { formatBytes, formatBytesPerSecond, formatTimeRemaining } from "@/lib/fo
 import {
   fromRawDownload,
   ipcAddDownload,
+  ipcFocusMainWindow,
   ipcGetDownloadRows,
   ipcGetEngineSettings,
+  ipcOpenDownloadFile,
   ipcOpenDownloadFolder,
   ipcPauseDownload,
   ipcProbeDownload,
@@ -76,6 +78,12 @@ import { Checkbox } from "@/components/ui/checkbox";
 type MonitorTab = "info" | "speed" | "completion";
 type RemovedDownloadEvent = { id: string };
 
+const EXECUTABLE_EXTENSIONS = new Set([".exe", ".msi", ".bat", ".cmd", ".dmg", ".pkg", ".deb", ".rpm", ".appimage"]);
+function isExecutable(filename: string): boolean {
+  const dot = filename.lastIndexOf(".");
+  return dot > -1 && EXECUTABLE_EXTENSIONS.has(filename.slice(dot).toLowerCase());
+}
+
 const SPEED_LIMIT_PRESETS_MB = [2, 5, 10, 25, 50, 100] as const;
 const MONITOR_TABS: Array<{ id: MonitorTab; label: string; Icon: typeof Info }> = [
   { id: "info", label: "Info", Icon: Info },
@@ -111,7 +119,7 @@ function sourceBadgeLabel(source: CapturePayload["source"]): string | null {
     case "context-menu":
       return "Context menu";
     case "link-click":
-      return "Link click";
+      return null;
     case "manual":
       return "Manual";
     default:
@@ -459,6 +467,10 @@ export function CompactCaptureWindow() {
   }, []);
 
   const resolvedName = name.trim() || probe?.suggestedName || "";
+  const autoSuggestedName = probe?.suggestedName?.trim() ?? "";
+  const filenameResetVisible = name.trim().length > 0
+    && autoSuggestedName.length > 0
+    && name.trim() !== autoSuggestedName;
   const duplicateMatch = useMemo(
     () => payload ? findDuplicateDownload(existingDownloads, {
       url: payload.url,
@@ -711,6 +723,7 @@ export function CompactCaptureWindow() {
   }, [completionOptionsSaving, mergeMonitorDownload, monitorDownload]);
 
   const focusMainWindow = () => {
+    void ipcFocusMainWindow().catch(() => null);
     void closeWindow();
   };
 
@@ -898,246 +911,242 @@ export function CompactCaptureWindow() {
           )}
 
           {monitorTab === "speed" && (
-            <div className="flex flex-col gap-2.5 pt-0.5">
-              <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-col gap-3 pt-0.5">
+              {/* Speed hero */}
+              <div className="flex items-end justify-between gap-2">
                 <div className="min-w-0">
-                  {isStarting ? (
-                    <div className="font-semibold leading-none text-foreground/55" style={{ fontSize: "20px" }}>
-                      Preparing…
-                    </div>
-                  ) : (
-                    <div
-                      key={Math.floor(live.speed / (64 * 1024))}
-                      className="animate-speed-pop tabular-nums font-semibold leading-none"
-                      style={{
-                        fontSize: "22px",
-                        color: live.speed > 0
-                          ? "hsl(var(--foreground) / 0.88)"
-                          : "hsl(var(--muted-foreground) / 0.32)",
-                      }}
-                    >
-                      {formatBytesPerSecond(live.speed, { idleLabel: "— B/s" })}
-                    </div>
-                  )}
-                  <div className="mt-0.5 text-[9.5px] text-muted-foreground/38">
-                    {isStarting ? "opening connection" : "live transfer rate"}
+                  <div
+                    key={Math.floor(live.speed / (64 * 1024))}
+                    className={cn(
+                      "animate-speed-pop tabular-nums font-semibold leading-none tracking-[-0.02em]",
+                      isStarting && "text-foreground/38",
+                    )}
+                    style={{
+                      fontSize: "28px",
+                      color: !isStarting && live.speed > 0
+                        ? "hsl(var(--foreground) / 0.9)"
+                        : undefined,
+                    }}
+                  >
+                    {isStarting ? "—" : formatBytesPerSecond(live.speed, { idleLabel: "0 B/s" })}
+                  </div>
+                  <div className="mt-[3px] text-[9px] uppercase tracking-[0.1em] text-muted-foreground/32">
+                    {isStarting ? "connecting" : "per second"}
                   </div>
                 </div>
-
-                <div className="flex shrink-0 flex-col items-end gap-0.5">
-                  <span className="text-[8.5px] uppercase tracking-[0.1em] text-muted-foreground/32">Cap</span>
+                <div className="flex shrink-0 flex-col items-end gap-1 pb-[2px]">
                   <span className={cn(
-                    "rounded-[4px] border px-1.5 py-[2px] text-[11px] font-semibold tabular-nums",
+                    "rounded-[4px] border px-1.5 py-[3px] text-[11px] font-semibold tabular-nums",
                     effectiveSpeedLimit
                       ? currentSpeedLimit
                         ? "border-[hsl(var(--status-downloading)/0.4)] bg-[hsl(var(--status-downloading)/0.12)] text-[hsl(var(--status-downloading))]"
-                        : "border-border/60 bg-white/[0.04] text-foreground/76"
-                      : "border-[hsl(var(--status-finished)/0.3)] bg-[hsl(var(--status-finished)/0.1)] text-[hsl(var(--status-finished))]",
+                        : "border-border/55 bg-white/[0.04] text-foreground/68"
+                      : "border-[hsl(var(--status-finished)/0.28)] bg-[hsl(var(--status-finished)/0.08)] text-[hsl(var(--status-finished)/0.9)]",
                   )}>
                     {effectiveSpeedLimit
                       ? formatBytesPerSecond(effectiveSpeedLimit, { idleLabel: "—" })
                       : "Unlimited"}
                   </span>
-                  <span className="text-[8.5px] text-muted-foreground/32">{speedLimitModeLabel}</span>
+                  <span className="text-[9px] text-muted-foreground/28">{speedLimitModeLabel}</span>
                 </div>
               </div>
 
-                {effectiveSpeedLimit != null && speedLimitUtilization != null && (
-                  <div>
-                    <div className="mb-[3px] flex items-center justify-between text-[9px] text-muted-foreground/32">
-                      <span>Cap utilization</span>
-                      <span className="tabular-nums">{speedLimitUtilization}%</span>
-                    </div>
-                    <div className="h-[3px] overflow-hidden rounded-full bg-border/35">
-                      <div
-                        className="h-full rounded-full bg-[linear-gradient(90deg,hsl(var(--primary)),hsl(198,85%,58%))] transition-[width] duration-300"
-                        style={{ width: `${speedLimitUtilization}%` }}
-                      />
-                    </div>
-                  </div>
-                )}
-
-                <div className="border-t border-border/20" />
-
-                <div className="flex flex-col gap-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[10px] font-medium text-foreground/65">Per-download override</span>
-                    <div className="flex items-center rounded-[5px] border border-border/60 bg-black/15 p-[2px]">
-                      <button
-                        type="button"
-                        onClick={() => void handleSetUnlimited()}
-                        disabled={transferOptionsSaving}
-                        className={cn(
-                          "rounded-[3px] px-2.5 py-[3px] text-[10px] font-medium leading-none transition-colors",
-                          !speedLimitEnabled
-                            ? "bg-[hsl(var(--status-finished)/0.2)] text-[hsl(var(--status-finished))]"
-                            : "text-muted-foreground/50 hover:text-foreground/72",
-                        )}
-                      >
-                        Use default
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setSpeedLimitEnabled(true);
-                          setTransferOptionsError(null);
-                          setTransferOptionsNotice(null);
-                        }}
-                        className={cn(
-                          "rounded-[3px] px-2.5 py-[3px] text-[10px] font-medium leading-none transition-colors",
-                          speedLimitEnabled
-                            ? "bg-[hsl(var(--status-downloading)/0.18)] text-[hsl(var(--status-downloading))]"
-                            : "text-muted-foreground/50 hover:text-foreground/72",
-                        )}
-                      >
-                        Override
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="text-[10px] leading-[1.45] text-muted-foreground/48">
-                    {currentSpeedLimit != null
-                      ? "This download is using its own manual cap and will override the global default."
-                      : usingGlobalSpeedLimit
-                        ? `Using the global cap of ${formatBytesPerSecond(effectiveSpeedLimit, { idleLabel: "—" })}.`
-                        : "No global cap is set, so this download is currently unlimited."}
-                  </div>
-
-                  {speedLimitEnabled && (
-                    <div className="flex items-center gap-1.5">
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.1"
-                        disabled={transferOptionsSaving}
-                        value={speedLimitValue}
-                        onChange={(event) => {
-                          setSpeedLimitValue(event.target.value);
-                          setTransferOptionsError(null);
-                          setTransferOptionsNotice(null);
-                        }}
-                        className="h-[27px] min-w-0 flex-1 rounded-[5px] border border-border/65 bg-black/20 px-2 text-[12px] tabular-nums text-foreground/85 outline-none focus:border-[hsl(var(--status-downloading)/0.55)] transition-colors"
-                      />
-                      <select
-                        disabled={transferOptionsSaving}
-                        value={speedLimitUnit}
-                        onChange={(event) => {
-                          setSpeedLimitUnit(event.target.value as SpeedLimitUnit);
-                          setTransferOptionsError(null);
-                          setTransferOptionsNotice(null);
-                        }}
-                        className="h-[27px] w-[64px] shrink-0 rounded-[5px] border border-border/65 bg-black/20 px-1.5 text-[11px] text-foreground/85 outline-none transition-colors"
-                      >
-                        <option value="kb">KB/s</option>
-                        <option value="mb">MB/s</option>
-                        <option value="gb">GB/s</option>
-                      </select>
-                      <button
-                        type="button"
-                        onClick={() => void handleApplySpeedLimit()}
-                        disabled={transferOptionsSaving || (!speedLimitDirty && draftSpeedLimit.error == null)}
-                        className={cn(
-                          "flex h-[27px] shrink-0 items-center justify-center rounded-[5px] px-3 text-[11px] font-medium transition-colors",
-                          transferOptionsSaving || (!speedLimitDirty && draftSpeedLimit.error == null)
-                            ? "cursor-not-allowed border border-border/50 bg-black/10 text-muted-foreground/30"
-                            : "border border-[hsl(var(--status-downloading)/0.4)] bg-[hsl(var(--status-downloading)/0.14)] text-[hsl(var(--status-downloading))] hover:bg-[hsl(var(--status-downloading)/0.22)]",
-                        )}
-                      >
-                        {transferOptionsSaving ? <Loader2 size={11} className="animate-spin" /> : "Apply"}
-                      </button>
-                    </div>
-                  )}
-
-                  <div className="flex flex-wrap gap-1">
-                    {SPEED_LIMIT_PRESETS_MB.map((preset) => {
-                      const presetBytes = preset * SPEED_LIMIT_UNIT_FACTORS.mb;
-                      return (
-                        <button
-                          key={preset}
-                          type="button"
-                          onClick={() => void handleSetSpeedLimitPreset(presetBytes)}
-                          className={cn(
-                            "rounded-[999px] border px-2 py-[2px] text-[10px] font-medium transition-colors",
-                            currentSpeedLimit === presetBytes
-                              ? "border-[hsl(var(--status-downloading)/0.4)] bg-[hsl(var(--status-downloading)/0.14)] text-[hsl(var(--status-downloading))]"
-                              : "border-border/55 bg-black/10 text-muted-foreground/55 hover:border-border/80 hover:text-foreground/78",
-                          )}
-                        >
-                          {preset} MB/s
-                        </button>
-                      );
-                    })}
-                  </div>
-
-                  {transferOptionsError && (
-                    <InlineNotice
-                      tone="error"
-                      message={simplifyUserMessage(transferOptionsError)}
-                      onDismiss={() => setTransferOptionsError(null)}
-                      className="rounded-[5px] px-2 py-1.5 text-[10.5px]"
+              {effectiveSpeedLimit != null && speedLimitUtilization != null && (
+                <div>
+                  <div className="h-[2px] overflow-hidden rounded-full bg-border/30">
+                    <div
+                      className="h-full rounded-full bg-[linear-gradient(90deg,hsl(var(--primary)),hsl(198,85%,58%))] transition-[width] duration-300"
+                      style={{ width: `${speedLimitUtilization}%` }}
                     />
-                  )}
-                  {!transferOptionsError && transferOptionsNotice && (
-                    <InlineNotice
-                      tone="success"
-                      message={transferOptionsNotice}
-                      onDismiss={() => setTransferOptionsNotice(null)}
-                      className="rounded-[5px] px-2 py-1.5 text-[10.5px]"
-                    />
-                  )}
+                  </div>
+                  <div className="mt-[3px] flex justify-between text-[9px] text-muted-foreground/28">
+                    <span>Utilization</span>
+                    <span className="tabular-nums">{speedLimitUtilization}%</span>
+                  </div>
+                </div>
+              )}
+
+              <div className="h-px bg-border/20" />
+
+              <div className="flex flex-col gap-2">
+                {/* Override toggle */}
+                <div className="flex items-center gap-2">
+                  <span className="flex-1 text-[10px] font-medium text-foreground/58">Per-download cap</span>
+                  <div className="flex items-center gap-px rounded-[4px] border border-border/50 bg-black/20 p-px">
+                    <button
+                      type="button"
+                      onClick={() => void handleSetUnlimited()}
+                      disabled={transferOptionsSaving}
+                      className={cn(
+                        "rounded-[3px] px-2.5 py-[4px] text-[10px] font-medium transition-colors",
+                        !speedLimitEnabled
+                          ? "bg-white/[0.08] text-foreground/80"
+                          : "text-muted-foreground/40 hover:text-foreground/62",
+                      )}
+                    >
+                      Default
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSpeedLimitEnabled(true);
+                        setTransferOptionsError(null);
+                        setTransferOptionsNotice(null);
+                      }}
+                      className={cn(
+                        "rounded-[3px] px-2.5 py-[4px] text-[10px] font-medium transition-colors",
+                        speedLimitEnabled
+                          ? "bg-[hsl(var(--status-downloading)/0.18)] text-[hsl(var(--status-downloading))]"
+                          : "text-muted-foreground/40 hover:text-foreground/62",
+                      )}
+                    >
+                      Override
+                    </button>
+                  </div>
                 </div>
 
-                {totalSize != null && totalSize > 0 && (
-                  <>
-                    <div className="border-t border-border/20" />
-                    <div className="grid grid-cols-2 gap-x-3 gap-y-[3px] text-[11px]">
-                      <span className="text-muted-foreground/42">Downloaded</span>
-                      <span className="tabular-nums text-right text-foreground/68">{formatBytes(live.downloaded)}</span>
-                      <span className="text-muted-foreground/42">Remaining</span>
-                      <span className="tabular-nums text-right text-foreground/68">
-                        {formatBytes(Math.max(0, totalSize - live.downloaded))}
-                      </span>
-                      <span className="text-muted-foreground/42">Progress</span>
-                      <span className="tabular-nums text-right text-foreground/68">{pct?.toFixed(1) ?? "0"}%</span>
-                      {live.timeLeft != null && live.timeLeft > 0 && (
-                        <>
-                          <span className="text-muted-foreground/42">ETA</span>
-                          <span className="tabular-nums text-right text-foreground/68">
-                            {formatTimeRemaining(live.timeLeft, { emptyLabel: "—" })}
-                          </span>
-                        </>
+                <div className="text-[9.5px] leading-[1.5] text-muted-foreground/40">
+                  {currentSpeedLimit != null
+                    ? "This download uses its own cap, overriding the global default."
+                    : usingGlobalSpeedLimit
+                      ? `Global cap: ${formatBytesPerSecond(effectiveSpeedLimit!, { idleLabel: "—" })}.`
+                      : "No cap set — download is unlimited."}
+                </div>
+
+                {speedLimitEnabled && (
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.1"
+                      disabled={transferOptionsSaving}
+                      value={speedLimitValue}
+                      onChange={(event) => {
+                        setSpeedLimitValue(event.target.value);
+                        setTransferOptionsError(null);
+                        setTransferOptionsNotice(null);
+                      }}
+                      className="h-[27px] min-w-0 flex-1 rounded-[4px] border border-border/65 bg-black/20 px-2 text-[12px] tabular-nums text-foreground/85 outline-none focus:border-[hsl(var(--status-downloading)/0.55)] transition-colors"
+                    />
+                    <select
+                      disabled={transferOptionsSaving}
+                      value={speedLimitUnit}
+                      onChange={(event) => {
+                        setSpeedLimitUnit(event.target.value as SpeedLimitUnit);
+                        setTransferOptionsError(null);
+                        setTransferOptionsNotice(null);
+                      }}
+                      className="h-[27px] w-[64px] shrink-0 rounded-[4px] border border-border/65 bg-black/20 px-1.5 text-[11px] text-foreground/85 outline-none transition-colors"
+                    >
+                      <option value="kb">KB/s</option>
+                      <option value="mb">MB/s</option>
+                      <option value="gb">GB/s</option>
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => void handleApplySpeedLimit()}
+                      disabled={transferOptionsSaving || (!speedLimitDirty && draftSpeedLimit.error == null)}
+                      className={cn(
+                        "flex h-[27px] shrink-0 items-center justify-center rounded-[4px] px-3 text-[11px] font-medium transition-colors",
+                        transferOptionsSaving || (!speedLimitDirty && draftSpeedLimit.error == null)
+                          ? "cursor-not-allowed border border-border/50 bg-black/10 text-muted-foreground/30"
+                          : "border border-[hsl(var(--status-downloading)/0.4)] bg-[hsl(var(--status-downloading)/0.14)] text-[hsl(var(--status-downloading))] hover:bg-[hsl(var(--status-downloading)/0.22)]",
                       )}
-                      {effectiveSpeedLimit != null && (
-                        <>
-                          <span className="text-muted-foreground/42">Headroom</span>
-                          <span className="tabular-nums text-right text-foreground/68">
-                            {formatBytesPerSecond(Math.max(0, effectiveSpeedLimit - live.speed), { idleLabel: "0 B/s" })}
-                          </span>
-                        </>
-                      )}
-                    </div>
-                  </>
+                    >
+                      {transferOptionsSaving ? <Loader2 size={11} className="animate-spin" /> : "Apply"}
+                    </button>
+                  </div>
                 )}
+
+                <div className="flex flex-wrap gap-1">
+                  {SPEED_LIMIT_PRESETS_MB.map((preset) => {
+                    const presetBytes = preset * SPEED_LIMIT_UNIT_FACTORS.mb;
+                    return (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => void handleSetSpeedLimitPreset(presetBytes)}
+                        className={cn(
+                          "rounded-[4px] border px-2 py-[3px] text-[10px] font-medium transition-colors",
+                          currentSpeedLimit === presetBytes
+                            ? "border-[hsl(var(--status-downloading)/0.4)] bg-[hsl(var(--status-downloading)/0.14)] text-[hsl(var(--status-downloading))]"
+                            : "border-border/55 bg-black/10 text-muted-foreground/55 hover:border-border/80 hover:text-foreground/78",
+                        )}
+                      >
+                        {preset} MB/s
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {transferOptionsError && (
+                  <InlineNotice
+                    tone="error"
+                    message={simplifyUserMessage(transferOptionsError)}
+                    onDismiss={() => setTransferOptionsError(null)}
+                    className="rounded-[5px] px-2 py-1.5 text-[10.5px]"
+                  />
+                )}
+                {!transferOptionsError && transferOptionsNotice && (
+                  <InlineNotice
+                    tone="success"
+                    message={transferOptionsNotice}
+                    onDismiss={() => setTransferOptionsNotice(null)}
+                    className="rounded-[5px] px-2 py-1.5 text-[10.5px]"
+                  />
+                )}
+              </div>
+
+              {totalSize != null && totalSize > 0 && (
+                <>
+                  <div className="h-px bg-border/20" />
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-[3px] text-[11px]">
+                    <span className="text-muted-foreground/42">Downloaded</span>
+                    <span className="tabular-nums text-right text-foreground/68">{formatBytes(live.downloaded)}</span>
+                    <span className="text-muted-foreground/42">Remaining</span>
+                    <span className="tabular-nums text-right text-foreground/68">
+                      {formatBytes(Math.max(0, totalSize - live.downloaded))}
+                    </span>
+                    <span className="text-muted-foreground/42">Progress</span>
+                    <span className="tabular-nums text-right text-foreground/68">{pct?.toFixed(1) ?? "0"}%</span>
+                    {live.timeLeft != null && live.timeLeft > 0 && (
+                      <>
+                        <span className="text-muted-foreground/42">ETA</span>
+                        <span className="tabular-nums text-right text-foreground/68">
+                          {formatTimeRemaining(live.timeLeft, { emptyLabel: "—" })}
+                        </span>
+                      </>
+                    )}
+                    {effectiveSpeedLimit != null && (
+                      <>
+                        <span className="text-muted-foreground/42">Headroom</span>
+                        <span className="tabular-nums text-right text-foreground/68">
+                          {formatBytesPerSecond(Math.max(0, effectiveSpeedLimit - live.speed), { idleLabel: "0 B/s" })}
+                        </span>
+                      </>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           )}
 
           {monitorTab === "completion" && (
-            <div className="flex flex-col gap-2.5 pt-0.5">
-              <div className="flex items-start gap-2.5">
-                <Checkbox
-                  checked={dl.openFolderOnCompletion}
-                  disabled={completionOptionsSaving}
-                  onChange={(checked) => { void handleToggleOpenFolderOnCompletion(checked); }}
-                  className="mt-[1px] shrink-0"
-                />
+            <div className="flex flex-col gap-3 pt-0.5">
+              <div className="flex items-center justify-between gap-2 rounded-[6px] border border-border/40 bg-black/10 px-2.5 py-2">
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[11px] font-medium text-foreground/82">Open folder on finish</span>
-                    {completionOptionsSaving && <Loader2 size={10} className="animate-spin text-muted-foreground/45" />}
+                  <div className="text-[11px] font-medium text-foreground/80">Open folder on finish</div>
+                  <div className="mt-[2px] text-[9.5px] text-muted-foreground/42">
+                    Reveals the file in Explorer when done.
                   </div>
-                  <div className="mt-0.5 text-[10px] leading-[1.4] text-muted-foreground/45">
-                    Reveals the file in Explorer as soon as the download finishes.
-                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {completionOptionsSaving && <Loader2 size={10} className="animate-spin text-muted-foreground/45" />}
+                  <Checkbox
+                    checked={dl.openFolderOnCompletion}
+                    disabled={completionOptionsSaving}
+                    onChange={(checked) => { void handleToggleOpenFolderOnCompletion(checked); }}
+                  />
                 </div>
               </div>
 
@@ -1150,16 +1159,16 @@ export function CompactCaptureWindow() {
                 />
               )}
 
-              <div className="border-t border-border/20" />
+              <div className="h-px bg-border/20" />
 
               <div className="flex flex-wrap gap-1.5">
                 <button
                   type="button"
                   onClick={focusMainWindow}
-                  className="flex items-center gap-1.5 rounded-[5px] border border-border/60 bg-black/10 px-2.5 py-1.5 text-[11px] text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground/82"
+                  className="flex items-center gap-1.5 rounded-[5px] border border-[hsl(var(--primary)/0.35)] bg-[hsl(var(--primary)/0.1)] px-2.5 py-1.5 text-[11px] text-[hsl(var(--primary))] transition-colors hover:bg-[hsl(var(--primary)/0.18)]"
                 >
                   <ExternalLink size={11} />
-                  View in VDM
+                  Open in VDM
                 </button>
                 {isFinished && (
                   <button
@@ -1217,6 +1226,20 @@ export function CompactCaptureWindow() {
           <div className="flex-1" />
           {isFinished ? (
             <>
+              {isExecutable(dl.name) && (
+                <button
+                  type="button"
+                  onClick={() => void ipcOpenDownloadFile(dl.id).catch(() => null)}
+                  className={cn(
+                    "flex h-[26px] items-center gap-1.5 rounded-[3px] px-3 text-[11.5px] font-medium transition-colors",
+                    "bg-[linear-gradient(180deg,hsl(var(--primary)/0.28),hsl(var(--primary)/0.16))]",
+                    "border border-[hsl(var(--primary)/0.38)] text-[hsl(var(--primary))] hover:brightness-125",
+                  )}
+                >
+                  <Play size={10} />
+                  Open
+                </button>
+              )}
               <button
                 type="button"
                 onClick={handleOpenFolder}
@@ -1334,7 +1357,7 @@ export function CompactCaptureWindow() {
       <div className="flex flex-1 flex-col gap-1.5 p-2 overflow-y-auto min-h-0">
         <div
           className={cn(
-            "flex items-center gap-1.5 rounded-[3px] border px-2 h-[26px] min-w-0 transition-[border-color] duration-200",
+            "flex items-center gap-2 rounded-[4px] border px-2.5 h-[30px] min-w-0 transition-[border-color] duration-200",
             "bg-[hsl(var(--card))]",
             probing
               ? "border-primary/30"
@@ -1347,17 +1370,17 @@ export function CompactCaptureWindow() {
         >
           <span className="shrink-0">
             {probing ? (
-              <Loader2 size={11} className="animate-spin text-primary/50" />
+              <Loader2 size={13} className="animate-spin text-primary/50" />
             ) : probe && !probeError ? (
-              <ShieldCheck size={11} className="text-emerald-500/70" />
+              <ShieldCheck size={13} className="text-emerald-500/76" />
             ) : probeError ? (
-              <AlertTriangle size={11} className="text-yellow-500/55" />
+              <AlertTriangle size={13} className="text-yellow-500/58" />
             ) : (
-              <ShieldCheck size={11} className="text-muted-foreground/18" />
+              <ShieldCheck size={13} className="text-muted-foreground/22" />
             )}
           </span>
           <span
-            className="min-w-0 flex-1 truncate text-[11px] text-foreground/58 font-mono"
+            className="min-w-0 flex-1 truncate text-[11.5px] text-foreground/62 font-mono"
             title={payload?.url}
           >
             {truncateUrl(payload?.url ?? "")}
@@ -1365,7 +1388,7 @@ export function CompactCaptureWindow() {
         </div>
 
         <div className="flex flex-wrap items-center gap-1">
-          <span className="rounded-[3px] border border-border/70 bg-[hsl(var(--card))] px-1.5 py-px text-[10px] text-muted-foreground/60 font-mono">
+          <span className="rounded-[3px] border border-white/[0.14] bg-white/[0.07] px-1.5 py-px text-[10px] text-foreground/70 font-mono">
             {hostFromUrl(payload?.url ?? "")}
           </span>
           {sourceBadge && (
@@ -1384,7 +1407,7 @@ export function CompactCaptureWindow() {
             </span>
           )}
           {probe?.hostDiagnostics?.negotiatedProtocol && (
-            <span className="rounded-[3px] border border-border/50 bg-[hsl(var(--card))] px-1.5 py-px text-[10px] text-muted-foreground/50 uppercase tracking-widest font-mono">
+            <span className="rounded-[3px] border border-[hsl(var(--status-downloading)/0.32)] bg-[hsl(var(--status-downloading)/0.09)] px-1.5 py-px text-[10px] text-[hsl(var(--status-downloading)/0.82)] uppercase tracking-widest font-mono">
               {probe.hostDiagnostics.negotiatedProtocol}
             </span>
           )}
@@ -1416,6 +1439,9 @@ export function CompactCaptureWindow() {
           duplicateActions={duplicateMatch && duplicateResolution ? {
             active: true,
             title: describeDuplicateMatch(duplicateMatch),
+            detail: duplicateMatch.reason === "targetPath"
+              ? "Rename it to save another copy."
+              : undefined,
             primaryLabel: duplicateActionPending && duplicateResolution !== "inspect" && duplicateResolution !== "keepBoth"
               ? "Working..."
               : duplicateResolutionLabel(duplicateResolution, "compact"),
@@ -1434,6 +1460,10 @@ export function CompactCaptureWindow() {
               : undefined,
           } : undefined}
           hideWarningWhenDuplicate
+          filenameResetVisible={filenameResetVisible}
+          onFilenameReset={() => {
+            setName(probe?.suggestedName ?? "");
+          }}
           fieldIds={{
             category: "capture-category",
             savePath: "capture-savepath",
