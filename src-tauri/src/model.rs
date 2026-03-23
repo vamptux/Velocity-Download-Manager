@@ -35,45 +35,6 @@ pub struct ResumeValidators {
     pub content_disposition: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[serde(rename_all = "camelCase")]
-pub enum ChecksumAlgorithm {
-    Md5,
-    Sha1,
-    Sha256,
-    Sha512,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct ChecksumSpec {
-    pub algorithm: ChecksumAlgorithm,
-    pub value: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
-#[serde(rename_all = "camelCase")]
-pub enum IntegrityState {
-    #[default]
-    None,
-    Pending,
-    Verifying,
-    Verified,
-    Mismatch,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct DownloadIntegrity {
-    #[serde(default)]
-    pub expected: Option<ChecksumSpec>,
-    pub actual: Option<String>,
-    #[serde(default)]
-    pub state: IntegrityState,
-    pub message: Option<String>,
-    pub checked_at: Option<i64>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadCapabilities {
@@ -494,8 +455,6 @@ pub struct DownloadRecord {
     #[serde(default)]
     pub compatibility: DownloadCompatibility,
     #[serde(default)]
-    pub integrity: DownloadIntegrity,
-    #[serde(default)]
     pub diagnostics: DownloadDiagnostics,
     #[serde(default)]
     pub segments: Vec<DownloadSegment>,
@@ -587,8 +546,6 @@ pub struct AddDownloadArgs {
     pub request_method: DownloadRequestMethod,
     #[serde(default)]
     pub request_form_fields: Vec<DownloadRequestField>,
-    #[serde(default)]
-    pub checksum: Option<ChecksumSpec>,
     #[serde(default)]
     pub size_hint_bytes: Option<u64>,
     #[serde(default)]

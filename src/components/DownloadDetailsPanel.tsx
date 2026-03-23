@@ -34,12 +34,9 @@ import {
   failureKindLabel,
   formatCooldownLabel,
   hostLockLabel,
-  integrityBadgeLabel,
-  integrityStateLabel,
   statusLabel,
   targetConnectionCount,
 } from "@/lib/downloadPresentation";
-import { checksumAlgorithmLabel } from "../lib/checksum";
 import {
   formatBytes,
   formatBytesPerSecond,
@@ -49,7 +46,6 @@ import { calculateDisplayProgress } from "@/lib/downloadProgress";
 import { simplifyUserMessage } from "@/lib/userFacingMessages";
 import type {
   Download as DownloadItem,
-  DownloadIntegrity,
   DownloadLogEntry,
   DownloadLogLevel,
   DownloadSegment,
@@ -93,63 +89,6 @@ function formatLogTime(timestamp: number): string {
     minute: "2-digit",
     second: "2-digit",
   });
-}
-
-function integrityBadgeTone(
-  integrity: DownloadIntegrity,
-): "neutral" | "good" | "warn" | "error" {
-  if (!integrity.expected && integrity.actual) {
-    return "neutral";
-  }
-
-  switch (integrity.state) {
-    case "verified":
-      return "good";
-    case "verifying":
-    case "pending":
-      return "warn";
-    case "mismatch":
-      return "error";
-    case "none":
-      return "neutral";
-  }
-}
-
-function integrityActualLabel(integrity: DownloadIntegrity): string {
-  if (integrity.actual) {
-    return integrity.actual;
-  }
-
-  switch (integrity.state) {
-    case "verifying":
-      return "Computing";
-    case "pending":
-      return "Pending";
-    case "mismatch":
-      return "Unavailable";
-    case "verified":
-      return "Unavailable";
-    case "none":
-      return "Not requested";
-  }
-}
-
-function integrityStatusValue(integrity: DownloadIntegrity): string {
-  if (!integrity.expected) {
-    if (integrity.state === "verifying") {
-      return "Computing";
-    }
-    if (integrity.actual) {
-      return "Captured";
-    }
-    return "Automatic";
-  }
-
-  return integrityStateLabel(integrity.state);
-}
-
-function integrityAlgorithmValue(integrity: DownloadIntegrity): string {
-  return checksumAlgorithmLabel(integrity.expected?.algorithm ?? "sha256");
 }
 
 function isSensitiveQueryKey(key: string): boolean {
@@ -708,7 +647,6 @@ function SingleSelection({
   const sourceUrl =
     download.finalUrl !== download.url ? download.finalUrl : download.url;
   const displaySourceUrl = redactUrlDisplay(sourceUrl);
-  const integrityBadge = integrityBadgeLabel(download.integrity);
   const CategoryIcon = CATEGORY_ICONS[download.category];
   const categoryIconColor = CATEGORY_ICON_COLORS[download.category];
   const recentLogEntries = download.engineLog.slice(-20).reverse();
@@ -1235,33 +1173,6 @@ function SingleSelection({
 
         {tab === "log" && (
           <div className="flex flex-col gap-2.5 px-4 py-3">
-            {download.integrity.expected || download.integrity.actual || download.integrity.state === "verifying" ? (
-              <Section title="Integrity">
-                <div className="grid grid-cols-3 gap-1.5">
-                  <Field
-                    label="Status"
-                    value={integrityStatusValue(download.integrity)}
-                  />
-                  <Field
-                    label="Algorithm"
-                    value={integrityAlgorithmValue(download.integrity)}
-                  />
-                  <Field
-                    label="Hash"
-                    value={integrityActualLabel(download.integrity)}
-                  />
-                </div>
-                {integrityBadge ? (
-                  <div className="mt-1">
-                    <CapabilityBadge
-                      label={integrityBadge}
-                      tone={integrityBadgeTone(download.integrity)}
-                    />
-                  </div>
-                ) : null}
-              </Section>
-            ) : null}
-
             <Section title="Engine Log">
               <div className="flex flex-col">
                 {recentLogEntries.length > 0 ? (

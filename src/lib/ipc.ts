@@ -5,7 +5,6 @@ import type {
   AppUpdateStartupHealth,
   AddDownloadArgs as BackendAddDownloadArgs,
   CapturePayload,
-  ChecksumSpec,
   Download,
   DownloadContentCategory,
   DownloadRecord,
@@ -199,7 +198,6 @@ export interface IpcAddArgs {
   requestCookies?: string | null;
   requestMethod?: DownloadRequestMethod;
   requestFormFields?: DownloadRequestField[];
-  checksum?: ChecksumSpec;
   sizeHintBytes?: number;
   rangeSupportedHint?: boolean;
   resumableHint?: boolean;
@@ -223,7 +221,6 @@ export async function ipcAddDownload(args: IpcAddArgs): Promise<Download> {
     requestCookies: args.requestCookies ?? null,
     requestMethod: args.requestMethod ?? "get",
     requestFormFields: args.requestFormFields ?? [],
-    checksum: args.checksum ?? null,
     sizeHintBytes: args.sizeHintBytes ?? null,
     rangeSupportedHint: args.rangeSupportedHint ?? null,
     resumableHint: args.resumableHint ?? null,
@@ -268,16 +265,6 @@ export async function ipcStartQueue(): Promise<QueueState> {
 
 export async function ipcStopQueue(): Promise<QueueState> {
   return invoke<QueueState>("stop_queue");
-}
-
-export async function ipcSetDownloadChecksum(id: string, checksum: ChecksumSpec | null): Promise<Download> {
-  const raw = await invoke<RawDownload>("set_download_checksum", { id, checksum });
-  return fromRawDownload(raw);
-}
-
-export async function ipcVerifyDownloadChecksum(id: string): Promise<Download> {
-  const raw = await invoke<RawDownload>("verify_download_checksum", { id });
-  return fromRawDownload(raw);
 }
 
 export async function ipcSetDownloadSchedule(id: string, scheduledFor: number | null): Promise<Download> {

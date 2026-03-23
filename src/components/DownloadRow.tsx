@@ -1,7 +1,6 @@
 import { memo, useState } from "react";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import * as Dialog from "@radix-ui/react-dialog";
-import * as Select from "@radix-ui/react-select";
 import {
   ArrowDown,
   ArrowUp,
@@ -13,13 +12,8 @@ import {
   Clock3,
   Play,
   Pause,
-  RefreshCw,
   RotateCcw,
   Trash2,
-  Shield,
-  ShieldOff,
-  ChevronDown,
-  Check,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -36,13 +30,10 @@ import {
   CATEGORY_ICON_BG,
   CATEGORY_ICON_COLORS,
   CATEGORY_LABELS,
-  integrityStatusDetail,
-  integritySummaryLabel,
   stallReasonLabel,
   STATUS_META,
   targetConnectionCount,
 } from "@/lib/downloadPresentation";
-import { checksumAlgorithmLabel, parseChecksumInput } from "../lib/checksum";
 import {
   formatBytes,
   formatBytesPerSecond,
@@ -58,75 +49,10 @@ import {
   ipcPauseDownload,
   ipcRestartDownload,
   ipcResumeDownload,
-  ipcSetDownloadChecksum,
   ipcSetDownloadSchedule,
-  ipcVerifyDownloadChecksum,
 } from "@/lib/ipc";
 import { writeClipboardText } from "@/lib/clipboard";
-import type { ChecksumAlgorithm, Download } from "@/types/download";
-
-const CHECKSUM_ALGORITHMS: { value: ChecksumAlgorithm; label: string }[] = [
-  { value: "sha256", label: "SHA-256" },
-  { value: "sha512", label: "SHA-512" },
-  { value: "sha1", label: "SHA-1" },
-  { value: "md5", label: "MD5" },
-];
-
-function AlgorithmSelect({
-  value,
-  onChange,
-}: {
-  value: ChecksumAlgorithm;
-  onChange: (v: ChecksumAlgorithm) => void;
-}) {
-  return (
-    <Select.Root
-      value={value}
-      onValueChange={(v) => onChange(v as ChecksumAlgorithm)}
-    >
-      <Select.Trigger
-        className={cn(
-          "flex items-center justify-between rounded-md border border-border bg-[hsl(var(--card))] px-3 h-8 text-[12.5px] text-foreground outline-none w-full",
-          "focus:border-primary/60 focus:ring-1 focus:ring-primary/30 transition-colors",
-        )}
-      >
-        <Select.Value />
-        <Select.Icon>
-          <ChevronDown size={13} className="opacity-50" />
-        </Select.Icon>
-      </Select.Trigger>
-      <Select.Portal>
-        <Select.Content
-          position="popper"
-          sideOffset={4}
-          className={cn(
-            "z-[200] w-[var(--radix-select-trigger-width)] rounded-md border border-border py-1",
-            "bg-[hsl(var(--card))] shadow-xl shadow-black/40",
-            "data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
-          )}
-        >
-          <Select.Viewport>
-            {CHECKSUM_ALGORITHMS.map((algo) => (
-              <Select.Item
-                key={algo.value}
-                value={algo.value}
-                className={cn(
-                  "flex items-center justify-between px-3 py-[5px] text-[12px] cursor-default outline-none rounded-sm mx-0.5",
-                  "text-foreground/80 data-[highlighted]:bg-accent data-[highlighted]:text-foreground",
-                )}
-              >
-                <Select.ItemText>{algo.label}</Select.ItemText>
-                <Select.ItemIndicator>
-                  <Check size={12} className="text-primary" />
-                </Select.ItemIndicator>
-              </Select.Item>
-            ))}
-          </Select.Viewport>
-        </Select.Content>
-      </Select.Portal>
-    </Select.Root>
-  );
-}
+import type { Download } from "@/types/download";
 
 function transferModeLabel(download: Download): string {
   const restartLabel = restartRequirementLabel(download);
@@ -273,23 +199,6 @@ function formatScheduledSummary(timestamp: number | null | undefined): string {
   });
 }
 
-function formatChecksumCheckedAt(timestamp: number | null | undefined): string {
-  if (timestamp == null || !Number.isFinite(timestamp) || timestamp <= 0) {
-    return "Not checked yet";
-  }
-
-  return new Date(timestamp).toLocaleString([], {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
-function formatChecksumActionLabel(download: Download): string {
-  return download.integrity.expected ? "Verify now" : "Recompute SHA-256";
-}
-
 export interface DownloadRowProps {
   download: Download;
   index: number;
@@ -345,22 +254,15 @@ export const DownloadRow = memo(function DownloadRow({
     download.queuePosition > 0 ? `#${download.queuePosition}` : null;
   const transferMode = transferModeLabel(download);
   const restartLabel = restartRequirementLabel(download);
-  const integritySummary = integritySummaryLabel(download);
   const isAlt = index % 2 !== 0;
   const simplifiedErrorMessage = download.errorMessage
     ? simplifyUserMessage(download.errorMessage)
     : null;
   const summaryText =
-    download.status === "error" && download.integrity.state === "mismatch"
-      ? `${integritySummary ?? "Checksum mismatch"} · ${download.host || CATEGORY_LABELS[download.category]}`
-      : download.status === "error" && simplifiedErrorMessage
+    download.status === "error" && simplifiedErrorMessage
       ? simplifiedErrorMessage
       : download.diagnostics.restartRequired
         ? `${restartLabel ?? "Restart only"} · ${download.host || CATEGORY_LABELS[download.category]}`
-      : integritySummary && download.host
-        ? `${download.host} · ${transferMode} · ${integritySummary}`
-      : integritySummary
-        ? `${CATEGORY_LABELS[download.category]} · ${transferMode} · ${integritySummary}`
       : download.host
         ? `${download.host} · ${transferMode}`
         : `${CATEGORY_LABELS[download.category]} · ${transferMode}`;
@@ -368,98 +270,19 @@ export const DownloadRow = memo(function DownloadRow({
   const stallReason = stallReasonLabel(download);
   const statusDetail =
     stallReason
-    ?? integrityStatusDetail(download)
     ?? restartLabel
     ?? (isFinalizing ? "Flushing to disk" : null)
     ?? (showProgress && pct > 0 ? `${Math.round(smoothedPct)}%` : null);
 
-  const [csOpen, setCsOpen] = useState(false);
-  const [csAlgorithm, setCsAlgorithm] = useState<ChecksumAlgorithm>("sha256");
-  const [csValue, setCsValue] = useState("");
-  const [csBusyAction, setCsBusyAction] = useState<"save" | "verify" | null>(null);
-  const [csError, setCsError] = useState<string | null>(null);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleValue, setScheduleValue] = useState("");
   const [scheduleSaving, setScheduleSaving] = useState(false);
   const [scheduleError, setScheduleError] = useState<string | null>(null);
 
-  function openChecksumDialog() {
-    const existing = download.integrity.expected;
-    setCsAlgorithm(existing?.algorithm ?? "sha256");
-    setCsValue(existing?.value ?? "");
-    setCsError(null);
-    setCsOpen(true);
-  }
-
-  function applyDetectedChecksumInput(rawValue: string): boolean {
-    const parsed = parseChecksumInput(rawValue);
-    if (!parsed.checksum) {
-      return false;
-    }
-
-    setCsAlgorithm(parsed.checksum.algorithm);
-    setCsValue(parsed.checksum.value);
-    setCsError(null);
-    return true;
-  }
-
   function openScheduleDialog() {
     setScheduleValue(formatScheduleInputValue(download.scheduledFor));
     setScheduleError(null);
     setScheduleOpen(true);
-  }
-
-  async function handleChecksumSave(e: React.FormEvent) {
-    e.preventDefault();
-    setCsBusyAction("save");
-    setCsError(null);
-    try {
-      const parsedChecksum = parseChecksumInput(csValue);
-      if (csValue.trim() && !parsedChecksum.checksum) {
-        throw new Error(parsedChecksum.error ?? "Failed to parse checksum.");
-      }
-      if (parsedChecksum.checksum) {
-        setCsAlgorithm(parsedChecksum.checksum.algorithm);
-        setCsValue(parsedChecksum.checksum.value);
-      }
-      await ipcSetDownloadChecksum(
-        download.id,
-        parsedChecksum.checksum
-          ? parsedChecksum.checksum
-          : null,
-      );
-      setCsOpen(false);
-      onRefresh();
-    } catch (err) {
-      setCsError(
-        err instanceof Error
-          ? err.message
-          : typeof err === "string"
-            ? err
-            : "Failed to set checksum.",
-      );
-    } finally {
-      setCsBusyAction(null);
-    }
-  }
-
-  async function handleChecksumVerify() {
-    setCsBusyAction("verify");
-    setCsError(null);
-    try {
-      await ipcVerifyDownloadChecksum(download.id);
-      onRefresh();
-    } catch (err) {
-      setCsError(
-        err instanceof Error
-          ? err.message
-          : typeof err === "string"
-            ? err
-            : "Failed to verify checksum.",
-      );
-    } finally {
-      setCsBusyAction(null);
-    }
   }
 
   async function handleScheduleSave(e: React.FormEvent) {
@@ -688,11 +511,6 @@ export const DownloadRow = memo(function DownloadRow({
               onSelect={copyUrl}
             />
             <MenuItem
-              icon={Shield}
-              label="Checksum info…"
-              onSelect={openChecksumDialog}
-            />
-            <MenuItem
               icon={Clock3}
               label="Schedule start…"
               onSelect={openScheduleDialog}
@@ -777,161 +595,6 @@ export const DownloadRow = memo(function DownloadRow({
           </ContextMenu.Content>
         </ContextMenu.Portal>
       </ContextMenu.Root>
-
-      <Dialog.Root open={csOpen} onOpenChange={setCsOpen}>
-        <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-[100] bg-black/50 backdrop-blur-[2px] data-[state=open]:animate-in data-[state=open]:fade-in-0" />
-          <Dialog.Content
-            className={cn(
-              "fixed left-1/2 top-1/2 z-[101] -translate-x-1/2 -translate-y-1/2",
-              "w-[420px] rounded-lg border border-border bg-[hsl(var(--background))] shadow-2xl shadow-black/60 outline-none",
-              "data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
-            )}
-          >
-            <div className="flex items-center justify-between border-b border-border px-4 py-3">
-              <div className="flex items-center gap-2">
-                <Shield
-                  size={13}
-                  className="text-muted-foreground/60"
-                  strokeWidth={1.8}
-                />
-                <Dialog.Title className="text-[13px] font-semibold text-foreground">
-                  Checksum
-                </Dialog.Title>
-              </div>
-              <Dialog.Close className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground transition-colors">
-                <X size={13} strokeWidth={2} />
-              </Dialog.Close>
-            </div>
-            <form
-              onSubmit={(e) => void handleChecksumSave(e)}
-              className="flex flex-col gap-2.5 px-4 py-4"
-            >
-              <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2 text-[11px] leading-relaxed text-foreground/78">
-                <div>
-                  {download.integrity.expected
-                    ? (download.integrity.message ?? integrityStatusDetail(download) ?? "Checksum ready")
-                    : download.integrity.actual
-                      ? (download.integrity.message ?? "VDM computed a SHA-256 fingerprint automatically for this finished file.")
-                      : "VDM computes SHA-256 automatically after completion. Add a published checksum here only when you want a match or mismatch check."}
-                </div>
-                {download.integrity.expected || download.integrity.actual ? (
-                  <div className="mt-1 text-muted-foreground/58">
-                    Last checked: {formatChecksumCheckedAt(download.integrity.checkedAt)}
-                  </div>
-                ) : null}
-              </div>
-              <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-2">
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
-                    Algorithm
-                  </label>
-                  <AlgorithmSelect
-                    value={csAlgorithm}
-                    onChange={setCsAlgorithm}
-                  />
-                </div>
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
-                    Expected hash
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="Paste raw hash, sha256:..., or checksum-file line"
-                    value={csValue}
-                    onChange={(e) => {
-                      setCsValue(e.target.value);
-                      setCsError(null);
-                    }}
-                    onPaste={(event) => {
-                      const pastedText = event.clipboardData.getData("text");
-                      if (applyDetectedChecksumInput(pastedText)) {
-                        event.preventDefault();
-                      }
-                    }}
-                    spellCheck={false}
-                    autoCapitalize="none"
-                    autoCorrect="off"
-                    className={cn(
-                      "w-full rounded-md border border-border bg-[hsl(var(--card))] px-3 h-8 text-[12px] text-foreground placeholder:text-muted-foreground/40 outline-none",
-                      "focus:border-primary/60 focus:ring-1 focus:ring-primary/30 transition-colors",
-                    )}
-                  />
-                </div>
-              </div>
-              {download.integrity.expected || download.integrity.actual ? (
-                <div className="grid grid-cols-1 gap-1.5 text-[11px]">
-                  {download.integrity.expected ? (
-                    <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
-                      <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Expected</div>
-                      <div className="mt-1 text-[10px] text-muted-foreground/45">{checksumAlgorithmLabel(download.integrity.expected.algorithm)}</div>
-                      <div className="mt-1 break-all text-foreground/80">{download.integrity.expected.value}</div>
-                    </div>
-                  ) : null}
-                  {download.integrity.actual ? (
-                    <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2">
-                      <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Computed</div>
-                      <div className="mt-1 text-[10px] text-muted-foreground/45">{checksumAlgorithmLabel(download.integrity.expected?.algorithm ?? "sha256")}</div>
-                      <div className="mt-1 break-all text-foreground/80">{download.integrity.actual}</div>
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
-              {download.integrity.expected ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCsValue("");
-                  }}
-                  className="flex items-center gap-1.5 self-start text-[11px] text-muted-foreground/55 hover:text-muted-foreground transition-colors"
-                >
-                  <ShieldOff size={11} strokeWidth={1.8} />
-                  Clear existing checksum
-                </button>
-              ) : null}
-              {csError ? (
-                <div className="rounded-md border border-[hsl(var(--status-error)/0.26)] bg-[hsl(var(--status-error)/0.08)] px-3 py-2 text-[11.5px] text-[hsl(var(--status-error))]">
-                  {csError}
-                </div>
-              ) : null}
-              <div className="flex items-center justify-end gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={() => void handleChecksumVerify()}
-                  disabled={
-                    csBusyAction !== null
-                    || download.status !== "finished"
-                    || download.integrity.state === "verifying"
-                  }
-                  className="h-7 px-3 rounded-md border border-border text-[12px] text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:opacity-40"
-                >
-                  {csBusyAction === "verify" ? (
-                    <span className="inline-flex items-center gap-1.5">
-                      <RefreshCw size={11} className="animate-spin" strokeWidth={1.8} />
-                      Verifying…
-                    </span>
-                  ) : formatChecksumActionLabel(download)}
-                </button>
-                <Dialog.Close asChild>
-                  <button
-                    type="button"
-                    className="h-7 px-3 rounded-md border border-border text-[12px] text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
-                  >
-                    Cancel
-                  </button>
-                </Dialog.Close>
-                <button
-                  type="submit"
-                  disabled={csBusyAction !== null}
-                  className="h-7 px-4 rounded-md bg-primary hover:bg-primary/90 text-primary-foreground text-[12px] font-medium transition-colors disabled:opacity-40"
-                >
-                  {csBusyAction === "save" ? "Saving…" : "Save expected hash"}
-                </button>
-              </div>
-            </form>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
 
       <Dialog.Root open={scheduleOpen} onOpenChange={setScheduleOpen}>
         <Dialog.Portal>

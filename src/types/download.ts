@@ -7,15 +7,12 @@ import type { AppUpdateProgressEvent as BackendAppUpdateProgressEvent } from "./
 import type { AppUpdateStartupHealth as BackendAppUpdateStartupHealth } from "./generated/backend/AppUpdateStartupHealth";
 import type { AppUpdateStartupHealthStatus as BackendAppUpdateStartupHealthStatus } from "./generated/backend/AppUpdateStartupHealthStatus";
 import type { CapturePayload as BackendCapturePayload } from "./generated/backend/CapturePayload";
-import type { ChecksumAlgorithm as BackendChecksumAlgorithm } from "./generated/backend/ChecksumAlgorithm";
-import type { ChecksumSpec as BackendChecksumSpec } from "./generated/backend/ChecksumSpec";
 import type { DownloadCapabilities as BackendDownloadCapabilities } from "./generated/backend/DownloadCapabilities";
 import type { DownloadCategory as BackendDownloadContentCategory } from "./generated/backend/DownloadCategory";
 import type { DownloadCompatibility as BackendDownloadCompatibility } from "./generated/backend/DownloadCompatibility";
 import type { DownloadCompletedEvent as BackendDownloadCompletedEvent } from "./generated/backend/DownloadCompletedEvent";
 import type { DownloadDiagnostics as BackendDownloadDiagnostics } from "./generated/backend/DownloadDiagnostics";
 import type { DownloadFailureKind as BackendDownloadFailureKind } from "./generated/backend/DownloadFailureKind";
-import type { DownloadIntegrity as BackendDownloadIntegrity } from "./generated/backend/DownloadIntegrity";
 import type { DownloadLogEntry as BackendDownloadLogEntry } from "./generated/backend/DownloadLogEntry";
 import type { DownloadLogLevel as BackendDownloadLogLevel } from "./generated/backend/DownloadLogLevel";
 import type { DownloadProgressDiffEvent as BackendDownloadProgressDiffEvent } from "./generated/backend/DownloadProgressDiffEvent";
@@ -30,7 +27,6 @@ import type { DownloadSegmentStatus as BackendDownloadSegmentStatus } from "./ge
 import type { DownloadStatus as BackendDownloadStatus } from "./generated/backend/DownloadStatus";
 import type { EngineSettings as BackendEngineSettings } from "./generated/backend/EngineSettings";
 import type { HostDiagnosticsSummary as BackendHostDiagnosticsSummary } from "./generated/backend/HostDiagnosticsSummary";
-import type { IntegrityState as BackendIntegrityState } from "./generated/backend/IntegrityState";
 import type { ProbeDownloadArgs as BackendProbeDownloadArgs } from "./generated/backend/ProbeDownloadArgs";
 import type { ProbeResult as BackendProbeResult } from "./generated/backend/ProbeResult";
 import type { QueueState as BackendQueueState } from "./generated/backend/QueueState";
@@ -70,10 +66,6 @@ export type DownloadRuntimeSegmentSample = Jsonify<BackendDownloadRuntimeSegment
 export type DownloadRuntimeRaceState = Jsonify<BackendDownloadRuntimeRaceState>;
 export type DownloadRuntimeCheckpoint = Jsonify<BackendDownloadRuntimeCheckpoint>;
 export type ResumeValidators = Jsonify<BackendResumeValidators>;
-export type ChecksumAlgorithm = Jsonify<BackendChecksumAlgorithm>;
-export type ChecksumSpec = Jsonify<BackendChecksumSpec>;
-export type IntegrityState = Jsonify<BackendIntegrityState>;
-export type DownloadIntegrity = Jsonify<BackendDownloadIntegrity>;
 export type DownloadFailureKind = Jsonify<BackendDownloadFailureKind>;
 export type DownloadLogLevel = Jsonify<BackendDownloadLogLevel>;
 export type DownloadLogEntry = Jsonify<BackendDownloadLogEntry>;

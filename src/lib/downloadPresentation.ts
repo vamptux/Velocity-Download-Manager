@@ -14,15 +14,12 @@ import {
   StopCircle,
   type LucideIcon,
 } from "lucide-react";
-import { checksumAlgorithmLabel } from "./checksum";
 import { formatDurationShort } from "@/lib/format";
 import type {
   Download,
   DownloadCategory,
   DownloadFailureKind,
-  DownloadIntegrity,
   DownloadStatus,
-  IntegrityState,
 } from "@/types/download";
 
 export type StatusMeta = {
@@ -127,60 +124,6 @@ export function targetConnectionCount(download: Download): number {
   return Math.max(download.targetConnections, 1);
 }
 
-export function integritySummaryLabel(
-  download: Pick<Download, "integrity">,
-): string | null {
-  const expected = download.integrity.expected;
-  if (!expected) {
-    if (download.integrity.state === "verifying") {
-      return "Hashing SHA-256";
-    }
-    if (download.integrity.actual) {
-      return "SHA-256 ready";
-    }
-    return null;
-  }
-
-  const algorithm = checksumAlgorithmLabel(expected.algorithm);
-  switch (download.integrity.state) {
-    case "verified":
-      return `${algorithm} verified`;
-    case "verifying":
-      return `Verifying ${algorithm}`;
-    case "mismatch":
-      return `${algorithm} mismatch`;
-    case "pending":
-    case "none":
-      return null;
-  }
-}
-
-export function integrityStatusDetail(
-  download: Pick<Download, "integrity">,
-): string | null {
-  if (!download.integrity.expected) {
-    if (download.integrity.state === "verifying") {
-      return "Hashing SHA-256";
-    }
-    if (download.integrity.actual) {
-      return "SHA-256 ready";
-    }
-    return null;
-  }
-
-  switch (download.integrity.state) {
-    case "verified":
-      return "Verified";
-    case "verifying":
-      return "Verifying";
-    case "mismatch":
-      return "Mismatch";
-    case "pending":
-    case "none":
-      return null;
-  }
-}
-
 export function failureKindLabel(
   kind: DownloadFailureKind | null,
 ): string | null {
@@ -194,48 +137,6 @@ export function failureKindLabel(
     case "fileSystem":
       return "File system failure";
     default:
-      return null;
-  }
-}
-
-export function integrityStateLabel(state: IntegrityState): string {
-  switch (state) {
-    case "none":
-      return "Not requested";
-    case "pending":
-      return "Queued";
-    case "verifying":
-      return "Verifying";
-    case "verified":
-      return "Verified";
-    case "mismatch":
-      return "Mismatch";
-  }
-}
-
-export function integrityBadgeLabel(
-  integrity: DownloadIntegrity,
-): string | null {
-  if (!integrity.expected) {
-    if (integrity.state === "verifying") {
-      return "Computing SHA-256";
-    }
-    if (integrity.actual) {
-      return "SHA-256 fingerprint ready";
-    }
-    return null;
-  }
-
-  switch (integrity.state) {
-    case "pending":
-      return "Checksum queued";
-    case "verifying":
-      return "Verifying checksum";
-    case "verified":
-      return "Checksum verified";
-    case "mismatch":
-      return "Checksum mismatch";
-    case "none":
       return null;
   }
 }

@@ -299,14 +299,6 @@ pub(super) async fn run_unknown_size_stream_runtime(
                     "runtime.finished",
                     "Completed the guarded single-stream transfer and finalized the file.",
                 );
-                if download.integrity.expected.is_some() {
-                    append_download_log(
-                        download,
-                        DownloadLogLevel::Info,
-                        "integrity.verify-pending",
-                        "Triggering checksum verification after completion.",
-                    );
-                }
                 clear_runtime_checkpoint(download);
                 HostTelemetryArgs {
                     host: download.host.clone(),
@@ -337,7 +329,6 @@ pub(super) async fn run_unknown_size_stream_runtime(
             engine.emit_download_upsert(&response);
             engine.trigger_download_completion_actions(&response);
             engine.apply_runtime_dispatch_plan(dispatch_plan, min_emit_interval_ms);
-            engine.spawn_checksum_verification(response.id.clone());
         }
         Err(error) => {
             let runtime_telemetry_snapshot = runtime_telemetry

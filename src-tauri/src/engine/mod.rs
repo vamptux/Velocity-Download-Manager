@@ -18,7 +18,6 @@ mod helpers;
 mod host_planner;
 mod http_helpers;
 pub mod http_pool;
-mod integrity;
 mod operations;
 mod persistence;
 mod persistence_queue;
@@ -62,10 +61,6 @@ use host_planner::{
     effective_connection_target_for_scope, host_diagnostics_summary_for_scope,
     initial_target_connections_for_scope, profile_warning_for_scope,
 };
-use integrity::{
-    apply_integrity_result, compute_checksum, mark_integrity_failure, mark_integrity_verifying,
-    normalize_checksum_spec, reset_integrity_for_expected, AUTOMATIC_CHECKSUM_ALGORITHM,
-};
 use persistence::{load_registry_snapshot, snapshot_path};
 use persistence_queue::{PersistPriority, SnapshotPersistQueue};
 use probe::{normalize_protocol_label, probe_download_headers_with_context};
@@ -83,13 +78,12 @@ use settings_policy::sanitize_engine_settings;
 use wake_lock::WakeLockController;
 
 use crate::model::{
-    AddDownloadArgs, AppUpdateStartupHealth, ChecksumSpec, DownloadCapabilities,
-    DownloadCompatibility, DownloadDiagnostics, DownloadFailureKind, DownloadIntegrity,
-    DownloadLogEntry, DownloadLogLevel, DownloadRecord, DownloadRequestField,
-    DownloadRequestMethod, DownloadRuntimeCheckpoint, DownloadSegment,
-    DownloadSegmentStatus, DownloadStatus, EngineSettings, HostProfile, HostTelemetryArgs,
-    ProbeDownloadArgs, ProbeResult, QueueState, RegistrySnapshot, ReorderDirection,
-    TrafficMode,
+    AddDownloadArgs, AppUpdateStartupHealth, DownloadCapabilities, DownloadCompatibility,
+    DownloadDiagnostics, DownloadFailureKind, DownloadLogEntry, DownloadLogLevel,
+    DownloadRecord, DownloadRequestField, DownloadRequestMethod, DownloadRuntimeCheckpoint,
+    DownloadSegment, DownloadSegmentStatus, DownloadStatus, EngineSettings, HostProfile,
+    HostTelemetryArgs, ProbeDownloadArgs, ProbeResult, QueueState, RegistrySnapshot,
+    ReorderDirection, TrafficMode,
 };
 
 const DEFAULT_QUEUE: &str = "default";
@@ -124,7 +118,6 @@ struct EngineInner {
     bootstrap_notify: Notify,
     progress_sync: Mutex<ProgressSyncState>,
     runtime_tasks: Mutex<BTreeMap<String, JoinHandle<()>>>,
-    integrity_tasks: Mutex<BTreeMap<String, JoinHandle<()>>>,
     dispatch_wake_task: Mutex<Option<JoinHandle<()>>>,
     dispatch_wake_at_ms: Mutex<Option<i64>>,
     download_limiters: Mutex<BTreeMap<String, Arc<TokenBucketRateLimiter>>>,
@@ -608,7 +601,6 @@ impl EngineState {
                 bootstrap_notify: Notify::new(),
                 progress_sync: Mutex::new(ProgressSyncState::default()),
                 runtime_tasks: Mutex::new(BTreeMap::new()),
-                integrity_tasks: Mutex::new(BTreeMap::new()),
                 dispatch_wake_task: Mutex::new(None),
                 dispatch_wake_at_ms: Mutex::new(None),
                 download_limiters: Mutex::new(BTreeMap::new()),
@@ -1056,144 +1048,6 @@ impl EngineState {
         });
     }
 
-    async fn run_checksum_verification(&self, id: &str) -> Result<(), String> {
-        let (target_path, expected, algorithm) = {
-            let mut registry = self.registry_guard()?;
-            let Some(download) = registry
-                .downloads
-                .iter_mut()
-                .find(|download| download.id == id)
-            else {
-                return Ok(());
-            };
-            if !matches!(download.status, DownloadStatus::Finished) {
-                return Ok(());
-            }
-
-            mark_integrity_verifying(&mut download.integrity);
-            append_download_log(
-                download,
-                DownloadLogLevel::Info,
-                if download.integrity.expected.is_some() {
-                    "integrity.verify-started"
-                } else {
-                    "integrity.fingerprint-started"
-                },
-                if download.integrity.expected.is_some() {
-                    "Started checksum verification for the completed file."
-                } else {
-                    "Started automatic SHA-256 calculation for the completed file."
-                },
-            );
-
-            let response = download.clone();
-            self.persist_registry(&registry)?;
-            drop(registry);
-            self.emit_download_upsert(&response);
-            let expected = response.integrity.expected.clone();
-            let algorithm = expected
-                .as_ref()
-                .map(|value| value.algorithm.clone())
-                .unwrap_or(AUTOMATIC_CHECKSUM_ALGORITHM);
-            (PathBuf::from(response.target_path), expected, algorithm)
-        };
-
-        let actual_result = compute_checksum(target_path, algorithm.clone()).await;
-
-        let mut registry = self.registry_guard()?;
-        let Some(download) = registry
-            .downloads
-            .iter_mut()
-            .find(|download| download.id == id)
-        else {
-            return Ok(());
-        };
-        if !matches!(download.status, DownloadStatus::Finished) {
-            return Ok(());
-        }
-        if download.integrity.expected != expected {
-            return Ok(());
-        }
-
-        match actual_result {
-            Ok(actual) => {
-                let matched = expected.as_ref().map(|value| actual == value.value);
-                let detail = match (&expected, matched) {
-                    (Some(expected), Some(true)) => format!(
-                        "Verified {} checksum for the completed file.",
-                        expected.value
-                    ),
-                    (Some(expected), Some(false)) => format!(
-                        "Checksum mismatch: expected {} but computed {}.",
-                        expected.value, actual
-                    ),
-                    _ => "Computed SHA-256 fingerprint for the completed file.".to_string(),
-                };
-                apply_integrity_result(
-                    &mut download.integrity,
-                    actual,
-                    matched,
-                    unix_epoch_millis(),
-                );
-                append_download_log(
-                    download,
-                    if matched.unwrap_or(true) {
-                        DownloadLogLevel::Info
-                    } else {
-                        DownloadLogLevel::Warn
-                    },
-                    match matched {
-                        Some(true) => "integrity.verified",
-                        Some(false) => "integrity.mismatch",
-                        None => "integrity.fingerprint-ready",
-                    },
-                    detail.clone(),
-                );
-                if matched == Some(false)
-                    && !download
-                        .diagnostics
-                        .warnings
-                        .iter()
-                        .any(|value| value == &detail)
-                {
-                    download.diagnostics.warnings.push(detail);
-                }
-            }
-            Err(error) => {
-                let detail = if expected.is_some() {
-                    format!("Checksum verification failed: {error}")
-                } else {
-                    format!("Automatic SHA-256 calculation failed: {error}")
-                };
-                mark_integrity_failure(&mut download.integrity, &error, unix_epoch_millis());
-                append_download_log(
-                    download,
-                    DownloadLogLevel::Error,
-                    if expected.is_some() {
-                        "integrity.verify-failed"
-                    } else {
-                        "integrity.fingerprint-failed"
-                    },
-                    detail.clone(),
-                );
-                if !download
-                    .diagnostics
-                    .warnings
-                    .iter()
-                    .any(|value| value == &detail)
-                {
-                    download.diagnostics.warnings.push(detail);
-                }
-            }
-        }
-
-        let response = download.clone();
-        self.persist_registry(&registry)?;
-        drop(registry);
-        self.emit_download_upsert(&response);
-        Ok(())
-    }
-
     fn record_runtime_task_failure(&self, id: &str, error: &str) {
         let Ok(mut registry) = self.registry_guard() else {
             return;
@@ -1234,14 +1088,6 @@ impl EngineState {
         self.apply_runtime_dispatch_plan(dispatch_plan, min_emit_interval_ms);
     }
 
-    fn abort_integrity_task(&self, id: &str) {
-        if let Ok(mut tasks) = self.inner.integrity_tasks.lock()
-            && let Some(handle) = tasks.remove(id)
-        {
-            handle.abort();
-        }
-    }
-
     fn abort_runtime_task(&self, id: &str) {
         if let Ok(mut tasks) = self.inner.runtime_tasks.lock()
             && let Some(handle) = tasks.remove(id)
@@ -1254,31 +1100,6 @@ impl EngineState {
         if let Ok(mut tasks) = self.inner.runtime_tasks.lock() {
             for handle in std::mem::take(&mut *tasks).into_values() {
                 handle.abort();
-            }
-        }
-    }
-
-    fn spawn_checksum_verification(&self, id: String) {
-        if let Ok(tasks) = self.inner.integrity_tasks.lock()
-            && tasks.contains_key(&id)
-        {
-            return;
-        }
-
-        let engine = self.clone();
-        let task_id = id.clone();
-        let handle = tokio::spawn(async move {
-            let _ = engine.run_checksum_verification(&task_id).await;
-            if let Ok(mut tasks) = engine.inner.integrity_tasks.lock() {
-                tasks.remove(&task_id);
-            }
-        });
-        match self.inner.integrity_tasks.lock() {
-            Ok(mut tasks) => {
-                tasks.insert(id, handle);
-            }
-            Err(_) => {
-                drop(handle);
             }
         }
     }

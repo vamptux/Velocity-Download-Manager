@@ -10,8 +10,7 @@ use engine::{
     EngineState, StartupSnapshot,
 };
 use model::{
-    AddDownloadArgs, AppUpdateCheckResult, AppUpdateInfo, ChecksumSpec, DownloadRecord,
-    EngineSettings,
+    AddDownloadArgs, AppUpdateCheckResult, AppUpdateInfo, DownloadRecord, EngineSettings,
     HostTelemetryArgs, ProbeDownloadArgs, ProbeResult, QueueState, ReorderDirection,
 };
 use tauri::{AppHandle, Manager, State};
@@ -230,28 +229,6 @@ async fn stop_queue(app: AppHandle, state: State<'_, EngineState>) -> CommandRes
 }
 
 #[tauri::command]
-async fn set_download_checksum(
-    id: String,
-    checksum: Option<ChecksumSpec>,
-    app: AppHandle,
-    state: State<'_, EngineState>,
-) -> CommandResult<DownloadRecord> {
-    state
-        .inner()
-        .set_download_checksum(&app, &id, checksum)
-        .await
-}
-
-#[tauri::command]
-async fn verify_download_checksum(
-    id: String,
-    app: AppHandle,
-    state: State<'_, EngineState>,
-) -> CommandResult<DownloadRecord> {
-    state.inner().verify_download_checksum(&app, &id).await
-}
-
-#[tauri::command]
 async fn set_download_schedule(
     id: String,
     scheduled_for: Option<i64>,
@@ -377,8 +354,6 @@ pub fn run() {
             reorder_download,
             start_queue,
             stop_queue,
-            set_download_checksum,
-            verify_download_checksum,
             set_download_schedule,
             set_download_transfer_options,
             set_download_completion_options,

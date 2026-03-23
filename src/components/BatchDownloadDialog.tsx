@@ -137,7 +137,6 @@ export function BatchDownloadDialog({
             name: row.filename,
             category: row.category,
             savePath: row.folder,
-            checksum: row.checksum ?? undefined,
             startImmediately: row.startImmediately,
           });
           addedDownloads.push(download);
@@ -233,7 +232,7 @@ export function BatchDownloadDialog({
                 autoFocus
               />
               <div className="text-[11px] text-muted-foreground/55">
-                Rows without a folder use {defaultSavePath || "your default download directory"}. Supported columns: url, folder, filename, checksum, category, start mode.
+                Rows without a folder use {defaultSavePath || "your default download directory"}. Supported columns: url, folder, filename, category, start mode.
               </div>
             </div>
 
@@ -314,16 +313,6 @@ export function BatchDownloadDialog({
                             <input
                               value={draftRowByLine.get(row.lineNumber)?.folder ?? row.folder}
                               onChange={(event) => updateDraftRow(row.lineNumber, { folder: event.target.value })}
-                              className="rounded-md border border-border/60 bg-black/20 px-2.5 py-2 text-[11.5px] normal-case tracking-normal text-foreground outline-none transition-colors focus:border-primary/50 focus:bg-black/35"
-                              disabled={submitting}
-                            />
-                          </label>
-                          <label className="flex flex-col gap-1 text-[10.5px] uppercase tracking-[0.08em] text-muted-foreground/42">
-                            Checksum
-                            <input
-                              value={draftRowByLine.get(row.lineNumber)?.checksumInput ?? row.checksumInput}
-                              onChange={(event) => updateDraftRow(row.lineNumber, { checksumInput: event.target.value })}
-                              placeholder="sha256:..., raw hash, or checksum-file line"
                               className="rounded-md border border-border/60 bg-black/20 px-2.5 py-2 text-[11.5px] normal-case tracking-normal text-foreground outline-none transition-colors focus:border-primary/50 focus:bg-black/35"
                               disabled={submitting}
                             />

@@ -2021,14 +2021,6 @@ impl EngineState {
                     "runtime.finished",
                     "Completed the segmented transfer and finalized the file.",
                 );
-                if download.integrity.expected.is_some() {
-                    append_download_log(
-                        download,
-                        DownloadLogLevel::Info,
-                        "integrity.verify-pending",
-                        "Triggering checksum verification after completion.",
-                    );
-                }
                 clear_runtime_checkpoint(download);
                 HostTelemetryArgs {
                     host: download.host.clone(),
@@ -2059,7 +2051,6 @@ impl EngineState {
             self.emit_download_upsert(&response);
             self.trigger_download_completion_actions(&response);
             self.apply_runtime_dispatch_plan(dispatch_plan, min_emit_interval_ms);
-            self.spawn_checksum_verification(response.id.clone());
         }
         Ok(())
     }

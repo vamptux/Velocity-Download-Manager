@@ -598,7 +598,6 @@ impl EngineState {
             now,
         );
 
-        let checksum = args.checksum.map(normalize_checksum_spec).transpose()?;
         let scheduled_for = normalize_scheduled_for(args.scheduled_for);
         let settings = registry.settings.clone();
         let host_profile = registry.host_profiles.get(&host);
@@ -731,10 +730,6 @@ impl EngineState {
         if segments.is_empty() && segmented_mode {
             capabilities.segmented = false;
         }
-
-        let mut integrity = DownloadIntegrity::default();
-        reset_integrity_for_expected(&mut integrity, checksum.clone());
-
         let mut record = DownloadRecord {
             id,
             name,
@@ -785,7 +780,6 @@ impl EngineState {
                 .map(|value| value.validators.clone())
                 .unwrap_or_default(),
             compatibility,
-            integrity,
             diagnostics: DownloadDiagnostics {
                 warnings,
                 notes: vec!["Runtime worker orchestration enabled.".to_string()],
@@ -844,14 +838,6 @@ impl EngineState {
                 DownloadLogLevel::Info,
                 "transfer.single-stream",
                 "Planned guarded single-stream startup for this request shape.",
-            );
-        }
-        if record.integrity.expected.is_some() {
-            append_download_log(
-                &mut record,
-                DownloadLogLevel::Info,
-                "integrity.queued",
-                "Queued checksum verification for completion.",
             );
         }
         if record.scheduled_for.is_some() {
@@ -950,7 +936,6 @@ impl EngineState {
     pub async fn restart_download(&self, _app: &AppHandle, id: &str) -> Result<(), String> {
         self.await_bootstrap().await;
         self.abort_runtime_task(id);
-        self.abort_integrity_task(id);
         let mut registry = self.registry_guard()?;
         let queue_running = registry.queue_running;
         let settings = registry.settings.clone();
@@ -971,8 +956,6 @@ impl EngineState {
         download.manual_start_requested = !queue_running;
         reset_download_progress(download);
         clear_runtime_checkpoint(download);
-        let expected = download.integrity.expected.clone();
-        reset_integrity_for_expected(&mut download.integrity, expected);
         append_download_log(
             download,
             DownloadLogLevel::Info,
@@ -1000,7 +983,6 @@ impl EngineState {
     ) -> Result<(), String> {
         self.await_bootstrap().await;
         self.abort_runtime_task(id);
-        self.abort_integrity_task(id);
         let mut registry = self.registry_guard()?;
 
         if let Some(download) = registry.downloads.iter().find(|d| d.id == id) {
@@ -1045,7 +1027,6 @@ impl EngineState {
 
         for id in ids {
             self.abort_runtime_task(id);
-            self.abort_integrity_task(id);
         }
 
         let requested_ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -1189,112 +1170,6 @@ impl EngineState {
 
         self.persist_registry_flush(&registry)?;
         Ok(QueueState { running: false })
-    }
-
-    pub async fn set_download_checksum(
-        &self,
-        _app: &AppHandle,
-        id: &str,
-        checksum: Option<ChecksumSpec>,
-    ) -> Result<DownloadRecord, String> {
-        self.await_bootstrap().await;
-        self.abort_integrity_task(id);
-        let mut registry = self.registry_guard()?;
-        let Some(download) = registry
-            .downloads
-            .iter_mut()
-            .find(|download| download.id == id)
-        else {
-            return Err(format!("No download found for id '{id}'."));
-        };
-
-        let checksum = checksum.map(normalize_checksum_spec).transpose()?;
-        reset_integrity_for_expected(&mut download.integrity, checksum);
-        let should_verify_now = matches!(download.status, DownloadStatus::Finished);
-        if should_verify_now {
-            mark_integrity_verifying(&mut download.integrity);
-            append_download_log(
-                download,
-                DownloadLogLevel::Info,
-                if download.integrity.expected.is_some() {
-                    "integrity.verify-requested"
-                } else {
-                    "integrity.fingerprint-requested"
-                },
-                if download.integrity.expected.is_some() {
-                    "Queued immediate checksum verification for the completed file."
-                } else {
-                    "Queued immediate SHA-256 calculation for the completed file."
-                },
-            );
-        } else if download.integrity.expected.is_some() {
-            append_download_log(
-                download,
-                DownloadLogLevel::Info,
-                "integrity.queued",
-                "Checksum verification will run after the download completes.",
-            );
-        } else {
-            append_download_log(
-                download,
-                DownloadLogLevel::Info,
-                "integrity.cleared",
-                "Removed the configured checksum. VDM will keep automatic SHA-256 calculation enabled.",
-            );
-        }
-        let response = download.clone();
-
-        self.persist_registry(&registry)?;
-        drop(registry);
-        self.emit_download_upsert(&response);
-        if should_verify_now {
-            self.spawn_checksum_verification(id.to_string());
-        }
-        Ok(response)
-    }
-
-    pub async fn verify_download_checksum(
-        &self,
-        _app: &AppHandle,
-        id: &str,
-    ) -> Result<DownloadRecord, String> {
-        self.await_bootstrap().await;
-        self.abort_integrity_task(id);
-        let mut registry = self.registry_guard()?;
-        let Some(download) = registry
-            .downloads
-            .iter_mut()
-            .find(|download| download.id == id)
-        else {
-            return Err(format!("No download found for id '{id}'."));
-        };
-
-        if !matches!(download.status, DownloadStatus::Finished) {
-            return Err("Checksum verification is only available after the download finishes.".to_string());
-        }
-
-        mark_integrity_verifying(&mut download.integrity);
-        append_download_log(
-            download,
-            DownloadLogLevel::Info,
-            if download.integrity.expected.is_some() {
-                "integrity.verify-requested"
-            } else {
-                "integrity.fingerprint-requested"
-            },
-            if download.integrity.expected.is_some() {
-                "Queued manual checksum verification for the completed file."
-            } else {
-                "Queued manual SHA-256 recomputation for the completed file."
-            },
-        );
-        let response = download.clone();
-
-        self.persist_registry(&registry)?;
-        drop(registry);
-        self.emit_download_upsert(&response);
-        self.spawn_checksum_verification(id.to_string());
-        Ok(response)
     }
 
     pub async fn set_download_schedule(

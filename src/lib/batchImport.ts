@@ -5,8 +5,7 @@ import {
   normalizeComparableUrl,
   suggestedNameFromUrl,
 } from "@/lib/downloadDuplicates";
-import { parseChecksumInput } from "./checksum";
-import type { ChecksumSpec, DownloadContentCategory } from "@/types/download";
+import type { DownloadContentCategory } from "@/types/download";
 
 export type BatchImportFormat = "lines" | "csv" | "tsv";
 
@@ -18,7 +17,6 @@ export interface BatchImportDraftRow {
   filename: string;
   category: DownloadContentCategory;
   startImmediately: boolean;
-  checksumInput: string;
   seedErrors: string[];
 }
 
@@ -30,8 +28,6 @@ export interface BatchImportRow {
   filename: string;
   category: DownloadContentCategory;
   startImmediately: boolean;
-  checksumInput: string;
-  checksum: ChecksumSpec | null;
   targetPath: string | null;
   errors: string[];
 }
@@ -59,8 +55,6 @@ const HEADER_ALIASES: Record<string, string> = {
   filename: "filename",
   file: "filename",
   name: "filename",
-  checksum: "checksum",
-  hash: "checksum",
   category: "category",
   type: "category",
   startmode: "startMode",
@@ -196,12 +190,6 @@ function finalizeRow(
     errors.push(`Unsupported category '${row.category}'.`);
   }
 
-  const checksumInput = row.checksumInput.trim();
-  const { checksum, error: checksumError } = parseChecksumInput(checksumInput);
-  if (checksumError) {
-    errors.push(checksumError);
-  }
-
   const targetPath = joinTargetPathPreview(folder, filename);
 
   return {
@@ -212,8 +200,6 @@ function finalizeRow(
     filename,
     category: category ?? "documents",
     startImmediately: row.startImmediately,
-    checksumInput,
-    checksum,
     targetPath,
     errors,
   };
@@ -228,7 +214,6 @@ function toDraftRow(row: BatchImportRow): BatchImportDraftRow {
     filename: row.filename,
     category: row.category,
     startImmediately: row.startImmediately,
-    checksumInput: row.checksumInput,
     seedErrors: [],
   };
 }
@@ -283,7 +268,6 @@ export function createBatchImportDrafts(input: string, defaultSavePath: string):
         filename: "",
         category: guessCaptureCategory(null, suggestedNameFromUrl(source)) ?? "documents",
         startImmediately: true,
-        checksumInput: "",
         seedErrors: [],
       }, defaultSavePath)));
     });
@@ -321,7 +305,6 @@ export function createBatchImportDrafts(input: string, defaultSavePath: string):
             ? normalizedCategory as DownloadContentCategory
             : guessCaptureCategory(null, record.filename?.trim() || suggestedNameFromUrl(suggestedUrl)) ?? "documents",
           startImmediately,
-          checksumInput: record.checksum ?? "",
           seedErrors: [categoryError, startModeError].filter((value): value is string => value != null),
         }, defaultSavePath)));
       }

@@ -1,4 +1,4 @@
-const ENGINE_HIGHLIGHT_PATTERN = /engine|backend|segment|resume|queue|host|probe|range|retry|checkpoint|disk|throughput|stability|integrity|scheduler|connection/i;
+const ENGINE_HIGHLIGHT_PATTERN = /engine|backend|segment|resume|queue|host|probe|range|retry|checkpoint|disk|throughput|stability|scheduler|connection/i;
 
 function normalizeUpdateLine(line: string): string {
   return line

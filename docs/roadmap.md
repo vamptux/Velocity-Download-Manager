@@ -83,7 +83,7 @@ Notes:
 - [x] Parse plain newline URL lists.
 - [x] Add CSV paste support.
 - [x] Add TSV paste support.
-- [x] Support columns: `url`, `folder`, `filename`, `checksum`, `category`, `start mode`.
+- [x] Support columns: `url`, `folder`, `filename`, `category`, `start mode`.
 - [x] Validate rows before enqueue.
 - [x] Show import preview with parsed fields and row errors.
 - [x] Allow partial success with per-row failure reporting.
@@ -92,7 +92,7 @@ Notes:
 
 Notes:
 - Current implementation is plain one-URL-per-line and hardcodes category/save behavior in `src/components/BatchDownloadDialog.tsx`.
-- Column map: `folder|directory|save path`, `filename|file|name`, `checksum|hash`, `category|type`, `start mode|start|mode`.
+- Column map: `folder|directory|save path`, `filename|file|name`, `category|type`, `start mode|start|mode`.
 - Metalink scope:
 
 ---
