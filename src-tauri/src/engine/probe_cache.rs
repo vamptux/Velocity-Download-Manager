@@ -3,7 +3,6 @@ use crate::model::{
     RecentProbeCacheEntry, RegistrySnapshot,
 };
 
-use super::http_helpers::request_context_supports_segmented_transfer;
 use super::probe::{DownloadProbeData, RangeObservation};
 
 const PROBE_CAPABILITY_TTL_MS: i64 = 30 * 60 * 1_000;
@@ -269,14 +268,8 @@ pub(super) fn fresh_recent_probe(
 }
 
 pub(super) fn cached_probe_to_download_probe(cached: &RecentProbeCacheEntry) -> DownloadProbeData {
-    let exact_request_shape_allows_segmentation = request_context_supports_segmented_transfer(
-        &cached.compatibility.request_method,
-        &cached.compatibility.request_form_fields,
-    );
     let range_observation = if cached.range_supported {
         RangeObservation::Supported
-    } else if exact_request_shape_allows_segmentation {
-        RangeObservation::Unsupported
     } else {
         RangeObservation::Unknown
     };
@@ -426,5 +419,49 @@ fn trim_recent_probe_cache(registry: &mut RegistrySnapshot) {
         .saturating_sub(MAX_RECENT_PROBE_ENTRIES);
     for (key, _) in ordered.into_iter().take(remove_count) {
         registry.recent_probes.remove(&key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{DownloadCompatibility, DownloadRequestMethod, ResumeValidators};
+
+    fn cached_recent_probe(range_supported: bool) -> RecentProbeCacheEntry {
+        RecentProbeCacheEntry {
+            captured_at: 1,
+            host: "example.com".to_string(),
+            final_url: "https://example.com/file.bin".to_string(),
+            size: Some(1024),
+            mime_type: Some("application/octet-stream".to_string()),
+            negotiated_protocol: Some("http2".to_string()),
+            range_supported,
+            resumable: range_supported,
+            validators: ResumeValidators::default(),
+            suggested_name: "file.bin".to_string(),
+            compatibility: DownloadCompatibility {
+                request_method: DownloadRequestMethod::Get,
+                ..DownloadCompatibility::default()
+            },
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cached_recent_probe_keeps_ambiguous_range_support_unknown() {
+        let probe = cached_probe_to_download_probe(&cached_recent_probe(false));
+
+        assert_eq!(probe.range_observation, RangeObservation::Unknown);
+        assert!(!probe.range_supported);
+        assert!(!probe.resumable);
+    }
+
+    #[test]
+    fn cached_recent_probe_preserves_supported_range_result() {
+        let probe = cached_probe_to_download_probe(&cached_recent_probe(true));
+
+        assert_eq!(probe.range_observation, RangeObservation::Supported);
+        assert!(probe.range_supported);
+        assert!(probe.resumable);
     }
 }
