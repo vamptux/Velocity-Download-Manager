@@ -1,4 +1,4 @@
-<img width="1024" height="1536" alt="veloicon" src="https://github.com/user-attachments/assets/f5547d64-3e54-4f2c-b1a1-578d33df5f41" />
+___________________________________________________<img width="340" height="550" alt="veloicon" src="https://github.com/user-attachments/assets/f5547d64-3e54-4f2c-b1a1-578d33df5f41" />
 
 # Velocity Download Manager (VDM)
 
