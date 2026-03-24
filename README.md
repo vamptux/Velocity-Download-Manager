@@ -1,4 +1,4 @@
-
+<img width="1024" height="1536" alt="veloicon" src="https://github.com/user-attachments/assets/f5547d64-3e54-4f2c-b1a1-578d33df5f41" />
 
 # Velocity Download Manager (VDM)
 
@@ -13,8 +13,7 @@ Velocity is a Rust-based download manager focused on speed, stability, and a sea
 - 🔱 Free and open source.
 
 ## 🌀 Engine highlights
-<img width="775" height="299" alt="image" src="https://github.com/user-attachments/assets/5ffd2808-0c86-4921-b668-eea8f366c384" />
-
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/5cf61c08-4b58-4f4d-88a6-cb1d67525865" />
 
 - 📍 Early disk reservation, direct offset writes, and batched I/O to keep transfers stable under load.
 - 📍 Adaptive segmentation with work stealing, slow-peer recovery, and conservative single-stream fallback when segmentation is unsafe.
