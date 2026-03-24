@@ -1,9 +1,12 @@
 use std::fs::{self, OpenOptions};
 use std::io;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
 pub(super) struct TempTransferLockGuard {
@@ -36,7 +39,9 @@ impl TempTransferLockGuard {
 
 impl Drop for TempTransferLockGuard {
     fn drop(&mut self) {
-        let _ = self.release();
+        if let Some(error) = self.release() {
+            eprintln!("[VDM] {error}");
+        }
     }
 }
 
@@ -99,6 +104,26 @@ pub(super) fn query_available_space(path: &Path) -> Option<u64> {
         current = candidate.parent();
     }
     None
+}
+
+pub(super) fn compute_sha256_checksum(path: &Path) -> Result<String, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("Failed opening '{}' for checksum verification: {error}", path.display()))?;
+    let mut reader = io::BufReader::with_capacity(1024 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("Failed reading '{}' for checksum verification: {error}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 pub(super) fn finalize_download_file(

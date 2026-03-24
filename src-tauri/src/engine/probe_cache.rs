@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::model::{
     DownloadRequestField, DownloadRequestMethod, HostProfile, ProbeScopeCache,
     RecentProbeCacheEntry, RegistrySnapshot,
@@ -10,11 +12,35 @@ const PROBE_CAPABILITY_STABLE_TTL_MS: i64 = 45 * 60 * 1_000;
 const PROBE_CAPABILITY_UNSTABLE_TTL_MS: i64 = 6 * 60 * 1_000;
 const PROBE_RESULT_REUSE_TTL_MS: i64 = 3 * 60 * 1_000;
 const PROBE_SCOPE_FAILURE_TTL_MS: i64 = 10 * 60 * 1_000;
+const PROBE_FAILURE_RETRY_BACKOFF_MS: i64 = 20 * 1_000;
 const PROBE_SCOPE_STABILITY_WINDOW_MS: i64 = 15 * 60 * 1_000;
 const PROBE_FAILURE_LOCK_THRESHOLD: u32 = 3;
+const PROBE_FAILURE_RETRY_BACKOFF_THRESHOLD: u32 = 2;
 const PROBE_SCOPE_STABLE_TELEMETRY_SAMPLES: u32 = 4;
 const MAX_SCOPE_CACHE_ENTRIES: usize = 24;
 const MAX_RECENT_PROBE_ENTRIES: usize = 64;
+const PROBE_SCOPE_KEY_VERSION: u8 = 2;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ProbeScopeIdentity {
+    version: u8,
+    url: String,
+    method: ProbeScopeMethod,
+    fields: Vec<ProbeScopeField>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ProbeScopeMethod {
+    Get,
+    Post,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ProbeScopeField {
+    name: String,
+    value: String,
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct CachedProbeCapabilities {
@@ -29,21 +55,29 @@ pub(super) fn probe_scope_key(
     request_method: &DownloadRequestMethod,
     request_form_fields: &[DownloadRequestField],
 ) -> String {
-    let normalized_url = normalize_probe_url(url);
-    let method = match request_method {
-        DownloadRequestMethod::Get => "get",
-        DownloadRequestMethod::Post => "post",
-    };
-    if request_form_fields.is_empty() {
-        return format!("{method}|{normalized_url}");
-    }
+    serde_json::to_string(&ProbeScopeIdentity {
+        version: PROBE_SCOPE_KEY_VERSION,
+        url: normalize_probe_url(url),
+        method: probe_scope_method(request_method),
+        fields: request_form_fields
+            .iter()
+            .map(|field| ProbeScopeField {
+                name: field.name.clone(),
+                value: field.value.clone(),
+            })
+            .collect(),
+    })
+    .unwrap_or_else(|_| legacy_probe_scope_key(url, request_method, request_form_fields))
+}
 
-    let field_signature = request_form_fields
-        .iter()
-        .map(|field| format!("{}={}", field.name, field.value))
-        .collect::<Vec<_>>()
-        .join("&");
-    format!("{method}|{normalized_url}|{field_signature}")
+pub(super) fn probe_scope_entry<'a>(
+    profile: &'a HostProfile,
+    scope_key: &str,
+) -> Option<&'a ProbeScopeCache> {
+    profile
+        .probe_scopes
+        .get(scope_key)
+        .or_else(|| legacy_probe_scope_alias(scope_key).and_then(|legacy| profile.probe_scopes.get(&legacy)))
 }
 
 pub(super) fn update_profile_probe_cache(
@@ -53,6 +87,7 @@ pub(super) fn update_profile_probe_cache(
     now: i64,
 ) {
     prune_scope_cache(profile, now);
+    promote_legacy_scope_entry(profile, scope_key);
 
     let scope = profile
         .probe_scopes
@@ -96,6 +131,7 @@ pub(super) fn update_profile_probe_cache(
 
 pub(super) fn record_probe_failure(profile: &mut HostProfile, scope_key: &str, now: i64) {
     prune_scope_cache(profile, now);
+    promote_legacy_scope_entry(profile, scope_key);
 
     let scope = profile
         .probe_scopes
@@ -114,14 +150,11 @@ pub(super) fn fresh_probe_capabilities(
     scope_key: &str,
     now: i64,
 ) -> Option<CachedProbeCapabilities> {
-    profile
-        .probe_scopes
-        .get(scope_key)
-        .and_then(|scope| fresh_scope_capabilities(scope, now))
+    probe_scope_entry(profile, scope_key).and_then(|scope| fresh_scope_capabilities(scope, now))
 }
 
 pub(super) fn probe_cache_stale(profile: &HostProfile, scope_key: &str, now: i64) -> bool {
-    if let Some(scope) = profile.probe_scopes.get(scope_key) {
+    if let Some(scope) = probe_scope_entry(profile, scope_key) {
         return scope.last_probe_at.is_some_and(|timestamp| {
             now.saturating_sub(timestamp) > scope_capability_ttl_ms(scope, now)
         });
@@ -157,7 +190,7 @@ pub(super) fn append_probe_cache_warning(
         warnings.push(warning);
     }
 
-    if let Some(scope) = profile.probe_scopes.get(scope_key)
+    if let Some(scope) = probe_scope_entry(profile, scope_key)
         && scoped_probe_failure_active(scope, now)
     {
         warnings.push(
@@ -195,7 +228,7 @@ pub(super) fn scoped_probe_failures(
     let Some(profile) = profile else {
         return 0;
     };
-    let Some(scope) = profile.probe_scopes.get(scope_key) else {
+    let Some(scope) = probe_scope_entry(profile, scope_key) else {
         return 0;
     };
     if scoped_probe_failure_active(scope, now) {
@@ -205,6 +238,24 @@ pub(super) fn scoped_probe_failures(
     }
 }
 
+pub(super) fn scoped_probe_retry_backoff(
+    profile: Option<&HostProfile>,
+    scope_key: &str,
+    now: i64,
+) -> bool {
+    let Some(profile) = profile else {
+        return false;
+    };
+    let Some(scope) = probe_scope_entry(profile, scope_key) else {
+        return false;
+    };
+
+    scope.probe_failure_streak >= PROBE_FAILURE_RETRY_BACKOFF_THRESHOLD
+        && scope
+            .last_probe_error_at
+            .is_some_and(|value| now.saturating_sub(value) <= PROBE_FAILURE_RETRY_BACKOFF_MS)
+}
+
 pub(super) fn apply_scope_range_validation_failure(
     profile: &mut HostProfile,
     scope_key: &str,
@@ -212,6 +263,7 @@ pub(super) fn apply_scope_range_validation_failure(
     now: i64,
 ) {
     prune_scope_cache(profile, now);
+    promote_legacy_scope_entry(profile, scope_key);
 
     let scope = profile
         .probe_scopes
@@ -235,6 +287,7 @@ pub(super) fn store_recent_probe(
     now: i64,
 ) {
     prune_recent_probe_cache(registry, now);
+    promote_legacy_recent_probe(registry, scope_key);
     registry.recent_probes.insert(
         scope_key.to_string(),
         RecentProbeCacheEntry {
@@ -260,7 +313,10 @@ pub(super) fn fresh_recent_probe(
     scope_key: &str,
     now: i64,
 ) -> Option<RecentProbeCacheEntry> {
-    let cached = registry.recent_probes.get(scope_key)?;
+    let cached = registry
+        .recent_probes
+        .get(scope_key)
+        .or_else(|| legacy_probe_scope_alias(scope_key).and_then(|legacy| registry.recent_probes.get(&legacy)))?;
     if now.saturating_sub(cached.captured_at) > PROBE_RESULT_REUSE_TTL_MS {
         return None;
     }
@@ -296,6 +352,84 @@ fn normalize_probe_url(url: &str) -> String {
     }
 
     url.split('#').next().unwrap_or(url).trim().to_string()
+}
+
+fn probe_scope_method(request_method: &DownloadRequestMethod) -> ProbeScopeMethod {
+    match request_method {
+        DownloadRequestMethod::Get => ProbeScopeMethod::Get,
+        DownloadRequestMethod::Post => ProbeScopeMethod::Post,
+    }
+}
+
+fn legacy_probe_scope_key(
+    url: &str,
+    request_method: &DownloadRequestMethod,
+    request_form_fields: &[DownloadRequestField],
+) -> String {
+    let normalized_url = normalize_probe_url(url);
+    let method = match request_method {
+        DownloadRequestMethod::Get => "get",
+        DownloadRequestMethod::Post => "post",
+    };
+    if request_form_fields.is_empty() {
+        return format!("{method}|{normalized_url}");
+    }
+
+    let field_signature = request_form_fields
+        .iter()
+        .map(|field| format!("{}={}", field.name, field.value))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{method}|{normalized_url}|{field_signature}")
+}
+
+fn legacy_probe_scope_key_from_identity(identity: &ProbeScopeIdentity) -> String {
+    let request_method = match identity.method {
+        ProbeScopeMethod::Get => DownloadRequestMethod::Get,
+        ProbeScopeMethod::Post => DownloadRequestMethod::Post,
+    };
+    let request_form_fields = identity
+        .fields
+        .iter()
+        .map(|field| DownloadRequestField {
+            name: field.name.clone(),
+            value: field.value.clone(),
+        })
+        .collect::<Vec<_>>();
+    legacy_probe_scope_key(&identity.url, &request_method, &request_form_fields)
+}
+
+fn legacy_probe_scope_alias(scope_key: &str) -> Option<String> {
+    let identity = serde_json::from_str::<ProbeScopeIdentity>(scope_key).ok()?;
+    (identity.version == PROBE_SCOPE_KEY_VERSION)
+        .then(|| legacy_probe_scope_key_from_identity(&identity))
+}
+
+fn promote_legacy_scope_entry(profile: &mut HostProfile, scope_key: &str) {
+    if profile.probe_scopes.contains_key(scope_key) {
+        return;
+    }
+    let Some(legacy_scope_key) = legacy_probe_scope_alias(scope_key) else {
+        return;
+    };
+    if let Some(scope) = profile.probe_scopes.remove(&legacy_scope_key) {
+        profile.probe_scopes.insert(scope_key.to_string(), scope);
+    }
+}
+
+fn promote_legacy_recent_probe(registry: &mut RegistrySnapshot, scope_key: &str) {
+    let Some(legacy_scope_key) = legacy_probe_scope_alias(scope_key) else {
+        return;
+    };
+    if registry.recent_probes.contains_key(scope_key) {
+        registry.recent_probes.remove(&legacy_scope_key);
+        return;
+    }
+    if let Some(cached_probe) = registry.recent_probes.remove(&legacy_scope_key) {
+        registry
+            .recent_probes
+            .insert(scope_key.to_string(), cached_probe);
+    }
 }
 
 fn fresh_scope_capabilities(scope: &ProbeScopeCache, now: i64) -> Option<CachedProbeCapabilities> {

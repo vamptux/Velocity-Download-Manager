@@ -17,10 +17,12 @@ function readCargoVersion(path) {
 const packageVersion = readJson("package.json").version;
 const tauriVersion = readJson("src-tauri/tauri.conf.json").version;
 const cargoVersion = readCargoVersion("src-tauri/Cargo.toml");
+const extensionVersion = readJson("extensions/vdm-catcher/manifest.json").version;
 const versions = [
   ["package.json", packageVersion],
   ["src-tauri/tauri.conf.json", tauriVersion],
   ["src-tauri/Cargo.toml", cargoVersion],
+  ["extensions/vdm-catcher/manifest.json", extensionVersion],
 ];
 
 const distinctVersions = new Set(versions.map(([, version]) => version));

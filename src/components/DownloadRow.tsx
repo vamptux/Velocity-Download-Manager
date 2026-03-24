@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
@@ -6,6 +6,9 @@ import {
   ArrowUp,
   ChevronsDown,
   ChevronsUp,
+  Hash,
+  RefreshCw,
+  ShieldCheck,
   StopCircle,
   FolderOpen,
   Copy,
@@ -25,14 +28,16 @@ import {
   restartRequirementLabel,
 } from "@/lib/downloadActions";
 import {
-  activeConnectionCount,
   CATEGORY_ICONS,
   CATEGORY_ICON_BG,
   CATEGORY_ICON_COLORS,
   CATEGORY_LABELS,
-  stallReasonLabel,
+  integritySummaryLabel,
+  primaryIssueSummary,
   STATUS_META,
-  targetConnectionCount,
+  transferConstraintMeta,
+  transferConstraintSummary,
+  transferModeLabel,
 } from "@/lib/downloadPresentation";
 import {
   formatBytes,
@@ -44,41 +49,22 @@ import {
   calculateDisplayProgress,
   useSmoothedNumber,
 } from "@/lib/downloadProgress";
-import { simplifyUserMessage } from "@/lib/userFacingMessages";
+import { extractErrorMessage } from "@/lib/userFacingMessages";
+import { buildDownloadDiagnosticsSummary } from "@/lib/downloadDiagnostics";
 import {
   ipcPauseDownload,
+  ipcRecalculateDownloadChecksum,
   ipcRestartDownload,
   ipcResumeDownload,
   ipcSetDownloadSchedule,
+  ipcSetDownloadIntegrityExpectedHash,
+  ipcVerifyDownloadChecksum,
 } from "@/lib/ipc";
 import { writeClipboardText } from "@/lib/clipboard";
 import type { Download } from "@/types/download";
 
-function transferModeLabel(download: Download): string {
-  const restartLabel = restartRequirementLabel(download);
-  if (restartLabel) {
-    return restartLabel === "Replay-only"
-      ? "Guarded single stream • replay-only"
-      : "Guarded single stream • restart only";
-  }
-
-  if (download.capabilities.segmented && download.segments.length > 0) {
-    const activeConnections = activeConnectionCount(download);
-    const targetConnections = targetConnectionCount(download);
-    return download.status === "downloading"
-      ? `Segmented • ${activeConnections}/${targetConnections} parts active`
-      : `Segmented • ${targetConnections} planned parts`;
-  }
-
-  if (download.capabilities.resumable) {
-    return "Single stream • resume ready";
-  }
-
-  if (download.capabilities.rangeSupported) {
-    return "Single-session range";
-  }
-
-  return "Single connection";
+function normalizeChecksumDraft(value: string): string {
+  return value.replace(/\s+/g, "").trim().toLowerCase();
 }
 
 function ProgressBar({
@@ -254,22 +240,27 @@ export const DownloadRow = memo(function DownloadRow({
     download.queuePosition > 0 ? `#${download.queuePosition}` : null;
   const transferMode = transferModeLabel(download);
   const restartLabel = restartRequirementLabel(download);
+  const primaryIssue = primaryIssueSummary(download);
   const isAlt = index % 2 !== 0;
-  const simplifiedErrorMessage = download.errorMessage
-    ? simplifyUserMessage(download.errorMessage)
-    : null;
   const summaryText =
-    download.status === "error" && simplifiedErrorMessage
-      ? simplifiedErrorMessage
+    download.status === "error" && primaryIssue
+      ? primaryIssue
       : download.diagnostics.restartRequired
         ? `${restartLabel ?? "Restart only"} · ${download.host || CATEGORY_LABELS[download.category]}`
       : download.host
         ? `${download.host} · ${transferMode}`
         : `${CATEGORY_LABELS[download.category]} · ${transferMode}`;
   const secondaryText = queueLabel ? `${queueLabel} · ${summaryText}` : summaryText;
-  const stallReason = stallReasonLabel(download);
+  const transferConstraint = transferConstraintMeta(download);
+  const transferConstraintDetail = transferConstraintSummary(transferConstraint);
+  const integritySummary = integritySummaryLabel(download.integrity.status);
   const statusDetail =
-    stallReason
+    (download.status === "error" && primaryIssue
+      ? primaryIssue
+      : transferConstraintDetail
+      ? transferConstraintDetail
+      : null)
+    ?? (download.diagnostics.restartRequired ? primaryIssue ?? restartLabel : null)
     ?? restartLabel
     ?? (isFinalizing ? "Flushing to disk" : null)
     ?? (showProgress && pct > 0 ? `${Math.round(smoothedPct)}%` : null);
@@ -278,11 +269,40 @@ export const DownloadRow = memo(function DownloadRow({
   const [scheduleValue, setScheduleValue] = useState("");
   const [scheduleSaving, setScheduleSaving] = useState(false);
   const [scheduleError, setScheduleError] = useState<string | null>(null);
+  const [checksumOpen, setChecksumOpen] = useState(false);
+  const [expectedChecksum, setExpectedChecksum] = useState(
+    download.integrity.expectedHash ?? "",
+  );
+  const [checksumSaving, setChecksumSaving] = useState(false);
+  const [checksumError, setChecksumError] = useState<string | null>(null);
+  const [checksumCopied, setChecksumCopied] = useState(false);
+  const normalizedExpectedChecksum = normalizeChecksumDraft(expectedChecksum);
+  const normalizedStoredExpectedChecksum = normalizeChecksumDraft(
+    download.integrity.expectedHash ?? "",
+  );
+  const checksumPending = download.integrity.status === "pending";
+  const checksumBusy = checksumSaving || checksumPending;
+  const expectedChecksumChanged =
+    normalizedExpectedChecksum !== normalizedStoredExpectedChecksum;
+  const canSaveExpectedChecksum = !checksumBusy && expectedChecksumChanged;
+  const canClearExpectedChecksum =
+    !checksumBusy && (normalizedStoredExpectedChecksum.length > 0 || normalizedExpectedChecksum.length > 0);
+
+  useEffect(() => {
+    setExpectedChecksum(download.integrity.expectedHash ?? "");
+  }, [download.id, download.integrity.expectedHash]);
 
   function openScheduleDialog() {
     setScheduleValue(formatScheduleInputValue(download.scheduledFor));
     setScheduleError(null);
     setScheduleOpen(true);
+  }
+
+  function openChecksumDialog() {
+    setExpectedChecksum(download.integrity.expectedHash ?? "");
+    setChecksumError(null);
+    setChecksumCopied(false);
+    setChecksumOpen(true);
   }
 
   async function handleScheduleSave(e: React.FormEvent) {
@@ -295,13 +315,7 @@ export const DownloadRow = memo(function DownloadRow({
       setScheduleOpen(false);
       onRefresh();
     } catch (err) {
-      setScheduleError(
-        err instanceof Error
-          ? err.message
-          : typeof err === "string"
-            ? err
-            : "Failed to update the schedule.",
-      );
+      setScheduleError(extractErrorMessage(err, "Failed to update the schedule."));
     } finally {
       setScheduleSaving(false);
     }
@@ -309,6 +323,28 @@ export const DownloadRow = memo(function DownloadRow({
 
   function copyUrl() {
     void writeClipboardText(download.url).catch(() => null);
+  }
+
+  function copyDiagnostics() {
+    const displaySourceUrl = download.finalUrl !== download.url
+      ? download.finalUrl
+      : download.url;
+    void writeClipboardText(
+      buildDownloadDiagnosticsSummary(download, displaySourceUrl),
+    ).catch(() => null);
+  }
+
+  function copyChecksum() {
+    const checksum = download.integrity.computedHash ?? download.integrity.expectedHash;
+    if (!checksum) {
+      return;
+    }
+    void writeClipboardText(checksum)
+      .then(() => {
+        setChecksumCopied(true);
+        window.setTimeout(() => setChecksumCopied(false), 1600);
+      })
+      .catch(() => null);
   }
 
   async function handleResume() {
@@ -329,6 +365,61 @@ export const DownloadRow = memo(function DownloadRow({
   async function handleStop() {
     await ipcPauseDownload(download.id).catch(() => null);
     onRefresh();
+  }
+
+  async function handleVerifyChecksum() {
+    setChecksumSaving(true);
+    setChecksumError(null);
+    try {
+      await ipcVerifyDownloadChecksum(download.id);
+      onRefresh();
+    } catch (error) {
+      setChecksumError(extractErrorMessage(error, "Failed to verify the checksum."));
+    } finally {
+      setChecksumSaving(false);
+    }
+  }
+
+  async function handleRecalculateChecksum() {
+    setChecksumSaving(true);
+    setChecksumError(null);
+    try {
+      await ipcRecalculateDownloadChecksum(download.id);
+      onRefresh();
+    } catch (error) {
+      setChecksumError(extractErrorMessage(error, "Failed to recalculate the checksum."));
+    } finally {
+      setChecksumSaving(false);
+    }
+  }
+
+  async function handleSaveExpectedChecksum() {
+    setChecksumSaving(true);
+    setChecksumError(null);
+    try {
+      await ipcSetDownloadIntegrityExpectedHash(
+        download.id,
+        normalizedExpectedChecksum || null,
+      );
+      onRefresh();
+    } catch (error) {
+      setChecksumError(extractErrorMessage(error, "Failed to save the expected checksum."));
+    } finally {
+      setChecksumSaving(false);
+    }
+  }
+
+  async function handleClearExpectedChecksum() {
+    setChecksumSaving(true);
+    setChecksumError(null);
+    try {
+      await ipcSetDownloadIntegrityExpectedHash(download.id, null);
+      onRefresh();
+    } catch (error) {
+      setChecksumError(extractErrorMessage(error, "Failed to clear the expected checksum."));
+    } finally {
+      setChecksumSaving(false);
+    }
   }
 
   async function handleOpenFolder() {
@@ -434,7 +525,10 @@ export const DownloadRow = memo(function DownloadRow({
                   {label}
                 </span>
                 {statusDetail ? (
-                  <span className="text-[9.5px] opacity-55 leading-tight tabular-nums">
+                  <span
+                    className="text-[9.5px] opacity-55 leading-tight tabular-nums"
+                    title={statusDetail}
+                  >
                     {statusDetail}
                   </span>
                 ) : null}
@@ -509,6 +603,16 @@ export const DownloadRow = memo(function DownloadRow({
               label="Copy URL"
               shortcut="Ctrl+C"
               onSelect={copyUrl}
+            />
+            <MenuItem
+              icon={Copy}
+              label="Copy diagnostics"
+              onSelect={copyDiagnostics}
+            />
+            <MenuItem
+              icon={Hash}
+              label="File checksum..."
+              onSelect={openChecksumDialog}
             />
             <MenuItem
               icon={Clock3}
@@ -671,11 +775,7 @@ export const DownloadRow = memo(function DownloadRow({
                       })
                       .catch((err) => {
                         setScheduleError(
-                          err instanceof Error
-                            ? err.message
-                            : typeof err === "string"
-                              ? err
-                              : "Failed to clear the schedule.",
+                          extractErrorMessage(err, "Failed to clear the schedule."),
                         );
                       })
                       .finally(() => setScheduleSaving(false));
@@ -694,6 +794,156 @@ export const DownloadRow = memo(function DownloadRow({
                 </button>
               </div>
             </form>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      <Dialog.Root open={checksumOpen} onOpenChange={setChecksumOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-[100] bg-black/50 backdrop-blur-[2px] data-[state=open]:animate-in data-[state=open]:fade-in-0" />
+          <Dialog.Content
+            className={cn(
+              "fixed left-1/2 top-1/2 z-[101] -translate-x-1/2 -translate-y-1/2",
+              "w-[440px] rounded-lg border border-border bg-[hsl(var(--background))] shadow-2xl shadow-black/60 outline-none",
+              "data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
+            )}
+          >
+            <div className="flex items-center justify-between border-b border-border px-4 py-3">
+              <div className="flex items-center gap-2">
+                <Hash size={13} className="text-muted-foreground/60" strokeWidth={1.8} />
+                <Dialog.Title className="text-[13px] font-semibold text-foreground">
+                  File Checksum
+                </Dialog.Title>
+              </div>
+              <Dialog.Close className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground transition-colors">
+                <X size={13} strokeWidth={2} />
+              </Dialog.Close>
+            </div>
+
+            <div className="flex flex-col gap-3 px-4 py-4">
+              <div className="rounded-md border border-border/55 bg-black/10 px-3 py-2.5 text-[11px]">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="uppercase tracking-[0.1em] text-muted-foreground/45">Status</div>
+                    <div className="mt-1 text-foreground/82">
+                      {checksumPending
+                        ? "SHA-256 is being calculated in the background."
+                        : download.integrity.expectedHash && !download.integrity.computedHash
+                          ? "Expected SHA-256 saved. Calculation still needs to complete before VDM can compare it."
+                          : integritySummary ?? "Checksum not available yet."}
+                    </div>
+                  </div>
+                  <div className="text-right text-[10px] text-muted-foreground/52">
+                    <div>Algorithm</div>
+                    <div className="mt-1 font-semibold text-foreground/78">SHA-256</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-2">
+                <div className="rounded-md border border-border/55 bg-black/8 px-3 py-2">
+                  <div className="text-[9.5px] uppercase tracking-[0.1em] text-muted-foreground/44">
+                    Computed checksum
+                  </div>
+                  <div className="mt-1 break-all text-[11px] text-foreground/78">
+                    {download.integrity.computedHash
+                      ?? (download.integrity.status === "pending"
+                        ? "Calculating..."
+                        : "Not available")}
+                  </div>
+                </div>
+                <div className="rounded-md border border-border/55 bg-black/8 px-3 py-2">
+                  <div className="text-[9.5px] uppercase tracking-[0.1em] text-muted-foreground/44">
+                    Expected checksum
+                  </div>
+                  <input
+                    type="text"
+                    value={expectedChecksum}
+                    onChange={(event) => {
+                      setExpectedChecksum(event.target.value);
+                      setChecksumError(null);
+                    }}
+                    placeholder="Paste a 64-character SHA-256 hash"
+                    disabled={checksumBusy}
+                    className={cn(
+                      "mt-1 h-8 w-full rounded-md border border-border bg-[hsl(var(--card))] px-3 text-[11px] text-foreground outline-none",
+                      "focus:border-primary/60 focus:ring-1 focus:ring-primary/30 transition-colors disabled:cursor-not-allowed disabled:opacity-60",
+                    )}
+                  />
+                </div>
+              </div>
+
+              {checksumPending ? (
+                <div className="rounded-md border border-border/55 bg-black/8 px-3 py-2 text-[10.5px] text-muted-foreground/66">
+                  Integrity metadata is temporarily locked while the current SHA-256 job finishes.
+                </div>
+              ) : null}
+
+              {download.integrity.lastError ? (
+                <div className="rounded-md border border-[hsl(var(--status-error)/0.2)] bg-[hsl(var(--status-error)/0.06)] px-3 py-2 text-[10.5px] text-muted-foreground/72">
+                  {download.integrity.lastError}
+                </div>
+              ) : null}
+              {checksumError ? (
+                <div className="rounded-md border border-[hsl(var(--status-error)/0.26)] bg-[hsl(var(--status-error)/0.08)] px-3 py-2 text-[11px] text-[hsl(var(--status-error))]">
+                  {checksumError}
+                </div>
+              ) : null}
+
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => copyChecksum()}
+                  disabled={!download.integrity.computedHash && !download.integrity.expectedHash}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-border/65 bg-black/10 px-3 py-1.5 text-[11px] font-medium text-foreground/78 transition-colors hover:bg-accent hover:text-foreground disabled:opacity-45"
+                >
+                  <Copy size={12} strokeWidth={1.8} />
+                  {checksumCopied ? "Copied" : "Copy checksum"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleSaveExpectedChecksum()}
+                  disabled={!canSaveExpectedChecksum}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-border/65 bg-black/10 px-3 py-1.5 text-[11px] font-medium text-foreground/78 transition-colors hover:bg-accent hover:text-foreground disabled:opacity-45"
+                >
+                  <Hash size={12} strokeWidth={1.8} />
+                  Save expected
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleClearExpectedChecksum()}
+                  disabled={!canClearExpectedChecksum}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-border/65 px-3 py-1.5 text-[11px] text-muted-foreground/64 transition-colors hover:bg-accent hover:text-foreground disabled:opacity-45"
+                >
+                  Clear expected
+                </button>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => void handleVerifyChecksum()}
+                  disabled={
+                    checksumBusy
+                    || download.status !== "finished"
+                    || !download.integrity.expectedHash
+                  }
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-3 text-[12px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+                >
+                  <ShieldCheck size={12} strokeWidth={1.8} />
+                  Verify
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleRecalculateChecksum()}
+                  disabled={checksumBusy || download.status !== "finished"}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-3 text-[12px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+                >
+                  <RefreshCw size={12} strokeWidth={1.8} />
+                  Recalculate
+                </button>
+              </div>
+            </div>
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>

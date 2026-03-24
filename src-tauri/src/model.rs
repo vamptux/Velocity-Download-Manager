@@ -25,6 +25,45 @@ pub enum DownloadCategory {
     Documents,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub enum DownloadIntegrityAlgorithm {
+    #[default]
+    Sha256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub enum DownloadIntegrityStatus {
+    #[default]
+    Unavailable,
+    Pending,
+    Computed,
+    Verified,
+    Mismatch,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadIntegrity {
+    #[serde(default)]
+    pub expected_hash: Option<String>,
+    #[serde(default)]
+    pub computed_hash: Option<String>,
+    #[serde(default)]
+    pub algorithm: DownloadIntegrityAlgorithm,
+    #[serde(default)]
+    pub status: DownloadIntegrityStatus,
+    #[serde(default)]
+    pub verified_at: Option<i64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumeValidators {
@@ -67,7 +106,6 @@ pub enum DownloadRequestMethod {
 pub enum AppUpdateChannel {
     #[default]
     Stable,
-    Preview,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, TS)]
@@ -108,9 +146,31 @@ pub struct EngineSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
+pub struct QueuePersistPressure {
+    #[serde(default)]
+    pub pressure_active: bool,
+    #[serde(default)]
+    pub queued_deferred: u32,
+    #[serde(default)]
+    pub max_deferred_depth: u32,
+    #[serde(default)]
+    pub backpressure_events: u64,
+    #[serde(default)]
+    pub overflow_replacements: u64,
+    #[serde(default)]
+    pub overflow_pending: bool,
+    #[serde(default)]
+    pub last_persist_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueState {
     #[serde(default = "default_queue_running")]
     pub running: bool,
+    #[serde(default)]
+    pub persist_pressure: QueuePersistPressure,
 }
 
 impl Default for EngineSettings {
@@ -361,6 +421,47 @@ pub enum DownloadFailureKind {
     FileSystem,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum CommandError {
+    NotFound {
+        message: String,
+        resource: String,
+        #[serde(default)]
+        id: Option<String>,
+    },
+    InvalidState {
+        message: String,
+        operation: String,
+        #[serde(default)]
+        status: Option<DownloadStatus>,
+        #[serde(default)]
+        retryable: bool,
+    },
+    Validation {
+        message: String,
+        #[serde(default)]
+        field: Option<String>,
+    },
+    Unavailable {
+        message: String,
+        operation: String,
+        retryable: bool,
+    },
+    Internal {
+        message: String,
+    },
+}
+
+impl CommandError {
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal {
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum DownloadLogLevel {
@@ -456,6 +557,8 @@ pub struct DownloadRecord {
     pub compatibility: DownloadCompatibility,
     #[serde(default)]
     pub diagnostics: DownloadDiagnostics,
+    #[serde(default)]
+    pub integrity: DownloadIntegrity,
     #[serde(default)]
     pub segments: Vec<DownloadSegment>,
     #[serde(default)]

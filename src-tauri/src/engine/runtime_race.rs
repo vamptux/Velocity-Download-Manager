@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::engine_log::append_download_log;
-use super::runtime_state::{
+use super::runtime_support::{
     RuntimeRaceState, persist_runtime_races, resolve_runtime_race, restore_runtime_races,
 };
 use super::scheduler::{SegmentRuntimeSample, SegmentScheduler};
@@ -49,8 +49,9 @@ pub(super) fn attempt_runtime_queue_expansion(
     scheduler: &SegmentScheduler,
     runtime_samples: &[SegmentRuntimeSample],
     race_by_segment: &mut BTreeMap<u32, RuntimeRaceState>,
+    idle_worker_count: u32,
 ) -> RuntimeQueueExpansion {
-    if download.writer_backpressure {
+    if download.writer_backpressure || idle_worker_count == 0 {
         return RuntimeQueueExpansion {
             appended_segment: None,
             control_updates: Vec::new(),
@@ -68,7 +69,7 @@ pub(super) fn attempt_runtime_queue_expansion(
             &mut download.segments,
             runtime_samples,
             download.size.max(0) as u64,
-            1,
+            idle_worker_count,
         );
         if stolen.is_some() {
             for segment in &download.segments {
@@ -86,7 +87,12 @@ pub(super) fn attempt_runtime_queue_expansion(
         };
     }
 
-    let Some(plan) = scheduler.attempt_slow_peer_race_steal(&download.segments, runtime_samples, 1)
+    let Some(plan) = scheduler.attempt_slow_peer_race_steal(
+        &download.segments,
+        runtime_samples,
+        download.size.max(0) as u64,
+        idle_worker_count,
+    )
     else {
         return RuntimeQueueExpansion {
             appended_segment: None,

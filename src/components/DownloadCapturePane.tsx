@@ -3,7 +3,10 @@ import * as Select from "@radix-ui/react-select";
 import { AlertTriangle, Check, ChevronDown, FolderOpen, Loader2, X } from "lucide-react";
 import { InlineNotice } from "@/components/ui/inline-notice";
 import { formatBytes } from "@/lib/format";
-import { formatCooldownLabel, hostLockLabel } from "@/lib/downloadPresentation";
+import {
+	probeHostBadgeItems,
+	semanticBadgeToneClassName,
+} from "@/lib/downloadPresentation";
 import { getVisibleProbeWarnings, simplifyUserMessage } from "@/lib/userFacingMessages";
 import { cn } from "@/lib/utils";
 import type { DownloadContentCategory, DownloadProbe } from "@/types/download";
@@ -184,15 +187,13 @@ function MetaBadge({
 	tone = "neutral",
 }: {
 	label: string;
-	tone?: "neutral" | "good" | "warn";
+	tone?: "neutral" | "good" | "warn" | "error";
 }) {
 	return (
 		<span
 			className={cn(
 				"inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium tracking-wide",
-				tone === "good" && "bg-[hsl(var(--status-downloading)/0.12)] text-[hsl(var(--status-downloading))]",
-				tone === "warn" && "bg-[hsl(var(--status-paused)/0.14)] text-[hsl(var(--status-paused))]",
-				tone === "neutral" && "bg-white/[0.08] text-foreground/65",
+				semanticBadgeToneClassName(tone),
 			)}
 		>
 			{label}
@@ -230,9 +231,9 @@ function conciseProbeWarning(message: string): string {
 
 function probeMetaBadges(probe: DownloadProbe): Array<{
 	label: string;
-	tone: "neutral" | "good" | "warn";
+	tone: "neutral" | "good" | "warn" | "error";
 }> {
-	const rows: Array<{ label: string; tone: "neutral" | "good" | "warn" }> = [];
+	const rows: Array<{ label: string; tone: "neutral" | "good" | "warn" | "error" }> = [];
 	// Only show fallback probe source — live/cached are internal implementation details
 	if (detectProbeSource(probe.warnings) === "fallback") {
 		rows.push({ label: "Probe: fallback", tone: "warn" });
@@ -249,16 +250,7 @@ function probeMetaBadges(probe: DownloadProbe): Array<{
 			tone: "warn",
 		});
 	}
-	if (probe.hostDiagnostics.hardNoRange || !probe.rangeSupported) {
-		rows.push({ label: "No-range host", tone: "warn" });
-	}
-	const cooldown = formatCooldownLabel(probe.hostDiagnostics.cooldownUntil);
-	if (cooldown) {
-		rows.push({ label: cooldown, tone: "warn" });
-	}
-	if (probe.hostDiagnostics.concurrencyLocked) {
-		rows.push({ label: hostLockLabel(probe.hostDiagnostics.lockReason), tone: "warn" });
-	}
+	rows.push(...probeHostBadgeItems(probe, Math.max(0, 4 - rows.length)));
 	return rows.slice(0, 4);
 }
 

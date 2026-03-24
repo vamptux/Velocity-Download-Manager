@@ -20,7 +20,6 @@ mod http_helpers;
 pub mod http_pool;
 mod operations;
 mod persistence;
-mod persistence_queue;
 mod probe;
 mod probe_cache;
 mod probe_filename;
@@ -33,8 +32,7 @@ mod runtime_bootstrap;
 mod runtime_dispatch;
 mod runtime_race;
 mod runtime_ramp;
-mod runtime_recovery;
-mod runtime_state;
+mod runtime_support;
 pub mod runtime_transfer;
 mod runtime_unknown_size;
 pub mod scheduler;
@@ -48,8 +46,9 @@ use download_identity::{
 };
 use engine_log::append_download_log;
 use file_ops::{
-    acquire_temp_transfer_lock, finalize_download_file, open_file_with_default_app,
-    open_in_file_manager, query_available_space, reset_temp_file_path,
+    acquire_temp_transfer_lock, compute_sha256_checksum, finalize_download_file,
+    open_file_with_default_app, open_in_file_manager, query_available_space,
+    reset_temp_file_path,
 };
 use helpers::{
     clear_download_terminal_state, format_bytes_compact, next_queue_position, non_empty,
@@ -61,17 +60,19 @@ use host_planner::{
     effective_connection_target_for_scope, host_diagnostics_summary_for_scope,
     initial_target_connections_for_scope, profile_warning_for_scope,
 };
-use persistence::{load_registry_snapshot, snapshot_path};
-use persistence_queue::{PersistPriority, SnapshotPersistQueue};
+use persistence::{
+    PersistPriority, SnapshotPersistQueue, load_registry_snapshot, snapshot_path,
+};
 use probe::{normalize_protocol_label, probe_download_headers_with_context};
 use probe_cache::{
     append_probe_cache_warning, apply_scope_range_validation_failure,
     cached_probe_to_download_probe, fresh_probe_capabilities, fresh_recent_probe,
     probe_cache_stale, probe_scope_key, record_probe_failure, scoped_hard_no_range,
-    scoped_probe_failures, store_recent_probe, update_profile_probe_cache,
+    scoped_probe_failures, scoped_probe_retry_backoff, store_recent_probe,
+    update_profile_probe_cache,
 };
 use runtime_dispatch::{RuntimeDispatchPlan, plan_runtime_dispatch};
-use runtime_state::clear_runtime_checkpoint;
+use runtime_support::clear_runtime_checkpoint;
 use runtime_transfer::TokenBucketRateLimiter;
 use segmentation::{SegmentPlanningHints, compute_segments_with_hints};
 use settings_policy::sanitize_engine_settings;
@@ -79,11 +80,11 @@ use wake_lock::WakeLockController;
 
 use crate::model::{
     AddDownloadArgs, AppUpdateStartupHealth, DownloadCapabilities, DownloadCompatibility,
-    DownloadDiagnostics, DownloadFailureKind, DownloadLogEntry, DownloadLogLevel,
-    DownloadRecord, DownloadRequestField, DownloadRequestMethod, DownloadRuntimeCheckpoint,
-    DownloadSegment, DownloadSegmentStatus, DownloadStatus, EngineSettings, HostProfile,
-    HostTelemetryArgs, ProbeDownloadArgs, ProbeResult, QueueState, RegistrySnapshot,
-    ReorderDirection, TrafficMode,
+    DownloadDiagnostics, DownloadFailureKind, DownloadIntegrityAlgorithm, DownloadIntegrityStatus,
+    DownloadLogEntry, DownloadLogLevel, DownloadRecord, DownloadRequestField,
+    DownloadRequestMethod, DownloadRuntimeCheckpoint, DownloadSegment, DownloadSegmentStatus,
+    DownloadStatus, EngineSettings, HostProfile, HostTelemetryArgs, ProbeDownloadArgs,
+    ProbeResult, QueueState, RegistrySnapshot, ReorderDirection, TrafficMode,
 };
 
 const DEFAULT_QUEUE: &str = "default";
@@ -118,6 +119,8 @@ struct EngineInner {
     bootstrap_notify: Notify,
     progress_sync: Mutex<ProgressSyncState>,
     runtime_tasks: Mutex<BTreeMap<String, JoinHandle<()>>>,
+    integrity_tasks: Mutex<HashSet<String>>,
+    planning_probes: Mutex<BTreeMap<String, InflightPlanningProbe>>,
     dispatch_wake_task: Mutex<Option<JoinHandle<()>>>,
     dispatch_wake_at_ms: Mutex<Option<i64>>,
     download_limiters: Mutex<BTreeMap<String, Arc<TokenBucketRateLimiter>>>,
@@ -125,10 +128,19 @@ struct EngineInner {
     wake_lock: Mutex<WakeLockController>,
 }
 
+#[derive(Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineBootstrapPhase {
+    Starting,
+    Ready,
+    Retrying,
+    Failed,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineBootstrapState {
-    pub ready: bool,
+    pub phase: EngineBootstrapPhase,
     pub error: Option<String>,
 }
 
@@ -166,11 +178,20 @@ pub struct DownloadDetailSnapshot {
     pub runtime_checkpoint: DownloadRuntimeCheckpoint,
 }
 
-#[derive(Default)]
 struct BootstrapRuntimeState {
-    ready: bool,
+    phase: EngineBootstrapPhase,
     error: Option<String>,
     running: bool,
+}
+
+impl Default for BootstrapRuntimeState {
+    fn default() -> Self {
+        Self {
+            phase: EngineBootstrapPhase::Starting,
+            error: None,
+            running: false,
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -187,6 +208,8 @@ struct DownloadCompletedEvent {
     name: String,
     target_path: String,
     save_path: String,
+    integrity_status: DownloadIntegrityStatus,
+    integrity_algorithm: DownloadIntegrityAlgorithm,
 }
 
 #[derive(Default)]
@@ -204,6 +227,12 @@ struct ProgressSyncEntry {
     last_target_connections: u32,
     segment_downloaded: BTreeMap<u32, i64>,
     segment_status: BTreeMap<u32, DownloadSegmentStatus>,
+}
+
+struct InflightPlanningProbe {
+    notify: Arc<Notify>,
+    result: Option<Result<probe::DownloadProbeData, String>>,
+    waiters: usize,
 }
 
 impl Default for ProgressSyncEntry {
@@ -375,30 +404,20 @@ pub(super) fn runtime_chunk_buffer_size_with_pressure(
     traffic_mode: &TrafficMode,
     throughput_bytes_per_second: u64,
     queue_utilization_percent: usize,
+    pressure_tier: disk_pool::QueuePressureTier,
 ) -> usize {
     let base = runtime_chunk_buffer_base_size(traffic_mode);
     let floor = runtime_chunk_buffer_floor(base);
     let ceiling = runtime_chunk_buffer_ceiling(base);
 
-    if throughput_bytes_per_second == 0 {
-        return base.clamp(floor, ceiling);
-    }
-
-    // When the disk queue is under pressure, increase the buffer size (target_window_ms).
-    // This results in fewer, larger I/O operations, reducing lock contention and I/O thrashing.
-    let target_window_ms = match queue_utilization_percent {
-        85..=100 => 128_u64,
-        70..=84 => 96_u64,
-        55..=69 => 64_u64,
-        0..=34 => 32_u64,
-        _ => 48_u64,
-    };
-    let target = throughput_bytes_per_second
-        .saturating_mul(target_window_ms)
-        .div_ceil(1_000);
-    usize::try_from(target)
-        .unwrap_or(usize::MAX)
-        .clamp(floor, ceiling)
+    disk_pool::adaptive_chunk_buffer_size(
+        base,
+        throughput_bytes_per_second,
+        floor,
+        ceiling,
+        queue_utilization_percent,
+        pressure_tier,
+    )
 }
 
 fn runtime_chunk_buffer_base_size(traffic_mode: &TrafficMode) -> usize {
@@ -601,6 +620,8 @@ impl EngineState {
                 bootstrap_notify: Notify::new(),
                 progress_sync: Mutex::new(ProgressSyncState::default()),
                 runtime_tasks: Mutex::new(BTreeMap::new()),
+                integrity_tasks: Mutex::new(HashSet::new()),
+                planning_probes: Mutex::new(BTreeMap::new()),
                 dispatch_wake_task: Mutex::new(None),
                 dispatch_wake_at_ms: Mutex::new(None),
                 download_limiters: Mutex::new(BTreeMap::new()),
@@ -616,11 +637,15 @@ impl EngineState {
                 if bootstrap.running {
                     return;
                 }
-                bootstrap.ready = false;
+                bootstrap.phase = if matches!(bootstrap.phase, EngineBootstrapPhase::Failed) {
+                    EngineBootstrapPhase::Retrying
+                } else {
+                    EngineBootstrapPhase::Starting
+                };
                 bootstrap.error = None;
                 bootstrap.running = true;
                 EngineBootstrapState {
-                    ready: false,
+                    phase: bootstrap.phase,
                     error: None,
                 }
             }
@@ -649,11 +674,11 @@ impl EngineState {
             .bootstrap
             .lock()
             .map(|state| EngineBootstrapState {
-                ready: state.ready,
+                phase: state.phase,
                 error: state.error.clone(),
             })
             .unwrap_or_else(|_| EngineBootstrapState {
-                ready: true,
+                phase: EngineBootstrapPhase::Failed,
                 error: Some("Engine bootstrap state lock was poisoned.".to_string()),
             })
     }
@@ -664,7 +689,7 @@ impl EngineState {
                 let Ok(state) = self.inner.bootstrap.lock() else {
                     return;
                 };
-                if state.ready {
+                if matches!(state.phase, EngineBootstrapPhase::Ready | EngineBootstrapPhase::Failed) {
                     return;
                 }
                 self.inner.bootstrap_notify.notified()
@@ -725,16 +750,20 @@ impl EngineState {
 
         let state = match self.inner.bootstrap.lock() {
             Ok(mut bootstrap) => {
-                bootstrap.ready = true;
+                bootstrap.phase = if bootstrap_error.is_some() {
+                    EngineBootstrapPhase::Failed
+                } else {
+                    EngineBootstrapPhase::Ready
+                };
                 bootstrap.error = bootstrap_error.clone();
                 bootstrap.running = false;
                 EngineBootstrapState {
-                    ready: bootstrap.ready,
+                    phase: bootstrap.phase,
                     error: bootstrap.error.clone(),
                 }
             }
             Err(_) => EngineBootstrapState {
-                ready: true,
+                phase: EngineBootstrapPhase::Failed,
                 error: bootstrap_error
                     .or_else(|| Some("Engine bootstrap state lock was poisoned.".to_string())),
             },
@@ -747,6 +776,28 @@ impl EngineState {
                 let _ = self.persist_registry_flush(&registry);
             }
             self.emit_engine_settings(&registry.settings);
+        }
+        self.requeue_pending_integrity_refreshes();
+    }
+
+    fn requeue_pending_integrity_refreshes(&self) {
+        let pending_ids = self
+            .registry_guard()
+            .map(|registry| {
+                registry
+                    .downloads
+                    .iter()
+                    .filter(|download| {
+                        download.status == DownloadStatus::Finished
+                            && download.integrity.status == DownloadIntegrityStatus::Pending
+                    })
+                    .map(|download| download.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for id in pending_ids {
+            self.spawn_download_integrity_refresh(id);
         }
     }
 
@@ -771,6 +822,13 @@ impl EngineState {
         priority: PersistPriority,
     ) -> Result<(), String> {
         self.inner.snapshot_writer.persist(registry, priority)
+    }
+
+    fn queue_state_snapshot(&self, running: bool) -> QueueState {
+        QueueState {
+            running,
+            persist_pressure: self.inner.snapshot_writer.telemetry_snapshot(),
+        }
     }
 
     fn retain_wake_lock(&self) {
@@ -1031,6 +1089,8 @@ impl EngineState {
                 name: download.name.clone(),
                 target_path: download.target_path.clone(),
                 save_path: download.save_path.clone(),
+                integrity_status: download.integrity.status.clone(),
+                integrity_algorithm: download.integrity.algorithm.clone(),
             },
         );
     }

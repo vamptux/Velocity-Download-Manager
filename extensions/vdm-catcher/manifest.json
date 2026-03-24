@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Velocity Download Catcher",
   "short_name": "Velocity Catcher",
-  "version": "1.0.0",
+  "version": "0.1.9",
   "description": "Intelligently intercept downloads and send them to Velocity Download Manager for maximum speed.",
   "icons": {
     "16": "icons/icon16.png",

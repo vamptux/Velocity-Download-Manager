@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Activity, ArrowDown, ChevronDown, ChevronUp, Cpu } from "lucide-react";
+import { Activity, ArrowDown, ChevronDown, ChevronUp, Cpu, Loader2 } from "lucide-react";
+import type { EngineBootstrapPhase } from "@/lib/ipc";
 import { formatBytesPerSecond } from "@/lib/format";
 import {
   parseSpeedLimitDraft,
   speedLimitDraftFromValue,
   type SpeedLimitUnit,
 } from "@/lib/speedLimits";
+import { extractErrorMessage } from "@/lib/userFacingMessages";
 import { cn } from "@/lib/utils";
+import type { QueueState } from "@/types/download";
 
 interface StatusBarProps {
   queuedCount: number;
@@ -16,11 +19,15 @@ interface StatusBarProps {
   activeCount: number;
   activeLimit: number;
   connectionCount: number;
+  guardedCount: number;
+  cooldownCount: number;
+  hostLockCount: number;
+  persistPressure: QueueState["persistPressure"];
   /** Active transfer speed in bytes/sec */
   downloadSpeed: number;
   speedLimitBytesPerSecond: number | null;
   manualOverrideCount: number;
-  engineBootstrapReady: boolean;
+  engineBootstrapPhase: EngineBootstrapPhase;
   engineBootstrapError: string | null;
   onRetryEngineBootstrap?: () => void;
   onUpdateGlobalSpeedLimit?: (limitBytesPerSecond: number | null) => Promise<void> | void;
@@ -37,15 +44,7 @@ function Sep() {
 }
 
 function getErrorMessage(error: unknown): string {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-
-  if (typeof error === "string" && error.trim()) {
-    return error;
-  }
-
-  return "VDM could not update the global speed cap.";
+  return extractErrorMessage(error, "VDM could not update the global speed cap.");
 }
 
 export function StatusBar({
@@ -56,10 +55,14 @@ export function StatusBar({
   activeCount,
   activeLimit,
   connectionCount,
+  guardedCount,
+  cooldownCount,
+  hostLockCount,
+  persistPressure,
   downloadSpeed,
   speedLimitBytesPerSecond,
   manualOverrideCount,
-  engineBootstrapReady,
+  engineBootstrapPhase,
   engineBootstrapError,
   onRetryEngineBootstrap,
   onUpdateGlobalSpeedLimit,
@@ -115,11 +118,70 @@ export function StatusBar({
     };
   }, [activeCount, finishedCount, pausedCount, queuedCount, queueRunning]);
 
-  const engineColor = engineBootstrapError
-    ? "bg-[hsl(var(--status-error))]"
-    : engineBootstrapReady
-      ? "bg-[hsl(var(--status-finished)/0.7)]"
-      : "bg-[hsl(var(--status-downloading)/0.6)]";
+  const engineStatus = useMemo(() => {
+    switch (engineBootstrapPhase) {
+      case "ready":
+        return {
+          color: "bg-[hsl(var(--status-finished)/0.7)]",
+          label: "Ready",
+          pending: false,
+          textClassName: "text-muted-foreground/44",
+        };
+      case "failed":
+        return {
+          color: "bg-[hsl(var(--status-error))]",
+          label: "Failed",
+          pending: false,
+          textClassName: "text-[hsl(var(--status-error))]",
+        };
+      case "retrying":
+        return {
+          color: "bg-[hsl(var(--status-paused)/0.82)]",
+          label: "Retrying",
+          pending: true,
+          textClassName: "text-[hsl(var(--status-paused)/0.82)]",
+        };
+      default:
+        return {
+          color: "bg-[hsl(var(--status-downloading)/0.6)]",
+          label: "Starting",
+          pending: true,
+          textClassName: "text-[hsl(var(--status-downloading)/0.72)]",
+        };
+    }
+  }, [engineBootstrapPhase]);
+
+  const persistPressureTitle = useMemo(() => {
+    const parts = [
+      `Deferred snapshots queued: ${persistPressure.queuedDeferred}`,
+      `Peak deferred depth: ${persistPressure.maxDeferredDepth}`,
+      `Backpressure events: ${persistPressure.backpressureEvents}`,
+      `Overflow replacements: ${persistPressure.overflowReplacements}`,
+    ];
+    if (persistPressure.overflowPending) {
+      parts.push("Overflow snapshot waiting to flush.");
+    }
+    if (persistPressure.lastPersistError) {
+      parts.push(persistPressure.lastPersistError);
+    }
+    return parts.join(" ");
+  }, [persistPressure]);
+
+  const persistPressureState = useMemo(() => {
+    if (persistPressure.lastPersistError) {
+      return {
+        label: "Persist error",
+        className: "text-[hsl(var(--status-error))]",
+      };
+    }
+    if (persistPressure.pressureActive) {
+      return {
+        label: persistPressure.overflowPending ? "Persist spill" : "Persist pressure",
+        className: "text-[hsl(var(--status-paused)/0.82)]",
+      };
+    }
+    return null;
+  }, [persistPressure]);
 
   const parsedDraft = parseSpeedLimitDraft(true, draftValue, draftUnit);
   const draftDirty = parsedDraft.error == null && parsedDraft.limitBytesPerSecond !== speedLimitBytesPerSecond;
@@ -221,7 +283,37 @@ export function StatusBar({
       {queuedCount > 0 && (
         <>
           <Sep />
-          <span className="text-muted-foreground/45">{queuedCount} queued</span>
+          <span className="text-muted-foreground/45">{queuedCount} backlog</span>
+        </>
+      )}
+
+      {guardedCount > 0 && (
+        <>
+          <Sep />
+          <span className="text-[hsl(var(--status-paused)/0.82)]">{guardedCount} guarded</span>
+        </>
+      )}
+
+      {cooldownCount > 0 && (
+        <>
+          <Sep />
+          <span className="text-[hsl(var(--status-paused)/0.78)]">{cooldownCount} cooldown</span>
+        </>
+      )}
+
+      {hostLockCount > 0 && (
+        <>
+          <Sep />
+          <span className="text-foreground/52">{hostLockCount} host lock</span>
+        </>
+      )}
+
+      {persistPressureState && (
+        <>
+          <Sep />
+          <span className={persistPressureState.className} title={persistPressureTitle}>
+            {persistPressureState.label}
+          </span>
         </>
       )}
 
@@ -393,13 +485,18 @@ export function StatusBar({
       <span
         className={cn(
           "flex items-center gap-1.5 transition-colors",
-          engineBootstrapError ? "text-[hsl(var(--status-error))]" : "text-muted-foreground/40",
+          engineStatus.textClassName,
         )}
-        title={engineBootstrapError ?? undefined}
+        title={engineBootstrapError ?? `Engine ${engineStatus.label.toLowerCase()}`}
       >
-        <Dot color={engineColor} />
-        <Cpu size={9.5} strokeWidth={2} />
-        {engineBootstrapError && onRetryEngineBootstrap && (
+        <Dot color={engineStatus.color} />
+        {engineStatus.pending ? (
+          <Loader2 size={9.5} strokeWidth={2} className="animate-spin" />
+        ) : (
+          <Cpu size={9.5} strokeWidth={2} />
+        )}
+        <span className="text-[9px] font-medium uppercase tracking-[0.12em]">{engineStatus.label}</span>
+        {engineBootstrapPhase === "failed" && onRetryEngineBootstrap && (
           <button
             type="button"
             onClick={onRetryEngineBootstrap}

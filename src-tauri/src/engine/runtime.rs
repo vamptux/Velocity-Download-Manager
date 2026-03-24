@@ -17,12 +17,11 @@ use super::runtime_race::{
     restore_runtime_races_from_checkpoint,
 };
 use super::runtime_ramp::*;
-use super::runtime_recovery::{
-    classify_runtime_error, reconcile_runtime_error, runtime_control_flow_error,
-    runtime_validation_error,
-};
-use super::runtime_state::{
-    persist_runtime_races, upsert_runtime_segment_health, upsert_runtime_segment_sample,
+use super::runtime_support::{
+    clear_runtime_checkpoint, classify_runtime_error, persist_runtime_races,
+    push_unique_diagnostic, reconcile_runtime_error, record_runtime_warning,
+    runtime_control_flow_error, runtime_validation_error,
+    upsert_runtime_segment_health, upsert_runtime_segment_sample,
 };
 use super::runtime_transfer::{
     InitialResponseStream, SegmentRuntimeControl, SegmentWorkerStart, TransferWorkerConfig,
@@ -33,8 +32,313 @@ use super::scheduler::{SegmentRuntimeSample, SegmentScheduler};
 use super::*;
 use crate::model::{DownloadCompatibility, ResumeValidators};
 
+struct ResumeResetReason {
+    warning: String,
+    terminal_reason: String,
+    log_message: String,
+}
+
+fn resume_validators_have_strong_identity(validators: &ResumeValidators) -> bool {
+    validators.etag.is_some() || validators.last_modified.is_some()
+}
+
+fn matching_resume_identity(saved: &ResumeValidators, fresh: &ResumeValidators) -> bool {
+    matches!((&saved.etag, &fresh.etag), (Some(left), Some(right)) if left == right)
+        || matches!(
+            (&saved.last_modified, &fresh.last_modified),
+            (Some(left), Some(right)) if left == right
+        )
+}
+
+fn expected_download_size(download: &DownloadRecord) -> Option<u64> {
+    u64::try_from(download.size).ok().filter(|value| *value > 0)
+}
+
+fn segment_span_len(segment: &DownloadSegment) -> Option<u64> {
+    let start = u64::try_from(segment.start).ok()?;
+    let end = u64::try_from(segment.end).ok()?;
+    end.checked_sub(start)?.checked_add(1)
+}
+
+fn segmented_partial_state_was_persisted(download: &DownloadRecord) -> bool {
+    download.capabilities.segmented
+        || download.target_connections > 1
+        || !download.runtime_checkpoint.segment_samples.is_empty()
+        || !download.runtime_checkpoint.active_races.is_empty()
+}
+
+fn resume_reset_for_segment_state_mismatch(download: &DownloadRecord) -> Option<ResumeResetReason> {
+    if download.downloaded <= 0 || expected_download_size(download).is_none() {
+        return None;
+    }
+
+    if !segmented_partial_state_was_persisted(download) {
+        return None;
+    }
+
+    if download.segments.is_empty() {
+        return Some(ResumeResetReason {
+            warning: "VDM discarded the saved partial state because the segmented checkpoint no longer included a recoverable byte-range map.".to_string(),
+            terminal_reason:
+                "The saved partial download no longer had enough segment state for a safe resume, so VDM restarted it from zero."
+                    .to_string(),
+            log_message:
+                "Runtime resume reset because persisted segmented partial state was missing its segment map."
+                    .to_string(),
+        });
+    }
+
+    let mut total_segment_progress = 0u64;
+    for segment in &download.segments {
+        let span_len = match segment_span_len(segment) {
+            Some(value) => value,
+            None => {
+                return Some(ResumeResetReason {
+                    warning: "VDM discarded the saved partial state because one or more saved segment bounds were invalid.".to_string(),
+                    terminal_reason:
+                        "The saved segmented resume plan was invalid, so VDM restarted this transfer from zero."
+                            .to_string(),
+                    log_message:
+                        "Runtime resume reset because a persisted segment had invalid byte bounds."
+                            .to_string(),
+                });
+            }
+        };
+
+        let downloaded = u64::try_from(segment.downloaded).unwrap_or_default();
+        if downloaded > span_len {
+            return Some(ResumeResetReason {
+                warning: format!(
+                    "VDM discarded the saved partial state because segment {} recorded {} of progress for a {} byte span.",
+                    segment.id,
+                    format_bytes_compact(downloaded),
+                    format_bytes_compact(span_len),
+                ),
+                terminal_reason:
+                    "The saved segmented resume plan no longer matched the recorded byte ranges, so VDM restarted this transfer from zero."
+                        .to_string(),
+                log_message: format!(
+                    "Runtime resume reset because segment {} recorded {} bytes for a {} byte span.",
+                    segment.id, downloaded, span_len,
+                ),
+            });
+        }
+
+        total_segment_progress = total_segment_progress.saturating_add(downloaded);
+    }
+
+    let recorded_progress = u64::try_from(download.downloaded).unwrap_or_default();
+    if total_segment_progress != recorded_progress {
+        return Some(ResumeResetReason {
+            warning: format!(
+                "VDM discarded the saved partial state because the segmented checkpoint recorded {} while the aggregate progress snapshot recorded {}.",
+                format_bytes_compact(total_segment_progress),
+                format_bytes_compact(recorded_progress),
+            ),
+            terminal_reason:
+                "The saved segmented checkpoint no longer matched the recorded transfer progress, so VDM restarted this transfer from zero."
+                    .to_string(),
+            log_message: format!(
+                "Runtime resume reset because segment progress {} differed from aggregate progress {}.",
+                total_segment_progress, recorded_progress,
+            ),
+        });
+    }
+
+    None
+}
+
+fn resume_reset_for_partial_file_state(download: &DownloadRecord) -> Option<ResumeResetReason> {
+    if download.downloaded <= 0 {
+        return None;
+    }
+
+    let metadata = match fs::metadata(&download.temp_path) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return Some(ResumeResetReason {
+                warning: "VDM discarded the saved partial state because the temp file was missing before resume validation completed.".to_string(),
+                terminal_reason:
+                    "The saved partial file was missing, so VDM restarted this transfer from zero."
+                        .to_string(),
+                log_message:
+                    "Runtime resume reset because the persisted partial file was missing."
+                        .to_string(),
+            });
+        }
+    };
+
+    let actual_len = metadata.len();
+    let recorded_progress = u64::try_from(download.downloaded).unwrap_or_default();
+    if actual_len < recorded_progress {
+        return Some(ResumeResetReason {
+            warning: format!(
+                "VDM discarded the saved partial state because the temp file only contained {} while the checkpoint recorded {}.",
+                format_bytes_compact(actual_len),
+                format_bytes_compact(recorded_progress),
+            ),
+            terminal_reason:
+                "The temp file was shorter than the saved resume checkpoint, so VDM restarted this transfer from zero."
+                    .to_string(),
+            log_message: format!(
+                "Runtime resume reset because temp file length {} was shorter than recorded progress {}.",
+                actual_len, recorded_progress,
+            ),
+        });
+    }
+
+    if let Some(expected_size) = expected_download_size(download)
+        && actual_len > expected_size
+    {
+        return Some(ResumeResetReason {
+            warning: format!(
+                "VDM discarded the saved partial state because the temp file grew past the planned size ({} vs {}).",
+                format_bytes_compact(actual_len),
+                format_bytes_compact(expected_size),
+            ),
+            terminal_reason:
+                "The temp file no longer matched the saved transfer plan, so VDM restarted this transfer from zero."
+                    .to_string(),
+            log_message: format!(
+                "Runtime resume reset because temp file length {} exceeded expected size {}.",
+                actual_len, expected_size,
+            ),
+        });
+    }
+
+    None
+}
+
+fn resume_reset_for_validator_mismatch(
+    download: &DownloadRecord,
+    fresh: &ResumeValidators,
+) -> Option<ResumeResetReason> {
+    let saved = &download.validators;
+    if download.downloaded <= 0 {
+        return None;
+    }
+
+    if !resume_validators_have_strong_identity(saved) {
+        return Some(ResumeResetReason {
+            warning: "VDM discarded the saved partial state because the previous session never captured a stable ETag or Last-Modified validator for safe resume.".to_string(),
+            terminal_reason:
+                "This partial download did not have a trusted resume validator, so VDM restarted it from zero."
+                    .to_string(),
+            log_message:
+                "Runtime resume reset because the saved partial download lacked a strong validator."
+                    .to_string(),
+        });
+    }
+
+    if !resume_validators_have_strong_identity(fresh) {
+        return Some(ResumeResetReason {
+            warning: "VDM discarded the saved partial state because the live resume probe did not return a stable ETag or Last-Modified validator.".to_string(),
+            terminal_reason:
+                "The current server response did not provide a trusted resume validator, so VDM restarted this transfer from zero."
+                    .to_string(),
+            log_message:
+                "Runtime resume reset because the live probe did not return a strong validator."
+                    .to_string(),
+        });
+    }
+
+    if let Some(expected_size) = expected_download_size(download)
+        && let Some(fresh_length) = fresh.content_length
+        && fresh_length != expected_size
+    {
+        return Some(ResumeResetReason {
+            warning: format!(
+                "VDM discarded the saved partial state because the remote size changed from {} to {} during resume validation.",
+                format_bytes_compact(expected_size),
+                format_bytes_compact(fresh_length),
+            ),
+            terminal_reason:
+                "The remote file size changed since the partial download was created, so VDM restarted it from zero."
+                    .to_string(),
+            log_message: format!(
+                "Runtime resume reset because remote content length {} differed from expected size {}.",
+                fresh_length, expected_size,
+            ),
+        });
+    }
+
+    if let (Some(saved_length), Some(fresh_length)) = (saved.content_length, fresh.content_length)
+        && saved_length != fresh_length
+    {
+        return Some(ResumeResetReason {
+            warning: format!(
+                "VDM discarded the saved partial state because the stored content length {} no longer matched the live response length {}.",
+                format_bytes_compact(saved_length),
+                format_bytes_compact(fresh_length),
+            ),
+            terminal_reason:
+                "The saved resume metadata no longer matched the server response, so VDM restarted this transfer from zero."
+                    .to_string(),
+            log_message: format!(
+                "Runtime resume reset because saved content length {} differed from live content length {}.",
+                saved_length, fresh_length,
+            ),
+        });
+    }
+
+    if !matching_resume_identity(saved, fresh) {
+        return Some(ResumeResetReason {
+            warning: "VDM discarded the saved partial state because the live resume validator no longer matched the saved ETag or Last-Modified identity.".to_string(),
+            terminal_reason:
+                "The server returned a different resume validator for this partial download, so VDM restarted it from zero."
+                    .to_string(),
+            log_message:
+                "Runtime resume reset because saved and live strong validators did not match."
+                    .to_string(),
+        });
+    }
+
+    None
+}
+
+fn reset_unsafe_resume_state(
+    engine: &EngineState,
+    runtime_download: &mut DownloadRecord,
+    settings: &EngineSettings,
+    reason: ResumeResetReason,
+) -> Result<(), String> {
+    let temp_path = runtime_download.temp_path.clone();
+    let mut registry = engine.registry_guard()?;
+    let Some(download) = registry
+        .downloads
+        .iter_mut()
+        .find(|download| download.id == runtime_download.id)
+    else {
+        return Err("Download disappeared during resume validation.".to_string());
+    };
+
+    reset_download_progress(download);
+    clear_runtime_checkpoint(download);
+    ensure_segment_plan(download, settings);
+    download.error_message = None;
+    download.diagnostics.failure_kind = None;
+    push_unique_diagnostic(&mut download.diagnostics.warnings, reason.warning.clone());
+    download.diagnostics.terminal_reason = Some(reason.terminal_reason);
+    append_download_log(
+        download,
+        DownloadLogLevel::Warn,
+        "runtime.resume-reset",
+        reason.log_message,
+    );
+    let response = download.clone();
+    engine.persist_registry(&registry)?;
+    drop(registry);
+    reset_temp_file_path(&temp_path)?;
+    engine.emit_download_upsert(&response);
+    *runtime_download = response;
+    Ok(())
+}
+
 const RUNTIME_ADAPTIVE_POLL_MS: u64 = 400;
 pub(super) const UNKNOWN_SIZE_SPACE_CHECK_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const UNKNOWN_SIZE_SPACE_CHECK_MIN_INTERVAL_BYTES: u64 = 2 * 1024 * 1024;
+pub(super) const UNKNOWN_SIZE_SPACE_CHECK_MAX_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const UNKNOWN_SIZE_SPACE_CHECK_TARGET_SECONDS: u64 = 2;
 pub(super) const UNKNOWN_SIZE_SPACE_SAFETY_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 const DISK_DRAIN_WAIT_POLL_MS: u64 = 25;
 const DISK_DRAIN_WAIT_TIMEOUT_MS: u64 = 20_000;
@@ -257,25 +561,6 @@ pub(super) fn runtime_protocol_hint(snapshot: &RuntimeTelemetrySnapshot) -> Opti
         .map(|(protocol, _)| protocol.clone())
 }
 
-fn resume_validators_compatible(saved: &ResumeValidators, fresh: &ResumeValidators) -> bool {
-    if let (Some(left), Some(right)) = (&saved.etag, &fresh.etag)
-        && left != right
-    {
-        return false;
-    }
-    if let (Some(left), Some(right)) = (&saved.last_modified, &fresh.last_modified)
-        && left != right
-    {
-        return false;
-    }
-    if let (Some(left), Some(right)) = (saved.content_length, fresh.content_length)
-        && left != right
-    {
-        return false;
-    }
-    true
-}
-
 fn needs_runtime_metadata_bootstrap(download: &DownloadRecord) -> bool {
     requires_wrapper_probe_refresh(download)
         || (download.downloaded <= 0
@@ -455,36 +740,6 @@ fn reserve_known_size_temp_file(file: &std::fs::File, size: u64) -> Result<(), S
             format_bytes_compact(size)
         )
     })
-}
-
-pub(super) fn push_unique_diagnostic(values: &mut Vec<String>, message: impl Into<String>) {
-    let message = message.into();
-    if !values.iter().any(|existing| existing == &message) {
-        values.push(message);
-    }
-}
-
-pub(super) fn record_runtime_warning(
-    engine: &EngineState,
-    runtime_download: &mut DownloadRecord,
-    code: &str,
-    warning: String,
-) {
-    push_unique_diagnostic(&mut runtime_download.diagnostics.warnings, warning.clone());
-
-    if let Ok(mut registry) = engine.registry_guard() {
-        if let Some(download) = registry
-            .downloads
-            .iter_mut()
-            .find(|download| download.id == runtime_download.id)
-        {
-            push_unique_diagnostic(&mut download.diagnostics.warnings, warning.clone());
-            append_download_log(download, DownloadLogLevel::Warn, code, warning.clone());
-            runtime_download.diagnostics = download.diagnostics.clone();
-            runtime_download.engine_log = download.engine_log.clone();
-        }
-        let _ = engine.persist_registry(&registry);
-    }
 }
 
 pub(super) fn disk_queue_under_pressure(disk_pool: &disk_pool::DiskPool) -> bool {
@@ -824,13 +1079,22 @@ fn adjust_runtime_segment_supply(
             .iter()
             .filter(|segment| matches!(segment.status, DownloadSegmentStatus::Pending))
             .count() as u32;
+        let sampled_speed = runtime_samples
+            .iter()
+            .filter_map(|sample| sample.throughput_bytes_per_second)
+            .filter(|value| *value > 0)
+            .sum::<u64>();
+        let sampled_speed = (sampled_speed > 0).then_some(sampled_speed);
         let remaining_bytes = (download.size - download.downloaded).max(0) as u64;
         let required_window = settings
             .min_segment_size_bytes
             .saturating_mul(u64::from(current_target.saturating_add(1)));
-        let speed = download.speed;
+        let speed = sampled_speed.unwrap_or(download.speed);
         ramp_state.record_sample(now, current_target, speed, median_ttfb_ms);
-        let stable_speed = ramp_state.stable_speed(current_target).unwrap_or(speed);
+        let stable_speed = ramp_state
+            .stable_speed(current_target)
+            .or(sampled_speed)
+            .unwrap_or(speed);
         let stable_ttfb_ms = ramp_state.stable_ttfb_ms(current_target).or(median_ttfb_ms);
         let sample_count = ramp_state.sample_count(current_target);
         let sustained_gain = ramp_state.marginal_gain(current_target);
@@ -1082,6 +1346,18 @@ impl EngineState {
             }
         }
 
+        if runtime_download.downloaded > 0
+            && let Some(reason) = resume_reset_for_partial_file_state(&runtime_download)
+        {
+            reset_unsafe_resume_state(self, &mut runtime_download, &settings, reason)?;
+        }
+
+        if runtime_download.downloaded > 0
+            && let Some(reason) = resume_reset_for_segment_state_mismatch(&runtime_download)
+        {
+            reset_unsafe_resume_state(self, &mut runtime_download, &settings, reason)?;
+        }
+
         if runtime_download.downloaded > 0 {
             let validation_probe = if let Some(probe) = bootstrap_probe.clone() {
                 Some(probe)
@@ -1105,26 +1381,10 @@ impl EngineState {
             };
 
             if let Some(probe) = validation_probe
-                && !resume_validators_compatible(&runtime_download.validators, &probe.validators)
+                && let Some(reason) =
+                    resume_reset_for_validator_mismatch(&runtime_download, &probe.validators)
             {
-                let mut registry = self.registry_guard()?;
-                if let Some(download) = registry
-                    .downloads
-                    .iter_mut()
-                    .find(|download| download.id == runtime_download.id)
-                {
-                    reset_download_progress(download);
-                    clear_runtime_checkpoint(download);
-                    ensure_segment_plan(download, &settings);
-                    download.error_message = None;
-                    download.diagnostics.failure_kind = None;
-                    download.diagnostics.terminal_reason =
-                        Some("Resume validators changed; restarting from zero.".to_string());
-                    runtime_download = download.clone();
-                }
-                self.persist_registry(&registry)?;
-                drop(registry);
-                reset_temp_file_path(&runtime_download.temp_path)?;
+                reset_unsafe_resume_state(self, &mut runtime_download, &settings, reason)?;
             }
         }
 
@@ -1399,6 +1659,7 @@ impl EngineState {
                             &runtime_download.traffic_mode,
                             runtime_download.speed,
                             disk_pool.queue_utilization_percent(),
+                            disk_pool.pressure_tier(),
                         ),
                         request_timeout_secs: 30,
                         retry_budget: segment.retry_budget.max(1),
@@ -1569,9 +1830,14 @@ impl EngineState {
                                         .map(|segment| segment.downloaded.max(0))
                                         .sum::<i64>()
                                         .max(0);
+                                    let uses_segmented_aggregate_speed =
+                                        download.capabilities.segmented
+                                            && download.segments.len() > 1;
                                     if let Some(aggregate_speed) = aggregate_speed {
                                         download.speed = aggregate_speed;
-                                    } else if progress.throughput_bytes_per_second > 0 {
+                                    } else if progress.throughput_bytes_per_second > 0
+                                        && !uses_segmented_aggregate_speed
+                                    {
                                         download.speed = progress.throughput_bytes_per_second;
                                     }
                                     download.time_left = estimate_time_left(
@@ -1777,11 +2043,17 @@ impl EngineState {
                                         .ok()
                                         .map(|value| value.values().cloned().collect::<Vec<_>>())
                                         .unwrap_or_default();
+                                    let idle_worker_count = u32::try_from(
+                                        desired_parallel.saturating_sub(join_set.len()),
+                                    )
+                                    .unwrap_or(u32::MAX)
+                                    .max(1);
                                     let expansion = attempt_runtime_queue_expansion(
                                         download,
                                         &scheduler,
                                         &samples,
                                         &mut race_by_segment,
+                                        idle_worker_count,
                                     );
                                     appended = expansion.appended_segment;
                                     control_updates = expansion.control_updates;
@@ -2012,6 +2284,7 @@ impl EngineState {
                         "Finalization used a cross-volume copy fallback because the temp and target folders resolved to different volumes.",
                     );
                 }
+                super::operations::mark_download_integrity_pending(download);
                 for warning in finalize_warnings {
                     push_unique_diagnostic(&mut download.diagnostics.warnings, warning);
                 }
@@ -2050,6 +2323,7 @@ impl EngineState {
             self.emit_download_progress_diff_if_due(&response, min_emit_interval_ms);
             self.emit_download_upsert(&response);
             self.trigger_download_completion_actions(&response);
+            self.spawn_download_integrity_refresh(response.id.clone());
             self.apply_runtime_dispatch_plan(dispatch_plan, min_emit_interval_ms);
         }
         Ok(())

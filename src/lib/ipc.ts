@@ -3,6 +3,7 @@ import type {
   AppUpdateCheckResult,
   AppUpdateInfo,
   AppUpdateStartupHealth,
+  CaptureBridgeStatus,
   AddDownloadArgs as BackendAddDownloadArgs,
   CapturePayload,
   Download,
@@ -21,9 +22,19 @@ import type {
 
 export type RawDownload = DownloadRecord;
 
+export type EngineBootstrapPhase = "starting" | "ready" | "retrying" | "failed";
+
 export interface EngineBootstrapState {
-  ready: boolean;
+  phase: EngineBootstrapPhase;
   error: string | null;
+}
+
+export function isEngineBootstrapReady(state: EngineBootstrapState): boolean {
+  return state.phase === "ready";
+}
+
+export function isEngineBootstrapSettled(state: EngineBootstrapState): boolean {
+  return state.phase === "ready" || state.phase === "failed";
 }
 
 interface RawAppState {
@@ -205,9 +216,13 @@ export interface IpcAddArgs {
   startImmediately?: boolean;
 }
 
-export async function ipcTakePendingCapturePayload(windowLabel?: string): Promise<CapturePayload | null> {
-  return invoke<CapturePayload | null>("take_pending_capture_payload", {
-    windowLabel: windowLabel ?? null,
+export async function ipcGetCaptureBridgeStatus(): Promise<CaptureBridgeStatus> {
+  return invoke<CaptureBridgeStatus>("get_capture_bridge_status");
+}
+
+export async function ipcCaptureWindowReady(windowLabel: string): Promise<CapturePayload | null> {
+  return invoke<CapturePayload | null>("capture_window_ready", {
+    windowLabel,
   });
 }
 
@@ -291,6 +306,27 @@ export async function ipcSetDownloadCompletionOptions(
     id,
     openFolderOnCompletion,
   });
+  return fromRawDownload(raw);
+}
+
+export async function ipcSetDownloadIntegrityExpectedHash(
+  id: string,
+  expectedHash: string | null,
+): Promise<Download> {
+  const raw = await invoke<RawDownload>("set_download_integrity_expected_hash", {
+    id,
+    expectedHash,
+  });
+  return fromRawDownload(raw);
+}
+
+export async function ipcVerifyDownloadChecksum(id: string): Promise<Download> {
+  const raw = await invoke<RawDownload>("verify_download_checksum", { id });
+  return fromRawDownload(raw);
+}
+
+export async function ipcRecalculateDownloadChecksum(id: string): Promise<Download> {
+  const raw = await invoke<RawDownload>("recalculate_download_checksum", { id });
   return fromRawDownload(raw);
 }
 

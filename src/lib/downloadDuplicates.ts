@@ -8,12 +8,27 @@ export interface DuplicateLookupInput {
   validators?: ResumeValidators | null;
 }
 
+export interface DuplicateCandidateInput {
+  url?: string | null;
+  finalUrl?: string | null;
+  targetPath?: string | null;
+  savePath?: string | null;
+  name?: string | null;
+  validators?: ResumeValidators | null;
+}
+
 export interface DuplicateMatch {
   download: Download;
   reason: "url" | "validators" | "targetPath";
 }
 
 export type DuplicateResolutionKind = "resume" | "restart" | "reveal" | "inspect" | "keepBoth";
+
+export interface DuplicateState {
+  match: DuplicateMatch | null;
+  resolution: DuplicateResolutionKind | null;
+  secondaryResolution: DuplicateResolutionKind | null;
+}
 
 export function normalizeComparableUrl(url: string | null | undefined): string | null {
   const trimmed = url?.trim();
@@ -80,6 +95,15 @@ export function joinTargetPathPreview(savePath: string, name: string): string | 
   return `${base}${separator}${trimmedName}`;
 }
 
+export function buildDuplicateLookupInput(input: DuplicateCandidateInput): DuplicateLookupInput {
+  return {
+    url: input.url,
+    finalUrl: input.finalUrl,
+    targetPath: input.targetPath ?? joinTargetPathPreview(input.savePath ?? "", input.name ?? ""),
+    validators: input.validators,
+  };
+}
+
 function normalizeValidatorToken(
   value: string | null | undefined,
   lowerCase: boolean = false,
@@ -127,25 +151,13 @@ export function findDuplicateDownload(
   downloads: Download[],
   input: DuplicateLookupInput,
 ): DuplicateMatch | null {
-  const candidateTargetPath = normalizeComparablePath(input.targetPath);
-
-  if (candidateTargetPath) {
-    for (const download of downloads) {
-      const existingTargetPath = normalizeComparablePath(download.targetPath);
-      if (existingTargetPath && existingTargetPath === candidateTargetPath) {
-        return { download, reason: "targetPath" };
-      }
-    }
-
-    return null;
-  }
-
   const candidateUrls = new Set(
     [normalizeComparableUrl(input.url), normalizeComparableUrl(input.finalUrl)].filter(
       (value): value is string => value != null,
     ),
   );
   const candidateValidators = input.validators;
+  const candidateTargetPath = normalizeComparablePath(input.targetPath);
 
   for (const download of downloads) {
     if (candidateUrls.size > 0) {
@@ -159,6 +171,13 @@ export function findDuplicateDownload(
 
     if (validatorsMatch(download.validators, candidateValidators)) {
       return { download, reason: "validators" };
+    }
+
+    if (candidateTargetPath) {
+      const existingTargetPath = normalizeComparablePath(download.targetPath);
+      if (existingTargetPath && existingTargetPath === candidateTargetPath) {
+        return { download, reason: "targetPath" };
+      }
     }
   }
 
@@ -207,6 +226,18 @@ export function getSecondaryDuplicateResolution(match: DuplicateMatch): Duplicat
   }
 
   return getExistingDuplicateResolution(match);
+}
+
+export function resolveDuplicateState(
+  downloads: Download[],
+  input: DuplicateCandidateInput,
+): DuplicateState {
+  const match = findDuplicateDownload(downloads, buildDuplicateLookupInput(input));
+  return {
+    match,
+    resolution: match ? getDuplicateResolution(match) : null,
+    secondaryResolution: match ? getSecondaryDuplicateResolution(match) : null,
+  };
 }
 
 export function duplicateResolutionLabel(

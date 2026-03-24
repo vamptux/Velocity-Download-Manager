@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::model::{DownloadRecord, DownloadStatus, EngineSettings, HostProfile, RegistrySnapshot};
 
@@ -217,46 +217,92 @@ pub(super) fn plan_runtime_dispatch(registry: &mut RegistrySnapshot) -> RuntimeD
         .collect();
     queued_indices.sort_by_key(|index| dispatch_sort_key(&registry.downloads[*index]));
 
-    let mut launch_indices = Vec::new();
+    let mut queued_by_host: BTreeMap<String, VecDeque<usize>> = BTreeMap::new();
     for index in queued_indices {
+        if let Some(download) = registry.downloads.get(index) {
+            queued_by_host
+                .entry(download.host.clone())
+                .or_default()
+                .push_back(index);
+        }
+    }
+
+    let mut launch_indices = Vec::new();
+    loop {
         if active_count >= active_limit {
             break;
         }
 
-        let Some(download) = registry.downloads.get(index) else {
-            continue;
-        };
-        let next_requested = requested_by_host
-            .get(&download.host)
-            .copied()
-            .unwrap_or(16u32)
-            .max(requested_connection_cap(download, &settings));
-        let host_cap = scheduler_host_connection_budget(
-            next_requested,
-            &settings,
-            host_profiles.get(&download.host),
-        );
-        if active_by_host.get(&download.host).copied().unwrap_or(0) >= host_cap {
-            continue;
+        let mut host_heads: Vec<((u8, u32, i64, String), String)> = queued_by_host
+            .iter()
+            .filter_map(|(host, indices)| {
+                indices
+                    .front()
+                    .map(|index| (dispatch_sort_key(&registry.downloads[*index]), host.clone()))
+            })
+            .collect();
+        if host_heads.is_empty() {
+            break;
+        }
+        host_heads.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut launched_this_round = false;
+        for (_, host) in host_heads {
+            if active_count >= active_limit {
+                break;
+            }
+
+            let Some(indices) = queued_by_host.get_mut(&host) else {
+                continue;
+            };
+            let Some(index) = indices.front().copied() else {
+                continue;
+            };
+            let Some(download) = registry.downloads.get(index) else {
+                indices.pop_front();
+                continue;
+            };
+
+            let requested_connections = requested_connection_cap(download, &settings);
+            let next_requested = requested_by_host
+                .get(&host)
+                .copied()
+                .unwrap_or(16u32)
+                .max(requested_connections);
+            let host_cap = scheduler_host_connection_budget(
+                next_requested,
+                &settings,
+                host_profiles.get(&host),
+            );
+            if active_by_host.get(&host).copied().unwrap_or(0) >= host_cap {
+                continue;
+            }
+
+            indices.pop_front();
+            let download = &mut registry.downloads[index];
+            download.status = DownloadStatus::Downloading;
+            changed_ids.insert(download.id.clone(), ());
+            active_indices.push(index);
+            launch_indices.push(index);
+            active_count = active_count.saturating_add(1);
+            launched_this_round = true;
+            *active_by_host.entry(host.clone()).or_default() = active_by_host
+                .get(&host)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            requested_by_host
+                .entry(host)
+                .and_modify(|value| {
+                    *value = (*value).max(requested_connections);
+                })
+                .or_insert(requested_connections);
         }
 
-        let download = &mut registry.downloads[index];
-        download.status = DownloadStatus::Downloading;
-        changed_ids.insert(download.id.clone(), ());
-        active_indices.push(index);
-        launch_indices.push(index);
-        active_count = active_count.saturating_add(1);
-        *active_by_host.entry(download.host.clone()).or_default() = active_by_host
-            .get(&download.host)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
-        requested_by_host
-            .entry(download.host.clone())
-            .and_modify(|value| {
-                *value = (*value).max(requested_connection_cap(download, &settings));
-            })
-            .or_insert_with(|| requested_connection_cap(download, &settings));
+        queued_by_host.retain(|_, indices| !indices.is_empty());
+        if !launched_this_round {
+            break;
+        }
     }
 
     let mut active_groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();

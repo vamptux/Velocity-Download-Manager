@@ -42,7 +42,7 @@ import {
   ipcUpdateEngineSettings,
   type DownloadDetailSnapshot,
 } from "@/lib/ipc";
-import { simplifyUserMessage } from "@/lib/userFacingMessages";
+import { extractErrorMessage, simplifyUserMessage } from "@/lib/userFacingMessages";
 import type {
   AppUpdateChannel,
   AppUpdateCheckResult,
@@ -69,6 +69,19 @@ const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   speedLimitBytesPerSecond: null,
   updateChannel: "stable",
   skippedUpdateVersion: null,
+};
+
+const DEFAULT_QUEUE_STATE: QueueState = {
+  running: true,
+  persistPressure: {
+    pressureActive: false,
+    queuedDeferred: 0,
+    maxDeferredDepth: 0,
+    backpressureEvents: 0,
+    overflowReplacements: 0,
+    overflowPending: false,
+    lastPersistError: null,
+  },
 };
 
 const LIVE_PROGRESS_HEARTBEAT_MS = 1200;
@@ -121,15 +134,7 @@ function summarizeBatchResult(actionLabel: string, result: BatchActionResult): A
 }
 
 function getActionErrorMessage(error: unknown, fallback: string): string {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-
-  if (typeof error === "string" && error.trim()) {
-    return error;
-  }
-
-  return fallback;
+  return extractErrorMessage(error, fallback);
 }
 
 function getErrorMessage(error: unknown): string {
@@ -161,7 +166,8 @@ function appUpdateProgressMessage(downloadedBytes: number, totalBytes: number | 
 }
 
 function updateChannelLabel(channel: AppUpdateChannel): string {
-  return channel === "preview" ? "Preview" : "Stable";
+  void channel;
+  return "Stable";
 }
 
 function updateFeedbackFromResult(result: AppUpdateCheckResult): AppUpdateFeedback | null {
@@ -397,10 +403,10 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [downloads, setDownloads] = useState<Download[]>([]);
   const [settings, setSettings] = useState<EngineSettings>(DEFAULT_ENGINE_SETTINGS);
-  const [queueState, setQueueState] = useState<QueueState>({ running: true });
+  const [queueState, setQueueState] = useState<QueueState>(DEFAULT_QUEUE_STATE);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
-  const [bootstrapState, setBootstrapState] = useState<EngineBootstrapState>({ ready: false, error: null });
+  const [bootstrapState, setBootstrapState] = useState<EngineBootstrapState>({ phase: "starting", error: null });
   const [startupUpdateHealth, setStartupUpdateHealth] = useState<AppUpdateStartupHealth | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
@@ -495,6 +501,22 @@ export function App() {
           stats.manualOverrideCount += 1;
         }
 
+        if (
+          download.status !== "finished"
+          && (download.diagnostics.restartRequired || !download.capabilities.rangeSupported)
+        ) {
+          stats.guardedCount += 1;
+        }
+
+        const cooldownUntil = download.hostDiagnostics.cooldownUntil ?? download.hostCooldownUntil;
+        if (cooldownUntil != null && cooldownUntil > Date.now()) {
+          stats.cooldownCount += 1;
+        }
+
+        if (download.hostDiagnostics.concurrencyLocked) {
+          stats.hostLockCount += 1;
+        }
+
         if (download.status !== "downloading") {
           return stats;
         }
@@ -517,6 +539,9 @@ export function App() {
         finishedCount: 0,
         totalSpeed: 0,
         manualOverrideCount: 0,
+        guardedCount: 0,
+        cooldownCount: 0,
+        hostLockCount: 0,
       },
     ),
     [downloads],
@@ -1116,7 +1141,7 @@ export function App() {
     try {
       setBootstrapState(await ipcRetryEngineBootstrap());
     } catch (error) {
-      setBootstrapState({ ready: true, error: getErrorMessage(error) });
+      setBootstrapState({ phase: "failed", error: getErrorMessage(error) });
     }
   }, []);
 
@@ -1130,7 +1155,6 @@ export function App() {
       }));
       return;
     }
-
     void ipcUpdateEngineSettings({
       ...settings,
       skippedUpdateVersion: dismissedVersion,
@@ -1595,10 +1619,14 @@ export function App() {
             activeCount={downloadStats.activeCount}
             activeLimit={settings.maxActiveDownloads}
             connectionCount={downloadStats.activeConnections}
+            guardedCount={downloadStats.guardedCount}
+            cooldownCount={downloadStats.cooldownCount}
+            hostLockCount={downloadStats.hostLockCount}
+            persistPressure={queueState.persistPressure}
             downloadSpeed={downloadStats.totalSpeed}
             speedLimitBytesPerSecond={settings.speedLimitBytesPerSecond ?? null}
             manualOverrideCount={downloadStats.manualOverrideCount}
-            engineBootstrapReady={bootstrapState.ready}
+            engineBootstrapPhase={bootstrapState.phase}
             engineBootstrapError={bootstrapState.error}
             onRetryEngineBootstrap={() => {
               void handleRetryBootstrap();

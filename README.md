@@ -55,4 +55,4 @@ Frontend-only iteration is available through `bun run dev`.
 bun run check:version-sync
 ```
 
-Run that before tagging a release if you changed any version metadata by hand.
+Run that before tagging a release if you changed any version metadata by hand. It now verifies the desktop package versions and the VDM Catcher extension manifest stay aligned on the same release number.

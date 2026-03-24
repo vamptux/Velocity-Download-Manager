@@ -1,4 +1,5 @@
 import type { Download } from "@/types/download";
+import { extractErrorMessage } from "@/lib/userFacingMessages";
 
 export interface BatchActionFailure {
   id: string;
@@ -12,22 +13,23 @@ export interface BatchActionResult {
 }
 
 function batchActionErrorMessage(error: unknown): string {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-
-  if (typeof error === "string" && error.trim()) {
-    return error;
-  }
-
-  return "The action could not be completed.";
+  return extractErrorMessage(error, "The action could not be completed.");
 }
 
-function isReplayOnlyRequest(download: Download): boolean {
+type ReplayOnlyRequestDownload = Pick<Download, "compatibility">;
+
+type RestartReasonDownload = Pick<
+  Download,
+  "diagnostics" | "compatibility" | "capabilities"
+>;
+
+function isReplayOnlyRequest(download: ReplayOnlyRequestDownload): boolean {
   return download.compatibility.requestMethod !== "get" || download.compatibility.requestFormFields.length > 0;
 }
 
-export function restartRequirementLabel(download: Download): string | null {
+export function restartRequirementLabel(
+  download: Pick<Download, "diagnostics" | "compatibility">,
+): string | null {
   if (!download.diagnostics.restartRequired) {
     return null;
   }
@@ -39,7 +41,7 @@ export function restartRequirementLabel(download: Download): string | null {
   return "Restart only";
 }
 
-export function restartRequirementReason(download: Download): string | null {
+export function restartRequirementReason(download: RestartReasonDownload): string | null {
   if (!download.diagnostics.restartRequired) {
     return null;
   }

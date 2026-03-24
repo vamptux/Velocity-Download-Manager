@@ -5,6 +5,11 @@ import { App } from "./App";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { loadUiPrefs, applyUiPrefs } from "@/lib/uiPrefs";
 
+function isEditableContextTarget(target: EventTarget | null): boolean {
+  const element = target instanceof Element ? target.closest("input, textarea, [contenteditable='true'], [contenteditable=''], [role='textbox']") : null;
+  return element != null;
+}
+
 // Apply saved visual prefs synchronously before first render to prevent FOUC.
 applyUiPrefs(loadUiPrefs());
 
@@ -14,6 +19,13 @@ window.addEventListener("storage", (e) => {
   if (e.key === "vdm-ui-prefs") {
     applyUiPrefs(loadUiPrefs());
   }
+});
+
+window.addEventListener("contextmenu", (event) => {
+  if (isEditableContextTarget(event.target)) {
+    return;
+  }
+  event.preventDefault();
 });
 
 const CompactCaptureWindow = lazy(() =>

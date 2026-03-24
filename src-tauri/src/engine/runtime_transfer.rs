@@ -17,7 +17,7 @@ use super::http_helpers::{
     parse_content_range_bounds, request_context_supports_segmented_transfer,
 };
 use super::probe::protocol_label;
-use crate::engine::disk_pool::{DiskPool, WriteBlock};
+use crate::engine::disk_pool::{DiskPool, QueuePressureTier, WriteBlock, adaptive_chunk_buffer_size};
 use crate::engine::http_pool::HttpPool;
 use crate::model::{
     DownloadRequestField, DownloadRequestMethod, DownloadSegment, DownloadSegmentStatus,
@@ -255,29 +255,19 @@ fn adaptive_chunk_buffer_target(
     base_chunk_buffer_size: usize,
     observed_throughput_bytes_per_second: u64,
     queue_utilization_percent: usize,
+    pressure_tier: QueuePressureTier,
 ) -> usize {
     let floor = adaptive_chunk_buffer_floor(base_chunk_buffer_size);
     let ceiling = adaptive_chunk_buffer_ceiling(base_chunk_buffer_size);
 
-    if observed_throughput_bytes_per_second == 0 {
-        return base_chunk_buffer_size.clamp(floor, ceiling);
-    }
-
-    // When the disk queue is under pressure, increase the buffer size (target_window_ms).
-    // This results in fewer, larger I/O operations, reducing lock contention and I/O thrashing.
-    let target_window_ms = match queue_utilization_percent {
-        85..=100 => 128_u64,
-        70..=84 => 96_u64,
-        55..=69 => 64_u64,
-        0..=34 => 32_u64,
-        _ => 48_u64,
-    };
-    let target = observed_throughput_bytes_per_second
-        .saturating_mul(target_window_ms)
-        .div_ceil(1_000);
-    usize::try_from(target)
-        .unwrap_or(usize::MAX)
-        .clamp(floor, ceiling)
+    adaptive_chunk_buffer_size(
+        base_chunk_buffer_size,
+        observed_throughput_bytes_per_second,
+        floor,
+        ceiling,
+        queue_utilization_percent,
+        pressure_tier,
+    )
 }
 
 fn adaptive_chunk_buffer_floor(base_chunk_buffer_size: usize) -> usize {
@@ -361,7 +351,7 @@ impl TokenBucketRateLimiter {
         self.rate_bytes_per_second
             .store(rate_bytes_per_second, Ordering::Relaxed);
         self.burst_bytes.store(burst_bytes, Ordering::Relaxed);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state_guard();
         state.available_tokens = state.available_tokens.min(burst_bytes as f64);
         state.last_refill = Instant::now();
     }
@@ -373,7 +363,7 @@ impl TokenBucketRateLimiter {
         let target = bytes.max(1) as f64;
         loop {
             let wait_for = {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state_guard();
                 let rate_bytes_per_second = self.rate_bytes_per_second.load(Ordering::Relaxed);
                 if rate_bytes_per_second == 0 {
                     state.last_refill = Instant::now();
@@ -404,6 +394,13 @@ impl TokenBucketRateLimiter {
                 continue;
             }
             return;
+        }
+    }
+
+    fn state_guard(&self) -> std::sync::MutexGuard<'_, TokenBucketState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
         }
     }
 }
@@ -594,10 +591,13 @@ where
 
             let dynamic_end = control.current_end().max(segment.start) as u64;
             let write_plan = plan_buffered_write(current_pos, dynamic_end, local_buffer.len());
+            let queue_utilization_percent = disk_pool.queue_utilization_percent();
+            let pressure_tier = disk_pool.pressure_tier();
             let flush_target = adaptive_chunk_buffer_target(
                 config.chunk_buffer_size,
                 observed_throughput_bytes_per_second,
-                disk_pool.queue_utilization_percent(),
+                queue_utilization_percent,
+                pressure_tier,
             );
 
             if local_buffer.len() >= flush_target || write_plan.boundary_reached {
@@ -610,7 +610,8 @@ where
                 let next_buffer_capacity = adaptive_chunk_buffer_target(
                     config.chunk_buffer_size,
                     observed_throughput_bytes_per_second,
-                    disk_pool.queue_utilization_percent(),
+                    queue_utilization_percent,
+                    pressure_tier,
                 );
                 let mut write_buffer =
                     std::mem::replace(&mut local_buffer, Vec::with_capacity(next_buffer_capacity));
@@ -756,7 +757,7 @@ where
     let mut attempt = 0u32;
     let retry_policy = RetryPolicy::from_config(config);
     let starting_offset = options.starting_offset;
-    let check_interval = options.space_check_interval_bytes.max(1);
+    let mut check_interval = options.space_check_interval_bytes.max(1);
     let mut initial_response = initial_response;
 
     loop {
@@ -829,17 +830,21 @@ where
                     local_buffer.extend_from_slice(&chunk);
                     downloaded_any_bytes = true;
 
+                    let queue_utilization_percent = disk_pool.queue_utilization_percent();
+                    let pressure_tier = disk_pool.pressure_tier();
                     let flush_target = adaptive_chunk_buffer_target(
                         config.chunk_buffer_size,
                         observed_throughput_bytes_per_second,
-                        disk_pool.queue_utilization_percent(),
+                        queue_utilization_percent,
+                        pressure_tier,
                     );
                     if local_buffer.len() >= flush_target {
                         let written = local_buffer.len() as u64;
                         let next_buffer_capacity = adaptive_chunk_buffer_target(
                             config.chunk_buffer_size,
                             observed_throughput_bytes_per_second,
-                            disk_pool.queue_utilization_percent(),
+                            queue_utilization_percent,
+                            pressure_tier,
                         );
                         current_offset = flush_unknown_size_buffer(
                             disk_pool,
@@ -864,6 +869,10 @@ where
                             compute_window_throughput(&mut window_start, &mut window_bytes);
                         if throughput > 0 {
                             observed_throughput_bytes_per_second = throughput;
+                            check_interval = adaptive_unknown_size_space_check_interval_bytes(
+                                options.space_check_interval_bytes,
+                                observed_throughput_bytes_per_second,
+                            );
                         }
                         on_progress(UnknownSizeStreamProgress {
                             downloaded: i64::try_from(current_offset).unwrap_or(i64::MAX),
@@ -896,10 +905,13 @@ where
 
                 if !local_buffer.is_empty() {
                     let written = local_buffer.len() as u64;
+                    let queue_utilization_percent = disk_pool.queue_utilization_percent();
+                    let pressure_tier = disk_pool.pressure_tier();
                     let next_buffer_capacity = adaptive_chunk_buffer_target(
                         config.chunk_buffer_size,
                         observed_throughput_bytes_per_second,
-                        disk_pool.queue_utilization_percent(),
+                        queue_utilization_percent,
+                        pressure_tier,
                     );
                     current_offset = flush_unknown_size_buffer(
                         disk_pool,
@@ -1022,6 +1034,23 @@ fn enforce_unknown_size_free_space(
         ));
     }
     Ok(())
+}
+
+fn adaptive_unknown_size_space_check_interval_bytes(
+    fallback_interval_bytes: u64,
+    observed_throughput_bytes_per_second: u64,
+) -> u64 {
+    let fallback = fallback_interval_bytes.max(super::runtime::UNKNOWN_SIZE_SPACE_CHECK_MIN_INTERVAL_BYTES);
+    if observed_throughput_bytes_per_second == 0 {
+        return fallback.min(super::runtime::UNKNOWN_SIZE_SPACE_CHECK_MAX_INTERVAL_BYTES);
+    }
+
+    observed_throughput_bytes_per_second
+        .saturating_mul(super::runtime::UNKNOWN_SIZE_SPACE_CHECK_TARGET_SECONDS)
+        .clamp(
+            super::runtime::UNKNOWN_SIZE_SPACE_CHECK_MIN_INTERVAL_BYTES,
+            super::runtime::UNKNOWN_SIZE_SPACE_CHECK_MAX_INTERVAL_BYTES,
+        )
 }
 
 fn compute_window_throughput(window_start: &mut Instant, window_bytes: &mut u64) -> u64 {

@@ -16,7 +16,7 @@ use ts_rs::TS;
 
 use crate::model::{DownloadRequestField, DownloadRequestMethod};
 
-static PENDING_CAPTURE: LazyLock<Mutex<BTreeMap<String, CapturePayload>>> =
+static PENDING_CAPTURE: LazyLock<Mutex<BTreeMap<String, PendingCaptureEntry>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 static CAPTURE_WINDOW_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -27,6 +27,9 @@ pub const CAPTURE_PORT: u16 = 17_780;
 const CAPTURE_BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const MAX_BODY_LEN: usize = 64 * 1024;
+const PENDING_CAPTURE_TTL_MS: i64 = 3 * 60 * 1000;
+const PENDING_CAPTURE_CLEANUP_INTERVAL_MS: u64 = 30 * 1000;
+const MAX_PENDING_CAPTURES: usize = 64;
 
 const PAIRING_SECRET_BYTES: usize = 20;
 const SESSION_NONCE_BYTES: usize = 16;
@@ -57,6 +60,37 @@ pub struct CapturePayload {
     pub request_form_fields: Vec<DownloadRequestField>,
     #[serde(default)]
     pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub enum CaptureBridgePhase {
+    #[default]
+    Starting,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureBridgeStatus {
+    pub phase: CaptureBridgePhase,
+    pub bridge_url: String,
+    pub port: u16,
+    pub auth_required: bool,
+    pub pending_captures: u32,
+    pub last_capture_at: Option<i64>,
+    pub last_capture_source: Option<String>,
+    pub last_error: Option<String>,
+    pub rotated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCaptureEntry {
+    payload: CapturePayload,
+    captured_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,9 +141,18 @@ struct CaptureBridgeAuthRuntime {
     seen_request_nonces: VecDeque<(String, i64)>,
 }
 
+#[derive(Debug, Default)]
+struct CaptureBridgeRuntime {
+    phase: CaptureBridgePhase,
+    last_capture_at: Option<i64>,
+    last_capture_source: Option<String>,
+    last_error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CaptureBridgeState {
-    inner: Arc<Mutex<CaptureBridgeAuthRuntime>>,
+    auth: Arc<Mutex<CaptureBridgeAuthRuntime>>,
+    runtime: Arc<Mutex<CaptureBridgeRuntime>>,
 }
 
 struct HttpRequest<'a> {
@@ -128,19 +171,47 @@ pub fn initialize_capture_bridge_state(app: &AppHandle) -> Result<CaptureBridgeS
     let persisted = load_or_create_persisted_auth(&auth_path)?;
 
     Ok(CaptureBridgeState {
-        inner: Arc::new(Mutex::new(CaptureBridgeAuthRuntime {
+        auth: Arc::new(Mutex::new(CaptureBridgeAuthRuntime {
             pairing_secret: persisted.pairing_secret,
             session_nonce: generate_random_hex(SESSION_NONCE_BYTES)?,
             rotated_at: persisted.rotated_at,
             seen_request_nonces: VecDeque::new(),
         })),
+        runtime: Arc::new(Mutex::new(CaptureBridgeRuntime::default())),
     })
 }
 
 impl CaptureBridgeState {
+    pub fn status(&self) -> Result<CaptureBridgeStatus, String> {
+        let auth = self
+            .auth
+            .lock()
+            .map_err(|_| "Capture bridge auth lock was poisoned.".to_string())?;
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "Capture bridge runtime lock was poisoned.".to_string())?;
+        let pending_captures = PENDING_CAPTURE
+            .lock()
+            .map(|pending| pending.len() as u32)
+            .unwrap_or_default();
+
+        Ok(CaptureBridgeStatus {
+            phase: runtime.phase,
+            bridge_url: format!("http://127.0.0.1:{CAPTURE_PORT}"),
+            port: CAPTURE_PORT,
+            auth_required: true,
+            pending_captures,
+            last_capture_at: runtime.last_capture_at,
+            last_capture_source: runtime.last_capture_source.clone(),
+            last_error: runtime.last_error.clone(),
+            rotated_at: auth.rotated_at,
+        })
+    }
+
     fn health_response(&self, authorized: bool) -> Result<CaptureBridgeHealthResponse, String> {
         let auth = self
-            .inner
+            .auth
             .lock()
             .map_err(|_| "Capture bridge auth lock was poisoned.".to_string())?;
         Ok(CaptureBridgeHealthResponse {
@@ -154,7 +225,7 @@ impl CaptureBridgeState {
 
     fn extension_pairing_response(&self) -> Result<CaptureBridgePairingResponse, String> {
         let auth = self
-            .inner
+            .auth
             .lock()
             .map_err(|_| "Capture bridge auth lock was poisoned.".to_string())?;
         Ok(CaptureBridgePairingResponse {
@@ -167,7 +238,7 @@ impl CaptureBridgeState {
 
     fn unauthorized_response(&self) -> Result<CaptureBridgeUnauthorizedResponse, String> {
         let auth = self
-            .inner
+            .auth
             .lock()
             .map_err(|_| "Capture bridge auth lock was poisoned.".to_string())?;
         Ok(CaptureBridgeUnauthorizedResponse {
@@ -208,7 +279,7 @@ impl CaptureBridgeState {
             return Err("stale auth timestamp");
         }
 
-        let mut auth = self.inner.lock().map_err(|_| "auth state unavailable")?;
+        let mut auth = self.auth.lock().map_err(|_| "auth state unavailable")?;
         prune_seen_request_nonces(&mut auth.seen_request_nonces, now);
         if auth
             .seen_request_nonces
@@ -240,24 +311,59 @@ impl CaptureBridgeState {
             .push_back((request_nonce.to_string(), now));
         Ok(())
     }
+
+    fn record_capture(&self, payload: &CapturePayload) -> Result<(), String> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "Capture bridge runtime lock was poisoned.".to_string())?;
+        runtime.last_capture_at = Some(current_timestamp_ms());
+        runtime.last_capture_source = payload.source.clone();
+        runtime.last_error = None;
+        Ok(())
+    }
+
+    fn set_phase(&self, phase: CaptureBridgePhase, error: Option<String>) -> Result<(), String> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "Capture bridge runtime lock was poisoned.".to_string())?;
+        runtime.phase = phase;
+        runtime.last_error = error;
+        Ok(())
+    }
 }
 
 pub fn take_pending_capture(window_label: Option<&str>) -> Option<CapturePayload> {
     let Ok(mut pending) = PENDING_CAPTURE.lock() else {
         return None;
     };
+    prune_pending_capture_entries(&mut pending, current_timestamp_ms());
 
     if let Some(label) = window_label {
-        return pending.remove(label);
+        return pending.remove(label).map(|entry| entry.payload);
     }
 
     let first_label = pending.keys().next().cloned()?;
-    pending.remove(&first_label)
+    pending.remove(&first_label).map(|entry| entry.payload)
+}
+
+pub fn capture_window_ready(window_label: &str) -> Option<CapturePayload> {
+    take_pending_capture(Some(window_label))
 }
 
 fn set_pending_capture(window_label: &str, payload: CapturePayload) {
     if let Ok(mut pending) = PENDING_CAPTURE.lock() {
-        pending.insert(window_label.to_string(), payload);
+        let now = current_timestamp_ms();
+        prune_pending_capture_entries(&mut pending, now);
+        pending.insert(
+            window_label.to_string(),
+            PendingCaptureEntry {
+                payload,
+                captured_at_ms: now,
+            },
+        );
+        prune_pending_capture_entries(&mut pending, now);
     }
 }
 
@@ -280,15 +386,68 @@ pub fn spawn_capture_server(app: AppHandle, state: CaptureBridgeState) {
     });
 }
 
+pub fn spawn_pending_capture_cleanup(app: AppHandle, state: CaptureBridgeState) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(PENDING_CAPTURE_CLEANUP_INTERVAL_MS)).await;
+            if cleanup_pending_captures() {
+                emit_capture_bridge_status(&app, &state);
+            }
+        }
+    });
+}
+
+fn cleanup_pending_captures() -> bool {
+    if let Ok(mut pending) = PENDING_CAPTURE.lock() {
+        let before = pending.len();
+        prune_pending_capture_entries(&mut pending, current_timestamp_ms());
+        return pending.len() != before;
+    }
+
+    false
+}
+
+fn emit_capture_bridge_status(app: &AppHandle, state: &CaptureBridgeState) {
+    if let Ok(status) = state.status() {
+        let _ = app.emit("capture://bridge-status", status);
+    }
+}
+
+fn prune_pending_capture_entries(
+    pending: &mut BTreeMap<String, PendingCaptureEntry>,
+    now_ms: i64,
+) {
+    pending.retain(|_, entry| {
+        now_ms.saturating_sub(entry.captured_at_ms) <= PENDING_CAPTURE_TTL_MS
+    });
+
+    while pending.len() > MAX_PENDING_CAPTURES {
+        let Some(oldest_label) = pending
+            .iter()
+            .min_by_key(|(_, entry)| entry.captured_at_ms)
+            .map(|(label, _)| label.clone())
+        else {
+            break;
+        };
+        pending.remove(&oldest_label);
+    }
+}
+
 async fn run_capture_server(app: AppHandle, state: CaptureBridgeState) {
     let addr = SocketAddr::from(([127, 0, 0, 1], CAPTURE_PORT));
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(err) => {
+            let message = format!("Could not bind {addr}: {err}");
+            let _ = state.set_phase(CaptureBridgePhase::Failed, Some(message));
+            emit_capture_bridge_status(&app, &state);
             eprintln!("[VDM] capture bridge: could not bind {addr}: {err}");
             return;
         }
     };
+
+    let _ = state.set_phase(CaptureBridgePhase::Ready, None);
+    emit_capture_bridge_status(&app, &state);
 
     eprintln!("[VDM] capture bridge: listening on {addr}");
 
@@ -393,7 +552,8 @@ async fn handle_connection(mut socket: TcpStream, app: AppHandle, state: Capture
                 return;
             }
 
-            show_capture_window(&app, &payload);
+            let _ = state.record_capture(&payload);
+            show_capture_window(&app, &state, &payload);
 
             let body = serde_json::to_vec(&CaptureBridgeOkResponse { ok: true })
                 .unwrap_or_else(|_| b"{}".to_vec());
@@ -426,9 +586,10 @@ async fn write_unauthorized_response(
     write_json_response(socket, 401, "Unauthorized", body.as_slice()).await
 }
 
-fn show_capture_window(app: &AppHandle, payload: &CapturePayload) {
+fn show_capture_window(app: &AppHandle, state: &CaptureBridgeState, payload: &CapturePayload) {
     let window_label = next_capture_window_label();
     set_pending_capture(&window_label, payload.clone());
+    emit_capture_bridge_status(app, state);
 
     let url = WebviewUrl::App("index.html?window=capture".into());
     let capture_window = match WebviewWindowBuilder::new(app, &window_label, url)
@@ -443,6 +604,7 @@ fn show_capture_window(app: &AppHandle, payload: &CapturePayload) {
         Ok(window) => window,
         Err(err) => {
             clear_pending_capture(&window_label);
+            emit_capture_bridge_status(app, state);
             eprintln!("[VDM] capture bridge: could not create capture window: {err}");
             return;
         }
@@ -451,10 +613,6 @@ fn show_capture_window(app: &AppHandle, payload: &CapturePayload) {
     let _ = capture_window.show();
     let _ = capture_window.unminimize();
     let _ = capture_window.set_focus();
-
-    if let Err(err) = capture_window.emit("extension://capture", payload) {
-        eprintln!("[VDM] capture bridge: emit failed: {err}");
-    }
 }
 
 fn focus_main_window(app: &AppHandle) {

@@ -14,11 +14,18 @@ import {
   StopCircle,
   type LucideIcon,
 } from "lucide-react";
+import {
+  restartRequirementLabel,
+  restartRequirementReason,
+} from "@/lib/downloadActions";
 import { formatDurationShort } from "@/lib/format";
+import { sameVisibleMessage, simplifyUserMessage } from "@/lib/userFacingMessages";
 import type {
   Download,
   DownloadCategory,
   DownloadFailureKind,
+  DownloadIntegrityStatus,
+  DownloadProbe,
   DownloadStatus,
 } from "@/types/download";
 
@@ -26,6 +33,64 @@ export type StatusMeta = {
   label: string;
   color: string;
   Icon: LucideIcon;
+};
+
+export type IntegrityMeta = {
+  label: string;
+  color: string;
+};
+
+export type TransferConstraintMeta = {
+  label: string;
+  summary: string;
+  detail: string;
+  tone: "neutral" | "warn";
+};
+
+export type TransferConstraintNotice = {
+  message: string;
+  tone: "note" | "warn";
+};
+
+export type HostBadgeMeta = {
+  label: string;
+  tone: SemanticBadgeTone;
+};
+
+export type TransferConstraintSource = Pick<
+  Download,
+  | "status"
+  | "scheduledFor"
+  | "writerBackpressure"
+  | "hostCooldownUntil"
+  | "hostDiagnostics"
+  | "diagnostics"
+  | "capabilities"
+  | "targetConnections"
+  | "segments"
+>;
+
+export type SemanticBadgeTone = "neutral" | "good" | "warn" | "error";
+
+type HostBadgeSource = {
+  compatibility: Pick<
+    Download["compatibility"],
+    "directUrlRecovered" | "browserInterstitialOnly" | "requestReferer"
+  >;
+  hostDiagnostics: Pick<
+    Download["hostDiagnostics"],
+    | "hardNoRange"
+    | "cooldownUntil"
+    | "concurrencyLocked"
+    | "lockReason"
+    | "negotiatedProtocol"
+    | "reuseConnections"
+  >;
+  rangeSupported: boolean;
+  hostCooldownUntil?: number | null;
+  hostProtocol?: string | null;
+  hostMaxConnections?: number | null;
+  restartLabel?: string | null;
 };
 
 export const CATEGORY_ICONS: Record<DownloadCategory, LucideIcon> = {
@@ -102,8 +167,136 @@ export const STATUS_META: Record<DownloadStatus, StatusMeta> = {
   },
 };
 
+export const INTEGRITY_STATUS_META: Record<DownloadIntegrityStatus, IntegrityMeta> = {
+  unavailable: {
+    label: "Unavailable",
+    color: "text-muted-foreground/50",
+  },
+  pending: {
+    label: "Pending",
+    color: "text-muted-foreground/66",
+  },
+  computed: {
+    label: "Ready",
+    color: "text-[hsl(var(--status-finished))]",
+  },
+  verified: {
+    label: "Verified",
+    color: "text-[hsl(var(--status-finished))]",
+  },
+  mismatch: {
+    label: "Mismatch",
+    color: "text-[hsl(var(--status-error))]",
+  },
+  failed: {
+    label: "Failed",
+    color: "text-[hsl(var(--status-error))]",
+  },
+};
+
 export function statusLabel(status: DownloadStatus): string {
   return STATUS_META[status].label;
+}
+
+export function statusBadgeClassName(status: DownloadStatus): string {
+  switch (status) {
+    case "downloading":
+      return "bg-[hsl(var(--status-downloading)/0.14)] text-[hsl(var(--status-downloading))]";
+    case "paused":
+      return "bg-[hsl(var(--status-paused)/0.14)] text-[hsl(var(--status-paused))]";
+    case "error":
+      return "bg-[hsl(var(--status-error)/0.14)] text-[hsl(var(--status-error))]";
+    case "finished":
+      return "bg-[hsl(var(--status-finished)/0.14)] text-[hsl(var(--status-finished))]";
+    case "queued":
+    case "stopped":
+      return "bg-white/6 text-muted-foreground/78";
+    default:
+      return "bg-white/6 text-muted-foreground/78";
+  }
+}
+
+export function semanticBadgeToneClassName(tone: SemanticBadgeTone): string {
+  switch (tone) {
+    case "good":
+      return "bg-[hsl(var(--status-downloading)/0.12)] text-[hsl(var(--status-downloading))]";
+    case "warn":
+      return "bg-[hsl(var(--status-paused)/0.14)] text-[hsl(var(--status-paused))]";
+    case "error":
+      return "bg-[hsl(var(--status-error)/0.12)] text-[hsl(var(--status-error))]";
+    case "neutral":
+    default:
+      return "bg-white/[0.065] text-foreground/62";
+  }
+}
+
+export function integrityStatusLabel(status: DownloadIntegrityStatus): string {
+  return INTEGRITY_STATUS_META[status].label;
+}
+
+export function integritySummaryLabel(status: DownloadIntegrityStatus): string | null {
+  switch (status) {
+    case "pending":
+      return "SHA-256 pending";
+    case "computed":
+      return "SHA-256 ready";
+    case "verified":
+      return "SHA-256 verified";
+    case "mismatch":
+      return "SHA-256 mismatch";
+    case "failed":
+      return "SHA-256 failed";
+    default:
+      return null;
+  }
+}
+
+export function transferConstraintSummary(
+  constraint: TransferConstraintMeta | null,
+): string | null {
+  if (!constraint) {
+    return null;
+  }
+
+  return constraint.summary === constraint.label
+    ? constraint.label
+    : `${constraint.label} · ${constraint.summary}`;
+}
+
+function diskLimitedConstraintMeta(
+  download: TransferConstraintSource,
+): TransferConstraintMeta {
+  const targetConnections = Math.max(download.targetConnections, 1);
+  const constrainedSegmentedTransfer =
+    download.capabilities.segmented && targetConnections > 1;
+
+  if (!constrainedSegmentedTransfer) {
+    return {
+      label: "Disk-limited",
+      summary: "Disk pressure",
+      detail:
+        "Writer backpressure is active, so disk writes are limiting further ramp-up and work stealing.",
+      tone: "warn",
+    };
+  }
+
+  const activeConnections = Math.max(
+    download.segments.filter((segment) => segment.status === "downloading").length,
+    1,
+  );
+  const summary = download.status === "downloading"
+    ? `Holding ${activeConnections}/${targetConnections} parts`
+    : `Holding ${targetConnections} planned parts`;
+  const detail = download.status === "downloading"
+    ? `Writer backpressure is active, so disk writes are holding this transfer at ${activeConnections} of ${targetConnections} planned parts while ramp-up and work stealing stay limited.`
+    : `Writer backpressure is active, so disk writes are holding this transfer below its ${targetConnections}-part plan until storage pressure recovers.`;
+
+  return {
+    label: "Disk-limited",
+    summary,
+    detail,
+    tone: "warn",
+  };
 }
 
 export function activeConnectionCount(download: Download): number {
@@ -139,6 +332,64 @@ export function failureKindLabel(
     default:
       return null;
   }
+}
+
+export function transferModeLabel(download: Download): string {
+  const restartLabel = restartRequirementLabel(download);
+  if (restartLabel) {
+    return restartLabel === "Replay-only"
+      ? "Guarded single stream - replay-only"
+      : "Guarded single stream - restart only";
+  }
+
+  if (download.capabilities.segmented && download.segments.length > 0) {
+    const activeConnections = activeConnectionCount(download);
+    const targetConnections = targetConnectionCount(download);
+    return download.status === "downloading"
+      ? `Segmented - ${activeConnections}/${targetConnections} parts active`
+      : `Segmented - ${targetConnections} planned parts`;
+  }
+
+  if (download.capabilities.resumable) {
+    return "Single stream - resume ready";
+  }
+
+  if (download.capabilities.rangeSupported) {
+    return "Single-session range";
+  }
+
+  return "Single connection";
+}
+
+export function primaryIssueSummary(
+  download: Pick<
+    Download,
+    | "status"
+    | "errorMessage"
+    | "diagnostics"
+    | "capabilities"
+    | "compatibility"
+  >,
+): string | null {
+  const restartReason = restartRequirementReason(download);
+  const terminalReason = download.diagnostics.terminalReason;
+
+  if (terminalReason) {
+    return simplifyUserMessage(terminalReason);
+  }
+
+  if (
+    restartReason
+    && !sameVisibleMessage(restartReason, download.errorMessage)
+  ) {
+    return simplifyUserMessage(restartReason);
+  }
+
+  if (download.errorMessage) {
+    return simplifyUserMessage(download.errorMessage);
+  }
+
+  return restartReason ? simplifyUserMessage(restartReason) : null;
 }
 
 function formatScheduledStartLabel(timestamp: number): string {
@@ -193,46 +444,119 @@ export function formatCooldownLabel(timestamp: number | null): string | null {
   return `Cooldown ${formatDurationShort(remainingSeconds)}`;
 }
 
-export function stallReasonLabel(
-  download: Pick<
-    Download,
-    | "status"
-    | "scheduledFor"
-    | "writerBackpressure"
-    | "hostCooldownUntil"
-    | "hostDiagnostics"
-    | "diagnostics"
-    | "capabilities"
-  >,
-): string | null {
+export function hostBadgeItems(
+  source: HostBadgeSource,
+  maxItems = 6,
+): HostBadgeMeta[] {
+  const rows: HostBadgeMeta[] = [];
+  if (source.restartLabel) {
+    rows.push({ label: source.restartLabel, tone: "warn" });
+  }
+  if (source.compatibility.directUrlRecovered) {
+    rows.push({ label: "Wrapper recovered", tone: "good" });
+  } else if (source.compatibility.browserInterstitialOnly) {
+    rows.push({ label: "Browser interstitial", tone: "warn" });
+  }
+  if (source.compatibility.requestReferer) {
+    rows.push({ label: "Wrapper referer", tone: "neutral" });
+  }
+  if (source.hostDiagnostics.hardNoRange || !source.rangeSupported) {
+    rows.push({ label: "No-range host", tone: "warn" });
+  }
+  const cooldown = formatCooldownLabel(
+    source.hostDiagnostics.cooldownUntil ?? source.hostCooldownUntil ?? null,
+  );
+  if (cooldown) {
+    rows.push({ label: cooldown, tone: "warn" });
+  }
+  if (source.hostDiagnostics.concurrencyLocked) {
+    rows.push({
+      label: hostLockLabel(source.hostDiagnostics.lockReason),
+      tone: "warn",
+    });
+  }
+  const protocol = source.hostDiagnostics.negotiatedProtocol ?? source.hostProtocol;
+  if (protocol) {
+    rows.push({ label: protocol.toUpperCase(), tone: "neutral" });
+  }
+  if (source.hostDiagnostics.reuseConnections != null) {
+    rows.push({
+      label: source.hostDiagnostics.reuseConnections
+        ? "Keep-alive reuse"
+        : "Fresh sockets",
+      tone: source.hostDiagnostics.reuseConnections ? "good" : "neutral",
+    });
+  }
+  if (source.hostMaxConnections != null) {
+    rows.push({ label: `Cap ${source.hostMaxConnections}`, tone: "neutral" });
+  }
+  return rows.slice(0, maxItems);
+}
+
+export function probeHostBadgeItems(
+  probe: DownloadProbe,
+  maxItems = 4,
+): HostBadgeMeta[] {
+  return hostBadgeItems(probe, maxItems);
+}
+
+export function transferConstraintMeta(
+  download: TransferConstraintSource,
+): TransferConstraintMeta | null {
   if (
     download.scheduledFor != null
     && download.scheduledFor > Date.now()
     && download.status !== "finished"
   ) {
-    return formatScheduledStartLabel(download.scheduledFor);
+    const summary = formatScheduledStartLabel(download.scheduledFor);
+    return {
+      label: "Scheduled",
+      summary,
+      detail: `${summary}. VDM is holding the transfer until its planned queue start time.`,
+      tone: "neutral",
+    };
   }
 
   if (download.writerBackpressure) {
-    return "Disk pressure";
+    return diskLimitedConstraintMeta(download);
   }
 
   const cooldown = formatCooldownLabel(
     download.hostDiagnostics.cooldownUntil ?? download.hostCooldownUntil,
   );
   if (cooldown) {
-    return cooldown;
+    return {
+      label: "Host-limited",
+      summary: cooldown,
+      detail: `${cooldown} is active because the host or request context is throttling or unstable.`,
+      tone: "warn",
+    };
   }
 
   if (download.hostDiagnostics.concurrencyLocked) {
-    return hostLockLabel(download.hostDiagnostics.lockReason);
+    const summary = hostLockLabel(download.hostDiagnostics.lockReason);
+    const plannerLimited = download.hostDiagnostics.lockReason === "ramp-no-gain";
+    return {
+      label: plannerLimited ? "Planner-limited" : "Host-limited",
+      summary,
+      detail: plannerLimited
+        ? "VDM is holding the current connection count because extra parallel streams were not improving throughput."
+        : `${summary} is capping connection ramp-up for stability on this host.`,
+      tone: plannerLimited ? "neutral" : "warn",
+    };
   }
 
   if (
     download.diagnostics.restartRequired
     && (download.status === "paused" || download.status === "error")
   ) {
-    return "Restart required";
+    return {
+      label: "Restart required",
+      summary: "Restart required",
+      detail:
+        "This partial state can no longer resume safely, so the transfer must restart from zero.",
+      tone: "warn",
+    };
   }
 
   if (
@@ -240,8 +564,28 @@ export function stallReasonLabel(
     && download.status !== "finished"
     && download.status !== "downloading"
   ) {
-    return "Single-stream guarded";
+    return {
+      label: "Guarded single stream",
+      summary: "Single-stream guarded",
+      detail:
+        "Byte-range support is unavailable or untrusted, so VDM is holding this transfer to a single connection.",
+      tone: "warn",
+    };
   }
 
   return null;
+}
+
+export function transferConstraintNotice(
+  download: TransferConstraintSource,
+): TransferConstraintNotice | null {
+  const constraint = transferConstraintMeta(download);
+  if (!constraint || constraint.label === "Restart required") {
+    return null;
+  }
+
+  return {
+    message: constraint.detail,
+    tone: constraint.tone === "warn" ? "warn" : "note",
+  };
 }

@@ -4,13 +4,17 @@ use tauri::AppHandle;
 
 use super::probe::DownloadProbeData;
 use super::*;
-use crate::model::{RecentProbeCacheEntry, ResumeValidators};
+use crate::model::{
+    DownloadIntegrityAlgorithm, DownloadIntegrityStatus, RecentProbeCacheEntry,
+    ResumeValidators,
+};
 
 const LOW_SPACE_UNKNOWN_SIZE_WARNING_BYTES: u64 = 512 * 1024 * 1024;
 const PROBE_SOURCE_WARNING_LIVE: &str = "Probe metadata source: live network probe.";
 const PROBE_SOURCE_WARNING_CACHED: &str = "Probe metadata source: recent probe cache reuse.";
 const PROBE_SOURCE_WARNING_FALLBACK: &str =
     "Probe metadata source: planning fallback without fresh metadata.";
+const SHA256_HEX_LENGTH: usize = 64;
 
 fn normalize_scheduled_for(scheduled_for: Option<i64>) -> Option<i64> {
     let now = unix_epoch_millis();
@@ -86,16 +90,6 @@ fn find_duplicate_download<'a>(
     requested_validators: Option<&ResumeValidators>,
     target_path: &str,
 ) -> Option<(&'a DownloadRecord, &'static str)> {
-    if !target_path.is_empty() {
-        for existing in downloads {
-            if target_path_matches(&existing.target_path, target_path) {
-                return Some((existing, "using the same target file"));
-            }
-        }
-
-        return None;
-    }
-
     for existing in downloads {
         if urls_overlap(existing, requested_url, final_url) {
             return Some((existing, "tracking the same source URL"));
@@ -105,6 +99,10 @@ fn find_duplicate_download<'a>(
             .is_some_and(|requested| validators_match(&existing.validators, requested))
         {
             return Some((existing, "matching the same remote file validators"));
+        }
+
+        if !target_path.is_empty() && target_path_matches(&existing.target_path, target_path) {
+            return Some((existing, "using the same target file"));
         }
     }
 
@@ -117,9 +115,15 @@ struct ProbePlanningState {
     request_form_fields: Vec<DownloadRequestField>,
     cached_recent_probe: Option<RecentProbeCacheEntry>,
     live_probe: Option<DownloadProbeData>,
+    live_probe_backoff_active: bool,
     probe: Option<DownloadProbeData>,
     final_url: String,
     host: String,
+}
+
+enum PlanningProbeJoinState {
+    Leader,
+    Follower(Arc<tokio::sync::Notify>),
 }
 
 fn append_storage_warning(
@@ -187,25 +191,289 @@ fn merge_probe_compatibility(
     compatibility
 }
 
+fn normalize_expected_sha256_hash(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let normalized = value
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if normalized.len() != SHA256_HEX_LENGTH
+        || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("Expected checksum must be a 64-character SHA-256 hex string.".to_string());
+    }
+
+    Ok(Some(normalized))
+}
+
+fn apply_integrity_status_from_hashes(download: &mut DownloadRecord, checked_at: Option<i64>) {
+    let Some(computed_hash) = download.integrity.computed_hash.as_ref() else {
+        download.integrity.status = DownloadIntegrityStatus::Unavailable;
+        download.integrity.verified_at = None;
+        download.integrity.last_error = None;
+        return;
+    };
+
+    if let Some(expected_hash) = download.integrity.expected_hash.as_ref() {
+        download.integrity.status = if expected_hash == computed_hash {
+            DownloadIntegrityStatus::Verified
+        } else {
+            DownloadIntegrityStatus::Mismatch
+        };
+        download.integrity.verified_at = checked_at;
+    } else {
+        download.integrity.status = DownloadIntegrityStatus::Computed;
+        download.integrity.verified_at = None;
+    }
+    download.integrity.last_error = None;
+}
+
+pub(super) fn mark_download_integrity_pending(download: &mut DownloadRecord) {
+    download.integrity.algorithm = DownloadIntegrityAlgorithm::Sha256;
+    download.integrity.computed_hash = None;
+    download.integrity.status = DownloadIntegrityStatus::Pending;
+    download.integrity.verified_at = None;
+    download.integrity.last_error = None;
+}
+
 fn apply_probe_learning(
     registry: &mut RegistrySnapshot,
     host: &str,
     scope_key: &str,
     live_probe: Option<&DownloadProbeData>,
     probe: Option<&DownloadProbeData>,
+    attempted_live_probe: bool,
     now: i64,
 ) {
     if let Some(probe_data) = live_probe {
         let profile = registry.host_profiles.entry(host.to_string()).or_default();
         update_profile_probe_cache(profile, scope_key, probe_data, now);
         store_recent_probe(registry, scope_key, host, probe_data, now);
-    } else if probe.is_none() {
+    } else if attempted_live_probe && probe.is_none() {
         let profile = registry.host_profiles.entry(host.to_string()).or_default();
         record_probe_failure(profile, scope_key, now);
     }
 }
 
 impl EngineState {
+    fn join_planning_probe(&self, scope_key: &str) -> Option<PlanningProbeJoinState> {
+        let Ok(mut planning_probes) = self.inner.planning_probes.lock() else {
+            return None;
+        };
+        if let Some(entry) = planning_probes.get_mut(scope_key) {
+            entry.waiters = entry.waiters.saturating_add(1);
+            return Some(PlanningProbeJoinState::Follower(entry.notify.clone()));
+        }
+
+        planning_probes.insert(
+            scope_key.to_string(),
+            super::InflightPlanningProbe {
+                notify: Arc::new(tokio::sync::Notify::new()),
+                result: None,
+                waiters: 1,
+            },
+        );
+        Some(PlanningProbeJoinState::Leader)
+    }
+
+    fn finish_planning_probe(&self, scope_key: &str, result: &Result<DownloadProbeData, String>) {
+        let Ok(mut planning_probes) = self.inner.planning_probes.lock() else {
+            return;
+        };
+        let Some(entry) = planning_probes.get_mut(scope_key) else {
+            return;
+        };
+        entry.result = Some(result.clone());
+        entry.notify.notify_waiters();
+    }
+
+    fn try_take_planning_probe_result(
+        &self,
+        scope_key: &str,
+    ) -> Option<Result<DownloadProbeData, String>> {
+        let Ok(mut planning_probes) = self.inner.planning_probes.lock() else {
+            return None;
+        };
+        let result = planning_probes.get(scope_key)?.result.clone()?;
+        let should_remove = if let Some(entry) = planning_probes.get_mut(scope_key) {
+            entry.waiters = entry.waiters.saturating_sub(1);
+            entry.waiters == 0
+        } else {
+            false
+        };
+        if should_remove {
+            planning_probes.remove(scope_key);
+        }
+        Some(result)
+    }
+
+    async fn request_live_planning_probe(
+        &self,
+        scope_key: &str,
+        url: &str,
+        request_referer: Option<&str>,
+        request_cookies: Option<&str>,
+        request_method: &DownloadRequestMethod,
+        request_form_fields: &[DownloadRequestField],
+    ) -> Result<DownloadProbeData, String> {
+        let Some(join_state) = self.join_planning_probe(scope_key) else {
+            return probe_download_headers_with_context(
+                url,
+                request_referer,
+                request_cookies,
+                request_method,
+                request_form_fields,
+            )
+            .await;
+        };
+
+        match join_state {
+            PlanningProbeJoinState::Leader => {
+                let result = probe_download_headers_with_context(
+                    url,
+                    request_referer,
+                    request_cookies,
+                    request_method,
+                    request_form_fields,
+                )
+                .await;
+                self.finish_planning_probe(scope_key, &result);
+                self.try_take_planning_probe_result(scope_key)
+                    .unwrap_or(result)
+            }
+            PlanningProbeJoinState::Follower(notify) => loop {
+                if let Some(result) = self.try_take_planning_probe_result(scope_key) {
+                    return result;
+                }
+                notify.notified().await;
+            },
+        }
+    }
+
+    fn integrity_refresh_active(&self, id: &str) -> bool {
+        self.inner
+            .integrity_tasks
+            .lock()
+            .map(|tasks| tasks.contains(id))
+            .unwrap_or(false)
+    }
+
+    fn try_begin_integrity_refresh(&self, id: &str) -> bool {
+        self.inner
+            .integrity_tasks
+            .lock()
+            .map(|mut tasks| tasks.insert(id.to_string()))
+            .unwrap_or(false)
+    }
+
+    fn finish_integrity_refresh(&self, id: &str) {
+        if let Ok(mut tasks) = self.inner.integrity_tasks.lock() {
+            tasks.remove(id);
+        }
+    }
+
+    pub(super) fn spawn_download_integrity_refresh(&self, id: String) {
+        if !self.try_begin_integrity_refresh(&id) {
+            return;
+        }
+        let engine = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let target_path = {
+                let Ok(registry) = engine.registry_guard() else {
+                    engine.finish_integrity_refresh(&id);
+                    return;
+                };
+                let Some(download) = registry.downloads.iter().find(|download| download.id == id)
+                else {
+                    engine.finish_integrity_refresh(&id);
+                    return;
+                };
+                if download.status != DownloadStatus::Finished {
+                    engine.finish_integrity_refresh(&id);
+                    return;
+                }
+                Path::new(&download.target_path).to_path_buf()
+            };
+
+            let checksum_result = match tauri::async_runtime::spawn_blocking(move || {
+                compute_sha256_checksum(&target_path)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(format!("Checksum worker failed to join cleanly: {error}")),
+            };
+
+            let Ok(mut registry) = engine.registry_guard() else {
+                engine.finish_integrity_refresh(&id);
+                return;
+            };
+            let Some(download) = registry.downloads.iter_mut().find(|download| download.id == id)
+            else {
+                engine.finish_integrity_refresh(&id);
+                return;
+            };
+            if download.status != DownloadStatus::Finished {
+                engine.finish_integrity_refresh(&id);
+                return;
+            }
+
+            match checksum_result {
+                Ok(checksum) => {
+                    download.integrity.algorithm = DownloadIntegrityAlgorithm::Sha256;
+                    download.integrity.computed_hash = Some(checksum.clone());
+                    apply_integrity_status_from_hashes(download, Some(unix_epoch_millis()));
+                    match download.integrity.status {
+                        DownloadIntegrityStatus::Verified => append_download_log(
+                            download,
+                            DownloadLogLevel::Info,
+                            "integrity.verified",
+                            "SHA-256 checksum matches the expected value.",
+                        ),
+                        DownloadIntegrityStatus::Mismatch => append_download_log(
+                            download,
+                            DownloadLogLevel::Warn,
+                            "integrity.mismatch",
+                            "SHA-256 checksum does not match the expected value.",
+                        ),
+                        _ => append_download_log(
+                            download,
+                            DownloadLogLevel::Info,
+                            "integrity.computed",
+                            "SHA-256 checksum calculation finished successfully.",
+                        ),
+                    }
+                }
+                Err(error) => {
+                    download.integrity.algorithm = DownloadIntegrityAlgorithm::Sha256;
+                    download.integrity.computed_hash = None;
+                    download.integrity.status = DownloadIntegrityStatus::Failed;
+                    download.integrity.verified_at = None;
+                    download.integrity.last_error = Some(error.clone());
+                    append_download_log(
+                        download,
+                        DownloadLogLevel::Error,
+                        "integrity.failed",
+                        format!("SHA-256 checksum calculation failed: {error}"),
+                    );
+                }
+            }
+
+            let response = download.clone();
+            let _ = engine.persist_registry(&registry);
+            drop(registry);
+            engine.finish_integrity_refresh(&id);
+            engine.emit_download_upsert(&response);
+        });
+    }
+
     async fn resolve_probe_planning_state(
         &self,
         url: &str,
@@ -216,14 +484,23 @@ impl EngineState {
     ) -> Result<ProbePlanningState, String> {
         let now = unix_epoch_millis();
         let scope_key = probe_scope_key(url, request_method, &request_form_fields);
-        let cached_recent_probe = {
+        let requested_host = extract_host(url);
+        let (cached_recent_probe, live_probe_backoff_active) = {
             let registry = self.registry_guard()?;
-            fresh_recent_probe(&registry, &scope_key, now)
+            let cached_recent_probe = fresh_recent_probe(&registry, &scope_key, now);
+            let live_probe_backoff_active = cached_recent_probe.is_none()
+                && scoped_probe_retry_backoff(
+                    registry.host_profiles.get(&requested_host),
+                    &scope_key,
+                    now,
+                );
+            (cached_recent_probe, live_probe_backoff_active)
         };
-        let live_probe = if cached_recent_probe.is_some() {
+        let live_probe = if cached_recent_probe.is_some() || live_probe_backoff_active {
             None
         } else {
-            probe_download_headers_with_context(
+            self.request_live_planning_probe(
+                &scope_key,
                 url,
                 request_referer,
                 request_cookies,
@@ -253,6 +530,7 @@ impl EngineState {
             request_form_fields,
             cached_recent_probe,
             live_probe,
+            live_probe_backoff_active,
             probe,
             final_url,
             host,
@@ -265,9 +543,7 @@ impl EngineState {
         Ok(AppStateSnapshot {
             downloads: registry.downloads.clone(),
             settings: registry.settings.clone(),
-            queue_state: QueueState {
-                running: registry.queue_running,
-            },
+            queue_state: self.queue_state_snapshot(registry.queue_running),
         })
     }
 
@@ -281,9 +557,7 @@ impl EngineState {
                 .map(Self::compact_download_for_row)
                 .collect(),
             settings: registry.settings.clone(),
-            queue_state: QueueState {
-                running: registry.queue_running,
-            },
+            queue_state: self.queue_state_snapshot(registry.queue_running),
         })
     }
 
@@ -311,9 +585,7 @@ impl EngineState {
         StartupSnapshot {
             bootstrap,
             settings,
-            queue_state: QueueState {
-                running: queue_running,
-            },
+            queue_state: self.queue_state_snapshot(queue_running),
             update_health,
             active_downloads,
         }
@@ -347,12 +619,11 @@ impl EngineState {
     }
 
     pub fn get_queue_state(&self) -> QueueState {
-        QueueState {
-            running: self
-                .registry_guard()
+        self.queue_state_snapshot(
+            self.registry_guard()
                 .map(|registry| registry.queue_running)
                 .unwrap_or(true),
-        }
+        )
     }
 
     pub async fn probe_download(&self, args: ProbeDownloadArgs) -> Result<ProbeResult, String> {
@@ -384,6 +655,7 @@ impl EngineState {
             request_form_fields,
             cached_recent_probe,
             live_probe,
+            live_probe_backoff_active,
             probe,
             final_url,
             host,
@@ -418,6 +690,7 @@ impl EngineState {
             &scope_key,
             live_probe.as_ref(),
             probe.as_ref(),
+            cached_recent_probe.is_none() && !live_probe_backoff_active,
             now,
         );
         let host_profile = registry.host_profiles.get(&host);
@@ -438,7 +711,12 @@ impl EngineState {
             live_probe.is_some(),
         );
         if probe.is_none() {
-            if cached_probe.is_some() {
+            if live_probe_backoff_active {
+                warnings.push(
+                    "Recent live probe failures are in short backoff for this exact request shape; VDM is briefly reusing saved planning state before probing that host again."
+                        .to_string(),
+                );
+            } else if cached_probe.is_some() {
                 warnings.push(
                     "Remote probe failed; using fresh host capability cache for planning."
                         .to_string(),
@@ -585,6 +863,7 @@ impl EngineState {
             request_form_fields,
             cached_recent_probe,
             live_probe,
+            live_probe_backoff_active,
             probe,
             final_url,
             host,
@@ -610,6 +889,7 @@ impl EngineState {
             &scope_key,
             live_probe.as_ref(),
             probe.as_ref(),
+            cached_recent_probe.is_none() && !live_probe_backoff_active,
             now,
         );
 
@@ -809,6 +1089,7 @@ impl EngineState {
                 contiguous_fsync_flushes: 0,
                 contiguous_fsync_window_bytes: 0,
             },
+            integrity: Default::default(),
             segments: std::mem::take(&mut segments),
             target_connections: starting_connections,
             writer_backpressure: false,
@@ -1163,7 +1444,7 @@ impl EngineState {
         self.persist_registry(&registry)?;
         drop(registry);
         self.apply_runtime_dispatch_plan(dispatch_plan, min_interval_ms);
-        Ok(QueueState { running: true })
+        Ok(self.queue_state_snapshot(true))
     }
 
     pub async fn stop_queue(&self, _app: &AppHandle) -> Result<QueueState, String> {
@@ -1184,7 +1465,7 @@ impl EngineState {
         }
 
         self.persist_registry_flush(&registry)?;
-        Ok(QueueState { running: false })
+        Ok(self.queue_state_snapshot(false))
     }
 
     pub async fn set_download_schedule(
@@ -1303,6 +1584,137 @@ impl EngineState {
         self.persist_registry(&registry)?;
         drop(registry);
         self.emit_download_upsert(&response);
+        Ok(response)
+    }
+
+    pub async fn set_download_integrity_expected_hash(
+        &self,
+        _app: &AppHandle,
+        id: &str,
+        expected_hash: Option<String>,
+    ) -> Result<DownloadRecord, String> {
+        self.await_bootstrap().await;
+        let normalized_hash = normalize_expected_sha256_hash(expected_hash)?;
+        let mut registry = self.registry_guard()?;
+        let Some(download) = registry
+            .downloads
+            .iter_mut()
+            .find(|download| download.id == id)
+        else {
+            return Err(format!("No download found for id '{id}'."));
+        };
+
+        download.integrity.algorithm = DownloadIntegrityAlgorithm::Sha256;
+        download.integrity.expected_hash = normalized_hash.clone();
+        if download.integrity.status != DownloadIntegrityStatus::Pending {
+            let checked_at = if download.integrity.computed_hash.is_some() && normalized_hash.is_some()
+            {
+                Some(unix_epoch_millis())
+            } else {
+                None
+            };
+            apply_integrity_status_from_hashes(download, checked_at);
+        }
+        append_download_log(
+            download,
+            DownloadLogLevel::Info,
+            if normalized_hash.is_some() {
+                "integrity.expected-set"
+            } else {
+                "integrity.expected-cleared"
+            },
+            if normalized_hash.is_some() {
+                "Stored an expected SHA-256 checksum for this download."
+            } else {
+                "Cleared the expected SHA-256 checksum for this download."
+            },
+        );
+
+        let response = download.clone();
+        self.persist_registry(&registry)?;
+        drop(registry);
+        self.emit_download_upsert(&response);
+        Ok(response)
+    }
+
+    pub async fn verify_download_checksum(
+        &self,
+        _app: &AppHandle,
+        id: &str,
+    ) -> Result<DownloadRecord, String> {
+        self.await_bootstrap().await;
+        let mut registry = self.registry_guard()?;
+        let Some(download) = registry
+            .downloads
+            .iter_mut()
+            .find(|download| download.id == id)
+        else {
+            return Err(format!("No download found for id '{id}'."));
+        };
+        if download.status != DownloadStatus::Finished {
+            return Err("Finish the download before verifying its checksum.".to_string());
+        }
+        if download.integrity.expected_hash.is_none() {
+            return Err("Set an expected SHA-256 checksum before running verification.".to_string());
+        }
+        if download.integrity.status == DownloadIntegrityStatus::Pending
+            && self.integrity_refresh_active(id)
+        {
+            return Ok(download.clone());
+        }
+
+        mark_download_integrity_pending(download);
+        append_download_log(
+            download,
+            DownloadLogLevel::Info,
+            "integrity.verify-requested",
+            "Queued a SHA-256 checksum verification run.",
+        );
+        let response = download.clone();
+
+        self.persist_registry(&registry)?;
+        drop(registry);
+        self.emit_download_upsert(&response);
+        self.spawn_download_integrity_refresh(id.to_string());
+        Ok(response)
+    }
+
+    pub async fn recalculate_download_checksum(
+        &self,
+        _app: &AppHandle,
+        id: &str,
+    ) -> Result<DownloadRecord, String> {
+        self.await_bootstrap().await;
+        let mut registry = self.registry_guard()?;
+        let Some(download) = registry
+            .downloads
+            .iter_mut()
+            .find(|download| download.id == id)
+        else {
+            return Err(format!("No download found for id '{id}'."));
+        };
+        if download.status != DownloadStatus::Finished {
+            return Err("Finish the download before recalculating its checksum.".to_string());
+        }
+        if download.integrity.status == DownloadIntegrityStatus::Pending
+            && self.integrity_refresh_active(id)
+        {
+            return Ok(download.clone());
+        }
+
+        mark_download_integrity_pending(download);
+        append_download_log(
+            download,
+            DownloadLogLevel::Info,
+            "integrity.recalculate-requested",
+            "Queued a fresh SHA-256 checksum calculation.",
+        );
+        let response = download.clone();
+
+        self.persist_registry(&registry)?;
+        drop(registry);
+        self.emit_download_upsert(&response);
+        self.spawn_download_integrity_refresh(id.to_string());
         Ok(response)
     }
 

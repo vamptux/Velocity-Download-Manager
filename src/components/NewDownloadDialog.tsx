@@ -20,12 +20,10 @@ import {
 } from "@/components/DownloadCapturePane";
 import { getCaptureErrorMessage, useDefaultCaptureSavePath } from "@/lib/captureUtils";
 import {
+  buildDuplicateLookupInput,
   describeDuplicateMatch,
   duplicateResolutionLabel,
-  findDuplicateDownload,
-  getDuplicateResolution,
-  getSecondaryDuplicateResolution,
-  joinTargetPathPreview,
+  resolveDuplicateState,
   suggestAlternativeFilename,
 } from "@/lib/downloadDuplicates";
 
@@ -121,19 +119,19 @@ export function NewDownloadDialog({
   }, [categoryDirty, filenameDirty, open, savePath, url]);
 
   const effectiveFilename = filename.trim() || probe?.suggestedName || "";
-  const duplicateMatch = useMemo(() => findDuplicateDownload(existingDownloads, {
-    url,
-    finalUrl: probe?.finalUrl,
-    targetPath: joinTargetPathPreview(savePath, effectiveFilename),
-    validators: probe?.validators,
-  }), [effectiveFilename, existingDownloads, probe?.finalUrl, probe?.validators, savePath, url]);
-  const duplicateResolution = useMemo(
-    () => (duplicateMatch ? getDuplicateResolution(duplicateMatch) : null),
-    [duplicateMatch],
-  );
-  const duplicateSecondaryResolution = useMemo(
-    () => (duplicateMatch ? getSecondaryDuplicateResolution(duplicateMatch) : null),
-    [duplicateMatch],
+  const {
+    match: duplicateMatch,
+    resolution: duplicateResolution,
+    secondaryResolution: duplicateSecondaryResolution,
+  } = useMemo(
+    () => resolveDuplicateState(existingDownloads, buildDuplicateLookupInput({
+      url,
+      finalUrl: probe?.finalUrl,
+      savePath,
+      name: effectiveFilename,
+      validators: probe?.validators,
+    })),
+    [effectiveFilename, existingDownloads, probe?.finalUrl, probe?.validators, savePath, url],
   );
 
   function closeWithExisting(download: Download) {

@@ -98,7 +98,7 @@ Notes:
 ---
 
 ## Phase 6 - Updater safety
-- [x] Add update channel model: `stable` and `preview`.
+- [x] Keep update channel model stable-only.
 - [x] Add skip-this-version state.
 - [x] Preserve engine settings across update transitions.
 - [x] Record enough update metadata to diff settings / behavior changes.
@@ -108,8 +108,8 @@ Notes:
 
 Notes:
 - Current updater flow is straightforward and all-or-nothing in `src-tauri/src/app_update.rs`.
-- Channel config decision: `EngineSettings.updateChannel` now persists `stable` or `preview`; preview checks `latest-preview.json` first and falls back to stable metadata when no preview manifest is published.
-- Rollback trigger: if the first restart after install comes up on the wrong version or the updated build fails engine bootstrap, VDM marks that target version as skipped and, for preview installs, automatically switches future checks back to the stable channel.
+- Channel config decision: `EngineSettings.updateChannel` stays `stable`; the app does not expose preview or staging rings.
+- Rollback trigger: if the first restart after install comes up on the wrong version or the updated build fails engine bootstrap, VDM marks that target version as skipped until a newer release appears.
 - Skip-version storage: persisted in `EngineSettings.skippedUpdateVersion` and filtered in backend update checks.
 - Update alerts now show current-to-target version metadata plus up to three prioritized highlights from release notes, with engine/backend items ranked ahead of general notes.
 - Update transition metadata: install now writes a pending transition record with source/target versions, release notes, and the pre-install `EngineSettings` snapshot before download begins.
@@ -123,7 +123,7 @@ Notes:
 - [ ] What exactly should `Replace existing` mean for finished vs partial downloads?
 - [ ] Should `Merge source list` be implemented now or deferred until mirror support lands?
 - [x] Should batch import preview allow editing parsed rows before enqueue?
-- [ ] Should preview update channel use a separate settings keyspace or share the same one?
+- [x] Should updater expose anything beyond the stable release path?
 
 Notes:
 - 
@@ -133,7 +133,7 @@ Notes:
 ## Session handoff
 - Next recommended step: decide whether validator-based duplicate matches should auto-link into the same contextual action flow before adding any destructive replace semantics.
 - Files most relevant next session: `src/components/BatchDownloadDialog.tsx`, `src/lib/batchImport.ts`, `src/App.tsx`, `src/hooks/useEngineBridge.ts`, `src-tauri/src/app_update.rs`, `src-tauri/src/engine/mod.rs`.
-- Decisions that must not be forgotten: skip-version is backend-persisted, duplicate URL matches outrank path-only matches, target-path-only collisions now default to `Keep both` while still exposing the existing download action, batch import rows are now editable and revalidated live before enqueue, and updater startup health can skip a failed build and downgrade preview users back to the stable channel.
+- Decisions that must not be forgotten: skip-version is backend-persisted as a single stable-only value, duplicate URL matches outrank path-only matches, target-path-only collisions now default to `Keep both` while still exposing the existing download action, batch import rows are now editable and revalidated live before enqueue, and updater startup health should not leak a failed install into future stable checks.
 - Current thresholds / limits: batch import preview now keeps all parsed rows editable in a scrollable review pane and still limits the failure summary to the first 5 import failures.
-- Known bugs / risks: CSV/TSV parsing supports quoted fields but not multiline quoted cells; validator duplicate matching intentionally refuses content-length-only matches and will not fire until the probe has both size and either `etag` or `last-modified`; preview and stable currently share the same skip-version state instead of using per-channel suppression.
-- Quick summary for next agent: this pass added editable batch-import review with live revalidation, first-class `Keep both` duplicate handling for target-path-only collisions, and updater hardening with persisted stable/preview channels plus rollback-trigger guardrails. Pending work is destructive duplicate semantics, mirror/source merging, and any decision to split updater keyspace by channel.
+- Known bugs / risks: CSV/TSV parsing supports quoted fields but not multiline quoted cells; validator duplicate matching intentionally refuses content-length-only matches and will not fire until the probe has both size and either `etag` or `last-modified`; extension auto-capture now intentionally avoids aggressive image/audio/video hijacking unless a stronger download signal exists.
+- Quick summary for next agent: this pass added editable batch-import review with live revalidation, first-class `Keep both` duplicate handling for target-path-only collisions, stable-only updater hardening with rollback-trigger guardrails, and more conservative browser auto-capture for media navigation. Pending work is destructive duplicate semantics and mirror/source merging.

@@ -1,9 +1,10 @@
-import { useMemo, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
   ArrowDown,
   ArrowUp,
+  Copy,
   FolderOpen,
   Info,
   Layers,
@@ -25,17 +26,23 @@ import {
   canRestartDownload,
   canResumeDownload,
   restartRequirementLabel,
-  restartRequirementReason,
 } from "@/lib/downloadActions";
+import { writeClipboardText } from "@/lib/clipboard";
 import {
-  activeConnectionCount,
+  buildDownloadDiagnosticsSummary,
+  buildSelectionDiagnosticsSummary,
+} from "@/lib/downloadDiagnostics";
+import {
   CATEGORY_ICONS,
   CATEGORY_ICON_COLORS,
   failureKindLabel,
-  formatCooldownLabel,
+  hostBadgeItems,
   hostLockLabel,
+  primaryIssueSummary,
+  semanticBadgeToneClassName,
+  statusBadgeClassName,
   statusLabel,
-  targetConnectionCount,
+  transferConstraintNotice,
 } from "@/lib/downloadPresentation";
 import {
   formatBytes,
@@ -43,15 +50,19 @@ import {
   formatTimeRemaining,
 } from "@/lib/format";
 import { calculateDisplayProgress } from "@/lib/downloadProgress";
-import { isInternalProbeWarning, simplifyUserMessage } from "@/lib/userFacingMessages";
+import {
+  getVisibleDiagnosticNotes,
+  getVisibleDownloadWarnings,
+  sameVisibleMessage,
+  simplifyUserMessage,
+} from "@/lib/userFacingMessages";
 import type {
   Download as DownloadItem,
   DownloadLogEntry,
   DownloadLogLevel,
-  DownloadSegment,
   DownloadStatus,
 } from "@/types/download";
-import { TransferSegmentStrip } from "@/components/TransferSegmentStrip";
+import { SegmentRuntimePanel } from "@/components/download-details/SegmentRuntimePanel";
 
 interface DownloadDetailsPanelProps {
   selectedDownloads: DownloadItem[];
@@ -133,29 +144,12 @@ function redactUrlDisplay(value: string): string {
   }
 }
 
-function isUserFacingDiagnosticNote(message: string): boolean {
-  const lower = message.toLowerCase();
-  return (
-    !lower.includes("runtime worker orchestration enabled") &&
-    !lower.includes("live transfer bootstrap")
-  );
-}
-
 function StatusBadge({ status }: { status: DownloadStatus }) {
   return (
     <span
       className={cn(
         "inline-flex items-center rounded px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
-        status === "downloading" &&
-          "bg-[hsl(var(--status-downloading)/0.14)] text-[hsl(var(--status-downloading))]",
-        status === "paused" &&
-          "bg-[hsl(var(--status-paused)/0.14)] text-[hsl(var(--status-paused))]",
-        status === "error" &&
-          "bg-[hsl(var(--status-error)/0.14)] text-[hsl(var(--status-error))]",
-        (status === "queued" || status === "stopped") &&
-          "bg-white/6 text-muted-foreground/78",
-        status === "finished" &&
-          "bg-[hsl(var(--status-finished)/0.14)] text-[hsl(var(--status-finished))]",
+        statusBadgeClassName(status),
       )}
     >
       {statusLabel(status)}
@@ -174,13 +168,7 @@ function CapabilityBadge({
     <span
       className={cn(
         "inline-flex items-center rounded px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
-        tone === "good" &&
-          "bg-[hsl(var(--status-downloading)/0.12)] text-[hsl(var(--status-downloading))]",
-        tone === "warn" &&
-          "bg-[hsl(var(--status-paused)/0.14)] text-[hsl(var(--status-paused))]",
-        tone === "error" &&
-          "bg-[hsl(var(--status-error)/0.12)] text-[hsl(var(--status-error))]",
-        tone === "neutral" && "bg-white/[0.065] text-foreground/62",
+        semanticBadgeToneClassName(tone),
       )}
     >
       {label}
@@ -279,138 +267,35 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-type BlockState = "complete" | "active" | "pending";
-
-function computeBlockStates(
-  size: number,
-  segments: DownloadSegment[],
-  totalBlocks: number,
-): BlockState[] {
-  const states: BlockState[] = new Array(totalBlocks).fill(
-    "pending",
-  ) as BlockState[];
-  const bytesPerBlock = size / totalBlocks;
-
-  for (const seg of segments) {
-    const completedUpTo =
-      seg.status === "finished" ? seg.end + 1 : seg.start + seg.downloaded;
-
-    if (completedUpTo > seg.start) {
-      const firstBlock = Math.floor(seg.start / bytesPerBlock);
-      const lastBlock = Math.min(
-        totalBlocks - 1,
-        Math.floor((completedUpTo - 1) / bytesPerBlock),
-      );
-      for (let b = firstBlock; b <= lastBlock; b++) {
-        states[b] = "complete";
-      }
-    }
-
-    if (seg.status === "downloading") {
-      const edgeBlock = Math.min(
-        totalBlocks - 1,
-        Math.floor(completedUpTo / bytesPerBlock),
-      );
-      if (states[edgeBlock] !== "complete") {
-        states[edgeBlock] = "active";
-      }
-    }
-  }
-
-  return states;
-}
-
-function BlockProgressMap({ download }: { download: DownloadItem }) {
-  const TOTAL_BLOCKS = 768;
-  const { size, segments, status, downloaded } = download;
-  const hasSegments = segments.length > 0 && size > 0;
-
-  const blockStates = useMemo(
-    () =>
-      hasSegments ? computeBlockStates(size, segments, TOTAL_BLOCKS) : null,
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [size, segments, hasSegments],
-  );
-
-  const progress = calculateDisplayProgress(downloaded, size, status);
-  const finishedSegments = segments.filter(
-    (s) => s.status === "finished",
-  ).length;
-  const activeConnections = activeConnectionCount(download);
-  const targetConnections = targetConnectionCount(download);
-
+function QuickActionButton({
+  icon: Icon,
+  label,
+  onClick,
+  active = false,
+  disabled = false,
+}: {
+  icon: React.ElementType;
+  label: string;
+  onClick: () => void;
+  active?: boolean;
+  disabled?: boolean;
+}) {
   return (
-    <div className="flex flex-col gap-2">
-      {blockStates ? (
-        <div
-          className="w-full overflow-hidden rounded-sm"
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, 7px)",
-            gap: "2px",
-          }}
-        >
-          {blockStates.map((state, i) => (
-            <div
-              key={i}
-              className={cn(
-                "h-[7px] w-[7px] rounded-[2px]",
-                state === "complete" && "bg-[hsl(var(--status-downloading))]",
-                state === "active" && "bg-[hsl(var(--status-downloading)/0.4)]",
-                state === "pending" && "bg-white/[0.06]",
-              )}
-            />
-          ))}
-        </div>
-      ) : (
-        <div className="h-[7px] overflow-hidden rounded-sm bg-white/[0.06]">
-          <div
-            className={cn(
-              "h-full transition-[width] duration-300",
-              status === "paused"
-                ? "bg-[hsl(var(--status-paused))]"
-                : status === "error"
-                  ? "bg-[hsl(var(--status-error))]"
-                  : status === "finished"
-                    ? "bg-[hsl(var(--status-finished))]"
-                    : "bg-[hsl(var(--status-downloading))]",
-            )}
-            style={{ width: `${progress}%` }}
-          />
-        </div>
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10px] font-medium transition-colors",
+        disabled && "pointer-events-none opacity-45",
+        active
+          ? "border-[hsl(var(--status-finished)/0.28)] bg-[hsl(var(--status-finished)/0.12)] text-[hsl(var(--status-finished))]"
+          : "border-border/55 bg-black/10 text-foreground/72 hover:bg-accent hover:text-foreground",
       )}
-
-      <div className="flex items-center gap-3 text-[10px] text-muted-foreground/40">
-        {status === "finished" ? (
-          <span className="text-[hsl(var(--status-finished)/0.8)] font-medium">Complete</span>
-        ) : hasSegments ? (
-          <>
-            <span>
-              <span className="tabular-nums text-foreground/55 font-medium">{finishedSegments}</span>
-              <span className="ml-0.5 text-muted-foreground/32">/ {segments.length} parts</span>
-            </span>
-            <span className="h-2.5 w-px bg-border/30" />
-            <span>
-              <span className="tabular-nums text-foreground/55 font-medium">{activeConnections}</span>
-              <span className="ml-0.5 text-muted-foreground/32">active</span>
-              <span className="mx-1 text-muted-foreground/20">/</span>
-              <span className="tabular-nums text-foreground/55 font-medium">{targetConnections}</span>
-              <span className="ml-0.5 text-muted-foreground/32">target</span>
-            </span>
-            {download.writerBackpressure && (
-              <>
-                <span className="h-2.5 w-px bg-border/30" />
-                <span className="text-[hsl(var(--status-paused)/0.75)] text-[9.5px]">Disk pressure</span>
-              </>
-            )}
-          </>
-        ) : (
-          <span className="text-[9.5px]">
-            {download.capabilities.rangeSupported ? "Range-resumable" : "Single connection"}
-          </span>
-        )}
-      </div>
-    </div>
+    >
+      <Icon size={11} strokeWidth={1.9} className="shrink-0" />
+      {label}
+    </button>
   );
 }
 
@@ -482,12 +367,19 @@ function SelectionSummary({
   selectedDownloads: DownloadItem[];
   onClearSelection: () => void;
 }) {
+  const [summaryCopied, setSummaryCopied] = useState(false);
   const errorCount = selectedDownloads.filter(
     (download) => download.status === "error",
   ).length;
   const restartCount = selectedDownloads.filter(
     (download) => download.diagnostics.restartRequired,
   ).length;
+
+  async function handleCopySummary() {
+    await writeClipboardText(buildSelectionDiagnosticsSummary(selectedDownloads));
+    setSummaryCopied(true);
+    window.setTimeout(() => setSummaryCopied(false), 1800);
+  }
 
   return (
     <section className="shrink-0 border-t border-border/80 bg-[linear-gradient(180deg,hsl(var(--card)),hsl(var(--background)))] px-4 py-3 shadow-[0_-10px_30px_rgba(0,0,0,0.28)]">
@@ -504,7 +396,17 @@ function SelectionSummary({
             <span>{restartCount} restart-only</span>
           </div>
         </div>
-        <CloseButton onClick={onClearSelection} />
+        <div className="flex items-center gap-2">
+          <QuickActionButton
+            icon={Copy}
+            label={summaryCopied ? "Summary copied" : "Copy summary"}
+            onClick={() => {
+              void handleCopySummary();
+            }}
+            active={summaryCopied}
+          />
+          <CloseButton onClick={onClearSelection} />
+        </div>
       </div>
     </section>
   );
@@ -537,7 +439,7 @@ function SingleSelection({
 }) {
   const [tab, setTab] = useState<DetailTab>("general");
   const [panelHeight, setPanelHeight] = useState(210);
-  const [urlCopied, setUrlCopied] = useState(false);
+  const [copiedAction, setCopiedAction] = useState<null | "url" | "path" | "diagnostics">(null);
   const isDragging = useRef(false);
 
   function startPanelResize(e: React.MouseEvent) {
@@ -580,62 +482,31 @@ function SingleSelection({
   const categoryIconColor = CATEGORY_ICON_COLORS[download.category];
   const recentLogEntries = download.engineLog.slice(-20).reverse();
   const restartLabel = restartRequirementLabel(download);
-  const restartReason = restartRequirementReason(download);
-  const hostBadges = (() => {
-    const rows: Array<{
-      label: string;
-      tone: "neutral" | "good" | "warn" | "error";
-    }> = [];
-    if (restartLabel) {
-      rows.push({ label: restartLabel, tone: "warn" });
-    }
-    if (download.compatibility.directUrlRecovered) {
-      rows.push({ label: "Wrapper recovered", tone: "good" });
-    } else if (download.compatibility.browserInterstitialOnly) {
-      rows.push({ label: "Browser interstitial", tone: "warn" });
-    }
-    if (download.compatibility.requestReferer) {
-      rows.push({ label: "Wrapper referer", tone: "neutral" });
-    }
-    if (
-      download.hostDiagnostics.hardNoRange ||
-      !download.capabilities.rangeSupported
-    ) {
-      rows.push({ label: "No-range host", tone: "warn" });
-    }
-    const cooldown = formatCooldownLabel(
-      download.hostDiagnostics.cooldownUntil ?? download.hostCooldownUntil,
-    );
-    if (cooldown) {
-      rows.push({ label: cooldown, tone: "warn" });
-    }
-    if (download.hostDiagnostics.concurrencyLocked) {
-      rows.push({
-        label: hostLockLabel(download.hostDiagnostics.lockReason),
-        tone: "warn",
-      });
-    }
-    const protocol =
-      download.hostDiagnostics.negotiatedProtocol ?? download.hostProtocol;
-    if (protocol) {
-      rows.push({ label: protocol.toUpperCase(), tone: "neutral" });
-    }
-    if (download.hostDiagnostics.reuseConnections !== null) {
-      rows.push({
-        label: download.hostDiagnostics.reuseConnections
-          ? "Keep-alive reuse"
-          : "Fresh sockets",
-        tone: download.hostDiagnostics.reuseConnections ? "good" : "neutral",
-      });
-    }
-    if (download.hostMaxConnections !== null) {
-      rows.push({
-        label: `Cap ${download.hostMaxConnections}`,
-        tone: "neutral",
-      });
-    }
-    return rows.slice(0, 6);
-  })();
+  const primaryIssue = primaryIssueSummary(download);
+  const visibleWarnings = getVisibleDownloadWarnings(
+    download.diagnostics.warnings,
+    2,
+  );
+  const visibleNotes = getVisibleDiagnosticNotes(download.diagnostics.notes, 1);
+
+  async function handleCopyAction(
+    action: "url" | "path" | "diagnostics",
+    value: string,
+  ) {
+    await writeClipboardText(value);
+    setCopiedAction(action);
+    window.setTimeout(() => setCopiedAction(null), 1800);
+  }
+
+  const hostBadges = hostBadgeItems({
+    compatibility: download.compatibility,
+    hostDiagnostics: download.hostDiagnostics,
+    rangeSupported: download.capabilities.rangeSupported,
+    hostCooldownUntil: download.hostCooldownUntil,
+    hostProtocol: download.hostProtocol,
+    hostMaxConnections: download.hostMaxConnections,
+    restartLabel,
+  });
   const hostFields = (() => {
     const rows: Array<{ label: string; value: string }> = [
       { label: "Host", value: download.host },
@@ -717,11 +588,15 @@ function SingleSelection({
       });
     };
 
-    if (restartReason) {
-      push(RotateCcw, restartReason, "warn");
+    if (primaryIssue) {
+      push(
+        download.status === "error" ? AlertTriangle : RotateCcw,
+        primaryIssue,
+        download.status === "error" ? "error" : "warn",
+      );
     }
 
-    if (download.errorMessage) {
+    if (download.errorMessage && !sameVisibleMessage(download.errorMessage, primaryIssue)) {
       push(AlertTriangle, download.errorMessage, "error");
     } else if (failureLabel) {
       push(Info, failureLabel, "note");
@@ -729,7 +604,8 @@ function SingleSelection({
 
     if (
       download.diagnostics.terminalReason &&
-      download.diagnostics.terminalReason !== download.errorMessage
+      !sameVisibleMessage(download.diagnostics.terminalReason, primaryIssue) &&
+      !sameVisibleMessage(download.diagnostics.terminalReason, download.errorMessage)
     ) {
       push(
         download.diagnostics.failureKind ? AlertTriangle : Info,
@@ -738,13 +614,15 @@ function SingleSelection({
       );
     }
 
-    if (download.writerBackpressure) {
+    const constraintNotice = transferConstraintNotice(download);
+    if (constraintNotice) {
       push(
-        AlertTriangle,
-        "Disk backpressure is active, so VDM is holding off on extra ramp-up and work-steal pressure.",
-        "warn",
+        constraintNotice.tone === "warn" ? AlertTriangle : Layers,
+        constraintNotice.message,
+        constraintNotice.tone,
       );
     }
+
     if (!download.writerBackpressure && download.diagnostics.checkpointDiskPressureEvents > 0) {
       push(
         AlertTriangle,
@@ -752,44 +630,12 @@ function SingleSelection({
         "warn",
       );
     }
-    const hostCooldown = formatCooldownLabel(
-      download.hostDiagnostics.cooldownUntil ?? download.hostCooldownUntil,
-    );
-    if (hostCooldown) {
-      push(
-        AlertTriangle,
-        `${hostCooldown} is active because the host is currently throttling or unstable.`,
-        "warn",
-      );
-    }
-    if (download.hostDiagnostics.concurrencyLocked) {
-      push(
-        Layers,
-        `${hostLockLabel(download.hostDiagnostics.lockReason)} is limiting connection ramp-up for stability.`,
-        "note",
-      );
-    }
 
-    if (
-      !download.capabilities.rangeSupported &&
-      download.status !== "finished"
-    ) {
-      push(
-        Layers,
-        "Host is pinned to single-connection mode because byte-range support is unavailable or untrusted.",
-        "note",
-      );
-    }
-
-    for (const warning of download.diagnostics.warnings
-      .filter((w) => !isInternalProbeWarning(w))
-      .slice(0, 2)) {
+    for (const warning of visibleWarnings) {
       push(AlertTriangle, warning, "warn");
     }
 
-    for (const note of download.diagnostics.notes
-      .filter(isUserFacingDiagnosticNote)
-      .slice(0, 1)) {
+    for (const note of visibleNotes) {
       push(Info, note, "note");
     }
 
@@ -1022,16 +868,44 @@ function SingleSelection({
                   <button
                     type="button"
                     onClick={() => {
-                      navigator.clipboard.writeText(displaySourceUrl).catch(() => null);
-                      setUrlCopied(true);
-                      window.setTimeout(() => setUrlCopied(false), 1800);
+                      void handleCopyAction("url", sourceUrl);
                     }}
                     className="min-w-0 truncate text-left text-foreground/60 hover:text-foreground/85 transition-colors"
-                    title={urlCopied ? "Copied!" : `${displaySourceUrl}\nClick to copy`}
+                    title={copiedAction === "url" ? "Copied!" : `${displaySourceUrl}\nClick to copy`}
                   >
-                    {urlCopied ? "Copied!" : displaySourceUrl}
+                    {copiedAction === "url" ? "Copied!" : displaySourceUrl}
                   </button>
                 </div>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5">
+                <QuickActionButton
+                  icon={Copy}
+                  label={copiedAction === "url" ? "Final URL copied" : "Copy final URL"}
+                  onClick={() => {
+                    void handleCopyAction("url", sourceUrl);
+                  }}
+                  active={copiedAction === "url"}
+                />
+                <QuickActionButton
+                  icon={FolderOpen}
+                  label={copiedAction === "path" ? "Target path copied" : "Copy target path"}
+                  onClick={() => {
+                    void handleCopyAction("path", download.targetPath);
+                  }}
+                  active={copiedAction === "path"}
+                />
+                <QuickActionButton
+                  icon={Info}
+                  label={copiedAction === "diagnostics" ? "Diagnostics copied" : "Copy diagnostics"}
+                  onClick={() => {
+                    void handleCopyAction(
+                      "diagnostics",
+                      buildDownloadDiagnosticsSummary(download, displaySourceUrl),
+                    );
+                  }}
+                  active={copiedAction === "diagnostics"}
+                />
               </div>
 
               {signalRows.length > 0 ? (
@@ -1083,30 +957,7 @@ function SingleSelection({
         )}
 
         {tab === "segments" && (
-          <div className="flex flex-col gap-3 px-4 py-3">
-            <BlockProgressMap download={download} />
-            {download.segments.length > 0 && (
-              <>
-                <div className="h-px bg-border/25" />
-                <div className="flex items-center justify-between text-[9px] text-muted-foreground/30 mb-0.5">
-                  <span className="font-semibold uppercase tracking-[0.14em]">
-                    {download.segments.length} Segment{download.segments.length !== 1 ? "s" : ""}
-                  </span>
-                  <span className="tabular-nums">
-                    {download.segments.filter((s) => s.status === "downloading").length} active
-                    {" · "}
-                    {download.segments.filter((s) => s.status === "finished").length} done
-                  </span>
-                </div>
-                <TransferSegmentStrip
-                  segments={download.segments}
-                  compact={false}
-                  barClassName="h-3"
-                  className="gap-[2px]"
-                />
-              </>
-            )}
-          </div>
+          <SegmentRuntimePanel download={download} />
         )}
 
         {tab === "log" && (

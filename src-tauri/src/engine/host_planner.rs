@@ -3,6 +3,7 @@ use crate::model::{
 };
 
 use super::probe::normalize_protocol_label;
+use super::probe_cache::probe_scope_entry;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_STABLE_HOST_CAP: u32 = 20;
@@ -312,9 +313,7 @@ pub fn apply_host_telemetry(profile: &mut HostProfile, payload: &HostTelemetryAr
                     profile.ramp_attempts_without_gain.saturating_add(1);
             } else {
                 profile.ramp_attempts_without_gain = 0;
-                profile.concurrency_locked = false;
-                profile.locked_connections = None;
-                profile.lock_reason = None;
+                clear_profile_lock(profile);
             }
         }
 
@@ -333,9 +332,7 @@ pub fn apply_host_telemetry(profile: &mut HostProfile, payload: &HostTelemetryAr
         } else if !cooldown_active(profile.cooldown_until)
             && profile.lock_reason.as_deref() == Some("cooldown-active")
         {
-            profile.concurrency_locked = false;
-            profile.locked_connections = None;
-            profile.lock_reason = None;
+            clear_profile_lock(profile);
         }
     }
 
@@ -406,17 +403,12 @@ pub fn host_diagnostics_summary_for_scope(
         return HostDiagnosticsSummary::default();
     };
     let concurrency_locked = should_apply_concurrency_lock_for_scope(profile, scope_key);
+    let lock_reason = effective_lock_reason(profile, scope_key);
 
     HostDiagnosticsSummary {
-        hard_no_range: false,
+        hard_no_range: effective_hard_no_range(profile, scope_key),
         concurrency_locked,
-        lock_reason: if !concurrency_locked
-            || effective_lock_reason(profile, scope_key) == Some("probe-failures")
-        {
-            None
-        } else {
-            effective_lock_reason(profile, scope_key).map(str::to_string)
-        },
+        lock_reason: visible_lock_reason(lock_reason, concurrency_locked).map(str::to_string),
         cooldown_until: effective_cooldown_until(profile, scope_key),
         negotiated_protocol: profile
             .negotiated_protocol
@@ -447,7 +439,7 @@ fn scope_entry<'a>(
     profile: &'a HostProfile,
     scope_key: Option<&str>,
 ) -> Option<&'a ProbeScopeCache> {
-    scope_key.and_then(|key| profile.probe_scopes.get(key))
+    scope_key.and_then(|key| probe_scope_entry(profile, key))
 }
 
 fn scope_has_telemetry(scope: &ProbeScopeCache) -> bool {
@@ -475,10 +467,24 @@ fn effective_locked_connections(profile: &HostProfile, scope_key: Option<&str>) 
         .or(profile.locked_connections)
 }
 
+fn effective_hard_no_range(profile: &HostProfile, scope_key: Option<&str>) -> bool {
+    scope_entry(profile, scope_key)
+        .map(|scope| scope.hard_no_range)
+        .unwrap_or(profile.hard_no_range)
+}
+
 fn effective_lock_reason<'a>(profile: &'a HostProfile, scope_key: Option<&str>) -> Option<&'a str> {
     scope_entry(profile, scope_key)
         .and_then(|scope| scope.lock_reason.as_deref())
         .or(profile.lock_reason.as_deref())
+}
+
+fn visible_lock_reason(lock_reason: Option<&str>, concurrency_locked: bool) -> Option<&str> {
+    if !concurrency_locked || lock_reason == Some("probe-failures") {
+        None
+    } else {
+        lock_reason
+    }
 }
 
 fn effective_throttle_events(profile: &HostProfile, scope_key: Option<&str>) -> u32 {
@@ -512,6 +518,12 @@ fn clear_scope_lock(scope: &mut ProbeScopeCache) {
     scope.concurrency_locked = false;
     scope.locked_connections = None;
     scope.lock_reason = None;
+}
+
+fn clear_profile_lock(profile: &mut HostProfile) {
+    profile.concurrency_locked = false;
+    profile.locked_connections = None;
+    profile.lock_reason = None;
 }
 
 fn maybe_release_stale_scope_ramp_lock(scope: &mut ProbeScopeCache, now_millis: i64) {
@@ -813,9 +825,7 @@ fn maybe_recover_host_max_connections(profile: &mut HostProfile, payload: &HostT
     profile.stable_recovery_samples = 0;
     if profile.lock_reason.as_deref() == Some("ramp-no-gain") {
         profile.ramp_attempts_without_gain = 0;
-        profile.concurrency_locked = false;
-        profile.locked_connections = None;
-        profile.lock_reason = None;
+        clear_profile_lock(profile);
     }
 }
 
@@ -828,9 +838,7 @@ fn maybe_release_stale_ramp_lock(profile: &mut HostProfile, now_millis: i64) {
     }
 
     profile.ramp_attempts_without_gain = 0;
-    profile.concurrency_locked = false;
-    profile.locked_connections = None;
-    profile.lock_reason = None;
+    clear_profile_lock(profile);
 }
 
 fn maybe_release_stale_probe_failure_lock(profile: &mut HostProfile, now_millis: i64) {
@@ -841,9 +849,7 @@ fn maybe_release_stale_probe_failure_lock(profile: &mut HostProfile, now_millis:
         .last_probe_error_at
         .is_some_and(|value| now_millis.saturating_sub(value) <= PROBE_FAILURE_LOCK_WINDOW_MS);
     if !is_active {
-        profile.concurrency_locked = false;
-        profile.locked_connections = None;
-        profile.lock_reason = None;
+        clear_profile_lock(profile);
     }
 }
 

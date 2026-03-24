@@ -1,7 +1,9 @@
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { AlertTriangle, AlignCenter, AlignJustify, Check, Cpu, Globe, LayoutGrid, Palette, X } from "lucide-react";
 import { InlineNotice } from "@/components/ui/inline-notice";
+import { ipcGetCaptureBridgeStatus } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 import {
   type AccentId,
@@ -13,7 +15,7 @@ import {
   loadUiPrefs,
   saveUiPrefs,
 } from "@/lib/uiPrefs";
-import type { AppUpdateChannel, EngineSettings, TrafficMode } from "@/types/download";
+import type { CaptureBridgeStatus, EngineSettings, TrafficMode } from "@/types/download";
 
 /* ─── THEME METADATA ────────────────────────────────────────────────────── */
 
@@ -163,11 +165,6 @@ const TRAFFIC_OPTIONS: Array<{ value: TrafficMode; label: string; hint: string }
   { value: "max",    label: "Max",    hint: "Unlimited" },
 ];
 
-const UPDATE_CHANNEL_OPTIONS: Array<{ value: AppUpdateChannel; label: string; hint: string }> = [
-  { value: "stable", label: "Stable", hint: "Production releases only" },
-  { value: "preview", label: "Preview", hint: "Early builds with fallback to stable on failure" },
-];
-
 type SettingsPage = "appearance" | "engine" | "browser";
 
 const PAGES: Array<{ id: SettingsPage; label: string; icon: React.ElementType }> = [
@@ -271,6 +268,7 @@ export function SettingsDialog({
   const [draft, setDraft] = useState<EngineSettings>(settings);
   const [page, setPage] = useState<SettingsPage>("appearance");
   const [uiPrefs, setUiPrefsState] = useState<UiPrefs>(() => ({ ...DEFAULT_UI_PREFS, ...loadUiPrefs() }));
+  const [captureBridgeStatus, setCaptureBridgeStatus] = useState<CaptureBridgeStatus | null>(null);
 
   function updateUiPrefs(patch: Partial<UiPrefs>) {
     setUiPrefsState((prev) => {
@@ -291,10 +289,67 @@ export function SettingsDialog({
     }
   }, [open, settings]);
 
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    let disposed = false;
+    void ipcGetCaptureBridgeStatus()
+      .then((status) => {
+        if (!disposed) {
+          setCaptureBridgeStatus(status);
+        }
+      })
+      .catch(() => null);
+
+    const unlistenPromise = listen<CaptureBridgeStatus>("capture://bridge-status", (event) => {
+      if (!disposed) {
+        setCaptureBridgeStatus(event.payload);
+      }
+    });
+
+    return () => {
+      disposed = true;
+      void unlistenPromise.then((unlisten) => unlisten()).catch(() => null);
+    };
+  }, [open]);
+
   const isDirty = useMemo(
     () => JSON.stringify(draft) !== JSON.stringify(settings),
     [draft, settings],
   );
+
+  const captureBridgePhaseTone = captureBridgeStatus?.phase === "ready"
+    ? "bg-[hsl(var(--status-finished)/0.75)]"
+    : captureBridgeStatus?.phase === "failed"
+      ? "bg-[hsl(var(--status-error))]"
+      : "bg-[hsl(var(--status-downloading)/0.7)]";
+
+  const captureBridgePhaseLabel = captureBridgeStatus?.phase === "ready"
+    ? "Ready"
+    : captureBridgeStatus?.phase === "failed"
+      ? "Failed"
+      : "Starting";
+
+  const lastCaptureSourceLabel = captureBridgeStatus?.lastCaptureSource === "context-menu"
+    ? "Context menu"
+    : captureBridgeStatus?.lastCaptureSource === "download-api"
+      ? "Download API"
+      : captureBridgeStatus?.lastCaptureSource === "link-click"
+        ? "Link click"
+        : captureBridgeStatus?.lastCaptureSource === "manual"
+          ? "Manual"
+          : "None yet";
+
+  const lastCaptureAtLabel = captureBridgeStatus?.lastCaptureAt
+    ? new Date(captureBridgeStatus.lastCaptureAt).toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+    })
+    : "Waiting for first capture";
+  const currentSkippedUpdateVersion = draft.skippedUpdateVersion;
 
   // Current accent color for theme preview stripe
   const currentAccentColor = ACCENTS.find((a) => a.id === uiPrefs.accent)?.color ?? ACCENTS[0].color;
@@ -579,29 +634,18 @@ export function SettingsDialog({
                       <div className="text-[12.5px] font-semibold text-foreground/80">App Updates</div>
                     </div>
                     <div className="text-[11.5px] leading-[1.65] text-muted-foreground/60">
-                      Stable keeps VDM on release builds. Preview checks prerelease manifests first and automatically falls back to stable if the first restart after an update fails.
+                      VDM now uses the stable release path only. Update checks follow the published stable manifest and keep a single skip-this-version state locally.
                     </div>
-                    <div className="mt-3 grid grid-cols-2 gap-2">
-                      {UPDATE_CHANNEL_OPTIONS.map((option) => {
-                        const active = draft.updateChannel === option.value;
-                        return (
-                          <button
-                            key={option.value}
-                            type="button"
-                            onClick={() => setDraft((prev) => ({ ...prev, updateChannel: option.value }))}
-                            className={cn(
-                              "rounded-md border px-3 py-2.5 text-left transition-colors duration-150",
-                              active
-                                ? "border-[hsl(var(--primary)/0.4)] bg-[hsl(var(--primary)/0.12)] text-foreground"
-                                : "border-border/60 bg-black/10 text-foreground/60 hover:border-border/90 hover:text-foreground/80 hover:bg-accent/5",
-                            )}
-                          >
-                            <div className="text-[12px] font-semibold">{option.label}</div>
-                            <div className="mt-0.5 text-[10.5px] text-muted-foreground/55">{option.hint}</div>
-                          </button>
-                        );
-                      })}
+                    <div className="mt-3 rounded-md border border-border/40 bg-black/[0.14] px-3 py-2.5">
+                      <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground/40">Release track</div>
+                      <div className="mt-1 text-[12px] font-semibold text-foreground/82">Stable</div>
+                      <div className="mt-1 text-[10.5px] text-muted-foreground/50">Published release manifests only</div>
                     </div>
+                    {currentSkippedUpdateVersion && (
+                      <div className="mt-3 rounded-md border border-border/40 bg-black/[0.14] px-3 py-2 text-[10.5px] text-muted-foreground/56">
+                        Current skipped version: <span className="font-medium text-foreground/72">{currentSkippedUpdateVersion}</span>
+                      </div>
+                    )}
                   </div>
                   <div className="rounded-md border border-border/40 bg-black/[0.12] p-4">
                     <div className="mb-2 flex items-center gap-2">
@@ -612,12 +656,34 @@ export function SettingsDialog({
                       VDM Catcher auto-detects the desktop app over localhost. No pairing step is required — keep the app running
                       and the extension reconnects automatically after browser or service-worker restarts.
                     </div>
+                    <div className="mt-3 grid grid-cols-2 gap-2">
+                      <div className="rounded-md border border-border/40 bg-black/[0.14] px-3 py-2.5">
+                        <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground/40">Bridge state</div>
+                        <div className="mt-1 flex items-center gap-2 text-[12px] font-semibold text-foreground/82">
+                          <span className={cn("h-2 w-2 rounded-full", captureBridgePhaseTone)} />
+                          {captureBridgePhaseLabel}
+                        </div>
+                        <div className="mt-1 text-[10.5px] text-muted-foreground/50">
+                          {captureBridgeStatus?.lastError ?? captureBridgeStatus?.bridgeUrl ?? "Loading bridge status..."}
+                        </div>
+                      </div>
+                      <div className="rounded-md border border-border/40 bg-black/[0.14] px-3 py-2.5">
+                        <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground/40">Recent capture</div>
+                        <div className="mt-1 text-[12px] font-semibold text-foreground/82">{lastCaptureSourceLabel}</div>
+                        <div className="mt-1 text-[10.5px] text-muted-foreground/50">{lastCaptureAtLabel}</div>
+                      </div>
+                    </div>
                   </div>
                   <div className="flex items-center gap-2.5 rounded-md border border-border/40 bg-black/[0.08] px-3.5 py-3">
-                    <div className="h-2 w-2 shrink-0 rounded-full bg-[hsl(var(--status-finished)/0.75)]" />
+                    <div className={cn("h-2 w-2 shrink-0 rounded-full", captureBridgePhaseTone)} />
                     <span className="text-[11.5px] text-foreground/60">
-                      Bridge listening on{" "}
-                      <span className="font-mono text-foreground/48">localhost:6670</span>
+                      {captureBridgeStatus?.phase === "failed" ? "Bridge unavailable" : "Bridge listening on"}{" "}
+                      <span className="font-mono text-foreground/48">
+                        {captureBridgeStatus ? `localhost:${captureBridgeStatus.port}` : "localhost:17780"}
+                      </span>
+                    </span>
+                    <span className="ml-auto text-[10.5px] text-muted-foreground/48">
+                      {captureBridgeStatus ? `${captureBridgeStatus.pendingCaptures} pending` : "..."}
                     </span>
                   </div>
                 </div>

@@ -1,9 +1,12 @@
 import { memo, useMemo } from "react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { formatBytes } from "@/lib/format";
+import { formatBytes, formatBytesPerSecond, formatTimeRemaining } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useSmoothedNumber } from "@/lib/downloadProgress";
-import type { DownloadSegment } from "@/types/download";
+import type {
+  DownloadRuntimeSegmentSample,
+  DownloadSegment,
+} from "@/types/download";
 
 const SEGMENT_BYTE_FORMAT = { zeroLabel: "0 B", integerAbove: 100 } as const;
 
@@ -30,6 +33,8 @@ interface SegmentViewModel {
   status: DownloadSegment["status"];
   length: number;
   progress: number;
+  sample: DownloadRuntimeSegmentSample | null;
+  raceCompanionId: number | null;
 }
 
 const SegmentCell = memo(function SegmentCell({
@@ -51,6 +56,7 @@ const SegmentCell = memo(function SegmentCell({
         <div
           className={cn(
             "relative min-w-[3px] flex-1 overflow-hidden rounded-[2px] bg-white/[0.05]",
+            segment.raceCompanionId != null && "ring-1 ring-inset ring-[hsl(var(--status-paused)/0.26)]",
             barClassName ?? (compact ? "h-1.5" : "h-2.5"),
           )}
           style={{ flexGrow: segment.length, flexBasis: 0 }}
@@ -76,6 +82,31 @@ const SegmentCell = memo(function SegmentCell({
           <div className="text-muted-foreground/70">
             {formatBytes(segment.downloaded, SEGMENT_BYTE_FORMAT)} of {formatBytes(segment.length, SEGMENT_BYTE_FORMAT)}
           </div>
+          {segment.sample?.throughputBytesPerSecond != null ? (
+            <div className="text-muted-foreground/70">
+              Speed {formatBytesPerSecond(segment.sample.throughputBytesPerSecond, SEGMENT_BYTE_FORMAT)}
+            </div>
+          ) : null}
+          {segment.sample?.etaSeconds != null ? (
+            <div className="text-muted-foreground/70">
+              ETA {formatTimeRemaining(segment.sample.etaSeconds, { emptyLabel: "Unknown" })}
+            </div>
+          ) : null}
+          {segment.sample?.retryAttempts ? (
+            <div className="text-muted-foreground/70">
+              Retries {segment.sample.retryAttempts}
+            </div>
+          ) : null}
+          {segment.raceCompanionId != null ? (
+            <div className="text-[hsl(var(--status-paused))]">
+              Racing with segment {segment.raceCompanionId}
+            </div>
+          ) : null}
+          {segment.sample?.terminalFailureReason ? (
+            <div className="text-[hsl(var(--status-error))]">
+              {segment.sample.terminalFailureReason}
+            </div>
+          ) : null}
           <div className="text-muted-foreground/60">
             Range {formatBytes(segment.start, SEGMENT_BYTE_FORMAT)} - {formatBytes(segment.end, SEGMENT_BYTE_FORMAT)}
           </div>
@@ -90,11 +121,15 @@ export function TransferSegmentStrip({
   compact = false,
   barClassName,
   className,
+  samplesBySegmentId,
+  raceCompanionBySegmentId,
 }: {
   segments: DownloadSegment[];
   compact?: boolean;
   barClassName?: string;
   className?: string;
+  samplesBySegmentId?: ReadonlyMap<number, DownloadRuntimeSegmentSample>;
+  raceCompanionBySegmentId?: ReadonlyMap<number, number>;
 }) {
   const prepared = useMemo<SegmentViewModel[]>(
     () =>
@@ -108,9 +143,11 @@ export function TransferSegmentStrip({
           status: segment.status,
           length,
           progress: Math.min(100, Math.max(0, (segment.downloaded / length) * 100)),
+          sample: samplesBySegmentId?.get(segment.id) ?? null,
+          raceCompanionId: raceCompanionBySegmentId?.get(segment.id) ?? null,
         };
       }),
-    [segments],
+    [raceCompanionBySegmentId, samplesBySegmentId, segments],
   );
 
   if (prepared.length === 0) {

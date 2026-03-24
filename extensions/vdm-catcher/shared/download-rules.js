@@ -42,6 +42,12 @@
     "application/x-apple-diskimage",
   ]);
 
+  const VIEWABLE_MEDIA_EXTENSIONS = new Set([
+    "mp4", "mkv", "mov", "avi", "webm", "m4v", "ts", "m2ts", "flv", "wmv",
+    "mp3", "flac", "wav", "ogg", "m4a", "aac", "opus",
+    "jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "avif", "tif", "tiff", "ico", "heic", "heif",
+  ]);
+
   const DEFAULT_MIN_SIZE_BYTES = 1 * 1024 * 1024;
 
   const CDN_PATTERNS = [
@@ -85,6 +91,15 @@
       return "";
     }
     return value.split(";")[0].trim().toLowerCase();
+  }
+
+  function isViewableMediaExtension(value) {
+    return !!value && VIEWABLE_MEDIA_EXTENSIONS.has(String(value).toLowerCase());
+  }
+
+  function isViewableMediaMime(value) {
+    const mime = cleanMimeType(value);
+    return mime.startsWith("image/") || mime.startsWith("video/") || mime.startsWith("audio/");
   }
 
   function extensionFromUrl(url, baseUrl) {
@@ -265,8 +280,18 @@
       (ext && ALWAYS_INTERCEPT_EXTENSIONS.has(ext)) ||
       (hintedExt && ALWAYS_INTERCEPT_EXTENSIONS.has(hintedExt)) ||
       (filenameExt && ALWAYS_INTERCEPT_EXTENSIONS.has(filenameExt));
+    const viewableMediaHint =
+      isViewableMediaExtension(ext) ||
+      isViewableMediaExtension(hintedExt) ||
+      isViewableMediaExtension(filenameExt);
     if (!strongFileHint) {
       return false;
+    }
+    if (viewableMediaHint) {
+      if (mediaHint) {
+        return false;
+      }
+      return directUrlHint && binaryHost && !isSameOrigin(parsed.href, referrerUrl, baseUrl);
     }
     if (directUrlHint || mediaHint || binaryHost) {
       return true;
@@ -311,10 +336,25 @@
     const effectiveSize = preferObservedSize(observed, fileSizeBytes);
     const directUrlHint = hasDownloadPathHint(url, baseUrl);
     const binaryHost = isCdnHost(url, baseUrl);
+    const viewableMedia =
+      isViewableMediaExtension(observedFilenameExt) ||
+      isViewableMediaExtension(ext) ||
+      isViewableMediaExtension(filenameExt) ||
+      isViewableMediaExtension(hintedExt) ||
+      isViewableMediaMime(cleanMime);
 
     if (context === "link-click") {
       if (explicitDownload) {
         return "yes";
+      }
+      if (viewableMedia) {
+        if (observed?.attachment) {
+          return "yes";
+        }
+        if (!mediaHint && directUrlHint && binaryHost && !isSameOrigin(url, referrerUrl, baseUrl)) {
+          return "yes";
+        }
+        return "no";
       }
       if (
         observedFilenameExt &&
@@ -339,6 +379,10 @@
         return "no";
       }
       return binaryHost && (directUrlHint || mediaHint) ? "yes" : "no";
+    }
+
+    if (viewableMedia && !observed?.attachment) {
+      return "no";
     }
 
     if (observed?.htmlLike) {
@@ -398,6 +442,8 @@
     hintedFilenameFromUrl,
     inferMediaIntent,
     isCdnHost,
+    isViewableMediaExtension,
+    isViewableMediaMime,
     looksLikeFileUrl,
     normalizeResponseHeaders,
     parseContentDispositionFilename,

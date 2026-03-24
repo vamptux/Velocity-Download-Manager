@@ -1,6 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::{DownloadRecord, DownloadSegmentStatus};
+use crate::model::{
+    DownloadIntegrityAlgorithm, DownloadIntegrityStatus, DownloadRecord, DownloadSegmentStatus,
+};
 
 use super::RUNTIME_SEGMENT_RETRY_BUDGET;
 
@@ -15,6 +17,11 @@ pub(super) fn non_empty(value: String) -> Option<String> {
 
 pub(super) fn reset_download_progress(download: &mut DownloadRecord) {
     download.downloaded = 0;
+    download.integrity.computed_hash = None;
+    download.integrity.algorithm = DownloadIntegrityAlgorithm::Sha256;
+    download.integrity.status = DownloadIntegrityStatus::Unavailable;
+    download.integrity.verified_at = None;
+    download.integrity.last_error = None;
     for segment in &mut download.segments {
         segment.downloaded = 0;
         segment.retry_attempts = 0;

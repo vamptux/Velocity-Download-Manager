@@ -26,6 +26,7 @@ import { formatBytes, formatBytesPerSecond, formatTimeRemaining } from "@/lib/fo
 import {
   fromRawDownload,
   ipcAddDownload,
+  ipcCaptureWindowReady,
   ipcFocusMainWindow,
   ipcGetDownloadRows,
   ipcGetEngineSettings,
@@ -37,7 +38,6 @@ import {
   ipcSetDownloadTransferOptions,
   ipcRestartDownload,
   ipcResumeDownload,
-  ipcTakePendingCapturePayload,
   type RawDownload,
 } from "@/lib/ipc";
 import {
@@ -63,12 +63,10 @@ import {
   useDefaultCaptureSavePath,
 } from "@/lib/captureUtils";
 import {
+  buildDuplicateLookupInput,
   describeDuplicateMatch,
   duplicateResolutionLabel,
-  findDuplicateDownload,
-  getDuplicateResolution,
-  getSecondaryDuplicateResolution,
-  joinTargetPathPreview,
+  resolveDuplicateState,
   suggestAlternativeFilename,
 } from "@/lib/downloadDuplicates";
 import { firstVisibleProbeWarning, simplifyUserMessage } from "@/lib/userFacingMessages";
@@ -332,10 +330,6 @@ export function CompactCaptureWindow() {
     void getCurrentWindow().minimize().catch(() => null);
   }, []);
 
-  useEffect(() => {
-    windowLabelRef.current = getCurrentWindow().label;
-  }, []);
-
   const runProbe = useCallback(async (
     url: string,
     hintName: string,
@@ -398,13 +392,25 @@ export function CompactCaptureWindow() {
   );
 
   useEffect(() => {
+    let disposed = false;
     const unlistenPromise = listen<CapturePayload>("extension://capture", (event) => {
       applyIncomingPayload(event.payload);
     });
-    void ipcTakePendingCapturePayload(windowLabelRef.current ?? undefined)
-      .then((pending) => { if (pending) applyIncomingPayload(pending); })
+
+    const currentWindow = getCurrentWindow();
+    windowLabelRef.current = currentWindow.label;
+    void ipcCaptureWindowReady(currentWindow.label)
+      .then((pending) => {
+        if (!disposed && pending) {
+          applyIncomingPayload(pending);
+        }
+      })
       .catch(() => null);
-    return () => { void unlistenPromise.then((u) => u()); };
+
+    return () => {
+      disposed = true;
+      void unlistenPromise.then((u) => u());
+    };
   }, [applyIncomingPayload]);
 
   const monitorId = monitorDownloadId;
@@ -471,22 +477,21 @@ export function CompactCaptureWindow() {
   const filenameResetVisible = name.trim().length > 0
     && autoSuggestedName.length > 0
     && name.trim() !== autoSuggestedName;
-  const duplicateMatch = useMemo(
-    () => payload ? findDuplicateDownload(existingDownloads, {
-      url: payload.url,
-      finalUrl: probe?.finalUrl,
-      targetPath: joinTargetPathPreview(savePath, resolvedName),
-      validators: probe?.validators,
-    }) : null,
+  const {
+    match: duplicateMatch,
+    resolution: duplicateResolution,
+    secondaryResolution: duplicateSecondaryResolution,
+  } = useMemo(
+    () => payload
+      ? resolveDuplicateState(existingDownloads, buildDuplicateLookupInput({
+        url: payload.url,
+        finalUrl: probe?.finalUrl,
+        savePath,
+        name: resolvedName,
+        validators: probe?.validators,
+      }))
+      : { match: null, resolution: null, secondaryResolution: null },
     [existingDownloads, payload, probe?.finalUrl, probe?.validators, resolvedName, savePath],
-  );
-  const duplicateResolution = useMemo(
-    () => (duplicateMatch ? getDuplicateResolution(duplicateMatch) : null),
-    [duplicateMatch],
-  );
-  const duplicateSecondaryResolution = useMemo(
-    () => (duplicateMatch ? getSecondaryDuplicateResolution(duplicateMatch) : null),
-    [duplicateMatch],
   );
 
   const handleBrowse = async () => {
@@ -737,7 +742,12 @@ export function CompactCaptureWindow() {
           <button
             type="button"
             onClick={() => {
-              void ipcTakePendingCapturePayload(windowLabelRef.current ?? undefined)
+              const windowLabel = windowLabelRef.current;
+              if (!windowLabel) {
+                return;
+              }
+
+              void ipcCaptureWindowReady(windowLabel)
                 .then((pending) => { if (pending) applyIncomingPayload(pending); })
                 .catch(() => null);
             }}

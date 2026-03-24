@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex};
 use super::runtime::{
     RuntimeTelemetrySnapshot, RuntimeWakeLockGuard, UNKNOWN_SIZE_SPACE_CHECK_INTERVAL_BYTES,
     UNKNOWN_SIZE_SPACE_SAFETY_MARGIN_BYTES, disk_queue_under_pressure, median_runtime_ttfb,
-    push_unique_diagnostic, record_runtime_warning, runtime_connection_reuse_hint,
-    runtime_protocol_hint, take_disk_pool_error, wait_for_disk_pool_drain,
+    runtime_connection_reuse_hint, runtime_protocol_hint, take_disk_pool_error,
+    wait_for_disk_pool_drain,
 };
-use super::runtime_recovery::classify_runtime_error;
-use super::runtime_state::clear_runtime_checkpoint;
+use super::runtime_support::{
+    classify_runtime_error, clear_runtime_checkpoint, push_unique_diagnostic,
+    record_runtime_warning,
+};
 use super::runtime_transfer::{
     InitialResponseStream, TransferWorkerConfig, UnknownSizeStreamOptions,
     run_unknown_size_stream_worker,
@@ -22,6 +24,15 @@ use crate::model::{
 
 pub(super) fn classify_unknown_size_failure_kind(error: &str) -> DownloadFailureKind {
     let normalized = error.to_ascii_lowercase();
+    if normalized.contains("content-length")
+        || normalized.contains("eof")
+        || normalized.contains("temp file reports")
+        || normalized.contains("after disk flush")
+        || normalized.contains("resume boundary")
+        || normalized.contains("validation")
+    {
+        return DownloadFailureKind::Validation;
+    }
     if normalized.contains("disk write")
         || normalized.contains("disk space")
         || normalized.contains("volume ran out of space")
@@ -37,6 +48,30 @@ pub(super) fn classify_unknown_size_failure_kind(error: &str) -> DownloadFailure
         return DownloadFailureKind::Http;
     }
     DownloadFailureKind::Network
+}
+
+fn unknown_size_terminal_reason(error: &str, restart_required: bool) -> String {
+    let normalized = error.to_ascii_lowercase();
+
+    if normalized.contains("temp file reports") || normalized.contains("after disk flush") {
+        return "VDM stopped this guarded single-stream transfer because the flushed temp file no longer matched the streamed byte count.".to_string();
+    }
+    if normalized.contains("final stream reported content-length")
+        || (normalized.contains("content-length") && normalized.contains("reached eof"))
+    {
+        return "VDM stopped this guarded single-stream transfer because the host ended the stream at a different size than the final Content-Length it reported.".to_string();
+    }
+    if normalized.contains("volume ran out of space") || normalized.contains("disk space") {
+        return "VDM stopped this guarded single-stream transfer because free disk space dropped below the safety margin before the target volume ran out of space.".to_string();
+    }
+    if normalized.contains("stream dropped after") {
+        return "The host dropped this guarded single-stream transfer after partial progress, and VDM now requires a clean restart because no safe resume boundary was available.".to_string();
+    }
+    if restart_required {
+        return "Guarded single-stream transfer stopped after partial progress and now requires a clean restart.".to_string();
+    }
+
+    "Guarded single-stream transfer failed before stable progress was established.".to_string()
 }
 
 pub(super) async fn run_unknown_size_stream_runtime(
@@ -94,6 +129,7 @@ pub(super) async fn run_unknown_size_stream_runtime(
             &runtime_download.traffic_mode,
             runtime_download.speed,
             disk_pool.queue_utilization_percent(),
+            disk_pool.pressure_tier(),
         ),
         request_timeout_secs: 30,
         retry_budget: 4,
@@ -290,6 +326,7 @@ pub(super) async fn run_unknown_size_stream_runtime(
                         "Finalization used a cross-volume copy fallback because the temp and target folders resolved to different volumes.",
                     );
                 }
+                super::operations::mark_download_integrity_pending(download);
                 for warning in finalize_warnings {
                     push_unique_diagnostic(&mut download.diagnostics.warnings, warning);
                 }
@@ -328,6 +365,7 @@ pub(super) async fn run_unknown_size_stream_runtime(
             engine.emit_download_progress_diff_if_due(&response, min_emit_interval_ms);
             engine.emit_download_upsert(&response);
             engine.trigger_download_completion_actions(&response);
+            engine.spawn_download_integrity_refresh(response.id.clone());
             engine.apply_runtime_dispatch_plan(dispatch_plan, min_emit_interval_ms);
         }
         Err(error) => {
@@ -363,13 +401,8 @@ pub(super) async fn run_unknown_size_stream_runtime(
                         "Guarded single-stream transfers cannot resume safely after partial progress. Use Restart to retry from byte 0.",
                     );
                 }
-                download.diagnostics.terminal_reason = Some(if restart_required {
-                    "Guarded single-stream transfer stopped after partial progress and now requires a clean restart."
-                        .to_string()
-                } else {
-                    "Guarded single-stream transfer failed before stable progress was established."
-                        .to_string()
-                });
+                download.diagnostics.terminal_reason =
+                    Some(unknown_size_terminal_reason(&error, restart_required));
                 append_download_log(
                     download,
                     DownloadLogLevel::Error,

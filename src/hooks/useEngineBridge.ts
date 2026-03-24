@@ -4,6 +4,7 @@ import {
   fromRawDownload,
   ipcGetEngineBootstrapState,
   ipcGetStartupSnapshot,
+  isEngineBootstrapSettled,
   type EngineBootstrapState,
   type RawDownload,
 } from "@/lib/ipc";
@@ -68,14 +69,16 @@ export function useEngineBridge({
         const unlistenBootstrap = await listen<EngineBootstrapState>("engine://bootstrap", (event) => {
           bootstrapEventReceived = true;
           setBootstrapState(event.payload);
-          void ipcGetStartupSnapshot()
-            .then((startupSnapshot) => {
-              if (!disposed) {
-                setUpdateHealth(startupSnapshot.updateHealth);
-              }
-            })
-            .catch(() => null);
-          void refreshAppState();
+          if (isEngineBootstrapSettled(event.payload)) {
+            void ipcGetStartupSnapshot()
+              .then((startupSnapshot) => {
+                if (!disposed) {
+                  setUpdateHealth(startupSnapshot.updateHealth);
+                }
+              })
+              .catch(() => null);
+            void refreshAppState();
+          }
         });
         const unlistenUpsert = await listen<RawDownload>("downloads://upsert-row", (event) => {
           if (!disposed) {
@@ -116,7 +119,7 @@ export function useEngineBridge({
         }
         setBootstrapState(bootstrap);
 
-        if (bootstrap.ready && !bootstrapEventReceived) {
+        if (isEngineBootstrapSettled(bootstrap) && !bootstrapEventReceived) {
           const startupSnapshot = await ipcGetStartupSnapshot().catch(() => null);
           if (!disposed && startupSnapshot) {
             setUpdateHealth(startupSnapshot.updateHealth);
@@ -125,7 +128,7 @@ export function useEngineBridge({
         }
       } catch {
         eventBridgeAttached.current = false;
-        setBootstrapState({ ready: true, error: null });
+        setBootstrapState({ phase: "failed", error: "VDM could not attach to the Tauri engine bridge." });
         setUpdateHealth(null);
         await refreshAppState();
       }

@@ -1,17 +1,10 @@
 import { useEffect } from "react";
 import { downloadDir } from "@tauri-apps/api/path";
 import type { DownloadContentCategory } from "@/types/download";
+import { extractErrorMessage } from "@/lib/userFacingMessages";
 
 export function getCaptureErrorMessage(error: unknown): string {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-
-  if (typeof error === "string" && error.trim()) {
-    return error;
-  }
-
-  return "The operation failed before VDM could explain why.";
+  return extractErrorMessage(error, "The operation failed before VDM could explain why.");
 }
 
 export function guessCaptureCategory(

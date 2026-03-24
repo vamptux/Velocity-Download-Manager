@@ -32,6 +32,8 @@ const MAINTENANCE_PERIOD_MINUTES = 1;
 const HEALTH_CACHE_TTL_MS = 2_500;
 const CAPTURE_TIMEOUT_MS = 3000;
 const CAPTURE_DEDUPE_WINDOW_MS = 4500;
+const CAPTURE_RETRY_ATTEMPTS = 3;
+const CAPTURE_RETRY_DELAY_MS = 350;
 const OBSERVED_REQUEST_TTL_MS = 30_000;
 const OBSERVED_RESPONSE_TTL_MS = 30_000;
 const AUTH_STATE_OFFLINE = "offline";
@@ -182,6 +184,58 @@ async function fetchBridge(path, options = {}) {
   }
 }
 
+function asRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+async function readJsonRecord(response) {
+  return asRecord(await response.json().catch(() => null));
+}
+
+function parseBridgeHealthPayload(payload) {
+  const record = asRecord(payload);
+  if (!record) {
+    return null;
+  }
+
+  return {
+    sessionNonce: typeof record.sessionNonce === "string" ? record.sessionNonce : null,
+    authRequired: typeof record.authRequired === "boolean" ? record.authRequired : true,
+    authorized: record.authorized === true,
+  };
+}
+
+function parsePairingPayload(payload) {
+  const record = asRecord(payload);
+  if (!record || typeof record.pairingCode !== "string") {
+    return null;
+  }
+
+  return {
+    pairingCode: record.pairingCode.trim(),
+    rotatedAt: Number.isFinite(record.rotatedAt) ? Number(record.rotatedAt) : 0,
+    sessionNonce: typeof record.sessionNonce === "string" ? record.sessionNonce : null,
+  };
+}
+
+function runtimeMessageRecord(message) {
+  const record = asRecord(message);
+  if (!record || typeof record.type !== "string") {
+    return null;
+  }
+
+  return record;
+}
+
+function readOptionalString(record, key) {
+  return typeof record[key] === "string" ? record[key] : null;
+}
+
+function readRequiredUrl(record) {
+  const url = typeof record.url === "string" ? record.url.trim() : "";
+  return /^https?:/i.test(url) ? url : null;
+}
+
 async function fetchBridgeHealthSnapshot() {
   try {
     const response = await fetchBridge("/health", { method: "GET" });
@@ -191,13 +245,19 @@ async function fetchBridgeHealthSnapshot() {
       return { ok: false, authRequired: true, authorized: false };
     }
 
-    const payload = await response.json().catch(() => null);
+    const payload = parseBridgeHealthPayload(await readJsonRecord(response));
+    if (!payload) {
+      vdmReachable = false;
+      bridgeSessionNonce = null;
+      return { ok: false, authRequired: true, authorized: false };
+    }
+
     vdmReachable = true;
-    bridgeSessionNonce = typeof payload?.sessionNonce === "string" ? payload.sessionNonce : null;
+    bridgeSessionNonce = payload.sessionNonce;
     return {
       ok: true,
-      authRequired: payload?.authRequired !== false,
-      authorized: payload?.authorized === true,
+      authRequired: payload.authRequired,
+      authorized: payload.authorized,
     };
   } catch {
     vdmReachable = false;
@@ -225,14 +285,13 @@ async function syncPairingFromVdm() {
     return false;
   }
 
-  const payload = await response.json().catch(() => null);
-  const pairingCode = String(payload?.pairingCode ?? "").trim();
-  if (!pairingCode) {
+  const payload = parsePairingPayload(await readJsonRecord(response));
+  if (!payload?.pairingCode) {
     return false;
   }
 
-  await persistPairingState(pairingCode, Number(payload?.rotatedAt ?? 0));
-  if (typeof payload?.sessionNonce === "string" && payload.sessionNonce) {
+  await persistPairingState(payload.pairingCode, payload.rotatedAt);
+  if (payload.sessionNonce) {
     bridgeSessionNonce = payload.sessionNonce;
   }
   vdmReachable = true;
@@ -309,6 +368,24 @@ async function fetchAuthorizedBridgeResponse(path, { method = "GET", bodyText = 
   } catch {
     return null;
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function shouldRetryCaptureResponse(response) {
+  if (!response) {
+    return true;
+  }
+
+  return response.status === 401
+    || response.status === 408
+    || response.status === 425
+    || response.status === 429
+    || response.status >= 500;
 }
 
 function pruneCaptureCache(now = Date.now()) {
@@ -555,11 +632,17 @@ async function refreshVdmHealth({ allowAutoPair = true } = {}) {
   }
 
   if (response.ok) {
-    const payload = await response.json().catch(() => null);
-    if (typeof payload?.sessionNonce === "string") {
-      bridgeSessionNonce = payload.sessionNonce;
+    const payload = parseBridgeHealthPayload(await readJsonRecord(response));
+    if (!payload) {
+      vdmConnected = false;
+      vdmAuthState = AUTH_STATE_INVALID;
+      lastHealthCheckAt = Date.now();
+      updateIcon();
+      return bridgeStatusSnapshot();
     }
-    vdmConnected = payload?.authorized === true;
+
+    bridgeSessionNonce = payload.sessionNonce;
+    vdmConnected = payload.authorized;
     vdmAuthState = vdmConnected ? AUTH_STATE_PAIRED : AUTH_STATE_INVALID;
     lastHealthCheckAt = Date.now();
     updateIcon();
@@ -631,54 +714,57 @@ async function sendToVdm(payload) {
   captureInFlight.add(dedupeKey);
 
   try {
-    const needsFreshHealth =
-      !vdmReachable ||
-      !bridgeSessionNonce ||
-      !vdmConnected ||
-      vdmAuthState === AUTH_STATE_MISSING ||
-      vdmAuthState === AUTH_STATE_INVALID;
-
-    if (needsFreshHealth) {
-      await checkVdmHealth({ force: true });
-    }
-    if (vdmAuthState === AUTH_STATE_MISSING || vdmAuthState === AUTH_STATE_INVALID) {
-      return false;
-    }
-
     const bodyText = JSON.stringify(preparedPayload);
-    let resp = await fetchAuthorizedBridgeResponse("/capture", {
-      method: "POST",
-      bodyText,
-      contentType: "application/json",
-    });
+    for (let attempt = 0; attempt < CAPTURE_RETRY_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) {
+        await sleep(CAPTURE_RETRY_DELAY_MS * attempt);
+      }
 
-    if (!resp) {
+      const needsFreshHealth =
+        !vdmReachable ||
+        !bridgeSessionNonce ||
+        !vdmConnected ||
+        vdmAuthState === AUTH_STATE_MISSING ||
+        vdmAuthState === AUTH_STATE_INVALID;
+
+      if (needsFreshHealth || attempt > 0) {
+        await checkVdmHealth({ force: true });
+      }
+      if (vdmAuthState === AUTH_STATE_MISSING || vdmAuthState === AUTH_STATE_INVALID) {
+        continue;
+      }
+
+      const resp = await fetchAuthorizedBridgeResponse("/capture", {
+        method: "POST",
+        bodyText,
+        contentType: "application/json",
+      });
+
+      if (resp?.ok) {
+        await markCaptureDelivered(preparedPayload, dedupeKey);
+        return true;
+      }
+
+      if (!shouldRetryCaptureResponse(resp)) {
+        await checkVdmHealth({ force: true });
+        return false;
+      }
+
       await checkVdmHealth({ force: true });
-      return false;
-    }
 
-    if (resp.ok) {
-      await markCaptureDelivered(preparedPayload, dedupeKey);
-      return true;
-    }
-
-    if (resp.status === 401) {
-      await checkVdmHealth({ force: true });
-      if (vdmAuthState === AUTH_STATE_PAIRED) {
-        resp = await fetchAuthorizedBridgeResponse("/capture", {
+      if (resp?.status === 401 && vdmAuthState === AUTH_STATE_PAIRED) {
+        const retryResponse = await fetchAuthorizedBridgeResponse("/capture", {
           method: "POST",
           bodyText,
           contentType: "application/json",
         });
-        if (resp?.ok) {
+        if (retryResponse?.ok) {
           await markCaptureDelivered(preparedPayload, dedupeKey);
           return true;
         }
       }
-      return false;
     }
 
-    await checkVdmHealth({ force: true });
     return false;
   } catch {
     await checkVdmHealth({ force: true });
@@ -830,23 +916,34 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 // ---------------------------------------------------------------------------
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === "intercept-link") {
+  const message = runtimeMessageRecord(msg);
+  if (!message) {
+    sendResponse({ ok: false, error: "invalid-message" });
+    return false;
+  }
+
+  if (message.type === "intercept-link") {
     // Content script detected a download-link click.
-    handleInterceptedLink(msg, sender).then(sendResponse);
+    handleInterceptedLink(message, sender).then(sendResponse);
     return true; // keep channel open for async response
   }
 
-  if (msg.type === "get-status") {
+  if (message.type === "get-status") {
     void (async () => {
-      await initializeBridgeIntegration({ force: msg.force !== false });
+      await initializeBridgeIntegration({ force: message.force !== false });
       sendResponse(bridgeStatusSnapshot());
     })();
     return true;
   }
 
-  if (msg.type === "set-enabled") {
+  if (message.type === "set-enabled") {
+    if (typeof message.enabled !== "boolean") {
+      sendResponse({ ok: false, error: "invalid-enabled" });
+      return false;
+    }
+
     void (async () => {
-      cachedSettings.enabled = !!msg.enabled;
+      cachedSettings.enabled = message.enabled;
       await saveGeneralSettings(cachedSettings);
       lastHealthCheckAt = 0;
       if (cachedSettings.enabled) {
@@ -860,26 +957,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg.type === "add-url") {
+  if (message.type === "add-url") {
+    const url = readRequiredUrl(message);
+    if (!url) {
+      sendResponse({ ok: false, error: "invalid-url" });
+      return false;
+    }
+
     sendToVdm({
-      url: msg.url,
-      referrer: msg.referrer ?? null,
-      filename: msg.filename ?? null,
-      sizeHint: msg.sizeHint ?? null,
+      url,
+      referrer: readOptionalString(message, "referrer"),
+      filename: readOptionalString(message, "filename"),
+      sizeHint: Number.isFinite(message.sizeHint) ? message.sizeHint : null,
       mime: null,
       source: "manual",
     }).then((ok) => sendResponse({ ok }));
     return true;
   }
 
-  if (msg.type === "focus-app") {
+  if (message.type === "focus-app") {
     focusVdmApp().then((ok) => sendResponse({ ok }));
     return true;
   }
+
+  sendResponse({ ok: false, error: "unknown-message-type" });
+  return false;
 });
 
 async function handleInterceptedLink(msg, sender) {
-  const { url, referrer, filename } = msg;
+  const url = readRequiredUrl(msg);
+  if (!url) {
+    return { intercepted: false, shouldPrevent: false };
+  }
+
+  const referrer = readOptionalString(msg, "referrer");
+  const filename = readOptionalString(msg, "filename");
   const observedResponseHeaders = findObservedResponseHeaders([url]);
 
   const decision = classifyDownload({

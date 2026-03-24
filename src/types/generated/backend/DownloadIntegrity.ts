@@ -2,4 +2,4 @@
 import type { DownloadIntegrityAlgorithm } from "./DownloadIntegrityAlgorithm";
 import type { DownloadIntegrityStatus } from "./DownloadIntegrityStatus";
 
-export type DownloadCompletedEvent = { id: string, name: string, targetPath: string, savePath: string, integrityStatus: DownloadIntegrityStatus, integrityAlgorithm: DownloadIntegrityAlgorithm, };
+export type DownloadIntegrity = { expectedHash: string | null, computedHash: string | null, algorithm: DownloadIntegrityAlgorithm, status: DownloadIntegrityStatus, verifiedAt: bigint | null, lastError: string | null, };

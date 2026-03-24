@@ -53,8 +53,7 @@ impl SegmentScheduler {
         let mut downloaded = 0_u64;
         let mut active_workers = 0_u64;
 
-        for (idx, seg) in segments.iter().enumerate() {
-            let _ = idx;
+        for seg in segments {
             downloaded = downloaded.saturating_add(seg.downloaded.max(0) as u64);
             if seg.status != DownloadSegmentStatus::Downloading {
                 continue;
@@ -144,6 +143,15 @@ impl SegmentScheduler {
         progress_percent >= u64::from(100u32.saturating_sub(self.late_segment_ratio_percent))
     }
 
+    fn late_transfer_guard_active(
+        &self,
+        segments: &[DownloadSegment],
+        total_file_size: u64,
+    ) -> bool {
+        let scan = self.scan_work_steal_window(segments, total_file_size);
+        self.is_in_late_segment_zone(scan.downloaded, scan.active_workers, total_file_size)
+    }
+
     pub fn attempt_work_steal(
         &self,
         segments: &mut [DownloadSegment],
@@ -155,8 +163,7 @@ impl SegmentScheduler {
             return None;
         }
 
-        let scan = self.scan_work_steal_window(segments, total_file_size);
-        if self.is_in_late_segment_zone(scan.downloaded, scan.active_workers, total_file_size) {
+        if self.late_transfer_guard_active(segments, total_file_size) {
             return None;
         }
 
@@ -231,12 +238,23 @@ impl SegmentScheduler {
             .count()
             < desired_parallelism
         {
+            let open_slots = desired_parallelism.saturating_sub(
+                segments
+                    .iter()
+                    .filter(|segment| segment.status != DownloadSegmentStatus::Finished)
+                    .count(),
+            );
             let before_ends: BTreeMap<u32, i64> = segments
                 .iter()
                 .map(|segment| (segment.id, segment.end))
                 .collect();
             let Some(stolen) =
-                self.attempt_work_steal(segments.as_mut_slice(), samples, total_file_size, 1)
+                self.attempt_work_steal(
+                    segments.as_mut_slice(),
+                    samples,
+                    total_file_size,
+                    u32::try_from(open_slots).unwrap_or(u32::MAX).max(1),
+                )
             else {
                 break;
             };
@@ -260,9 +278,14 @@ impl SegmentScheduler {
         &self,
         segments: &[DownloadSegment],
         samples: &[SegmentRuntimeSample],
+        total_file_size: u64,
         idle_worker_count: u32,
     ) -> Option<SlowPeerRacePlan> {
         if idle_worker_count == 0 || segments.is_empty() || samples.is_empty() {
+            return None;
+        }
+
+        if self.late_transfer_guard_active(segments, total_file_size) {
             return None;
         }
 
@@ -315,6 +338,9 @@ impl SegmentScheduler {
             let Some(sample) = sample_by_segment.get(&segment.id).copied() else {
                 continue;
             };
+            if sample.active_for_ms.unwrap_or(0) < self.donor_min_age_ms() {
+                continue;
+            }
             let eta = sample.eta_seconds.unwrap_or(0);
             let throughput = sample.throughput_bytes_per_second.unwrap_or(0);
             if sample.remaining_bytes < self.min_segment_size_bytes || eta == 0 || throughput == 0 {

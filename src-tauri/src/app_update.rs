@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{header, Client, StatusCode, Url};
 use semver::Version;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tauri_plugin_updater::Error as UpdaterError;
@@ -18,20 +18,17 @@ use crate::model::{
 pub const APP_UPDATE_PROGRESS_EVENT: &str = "app://update-progress";
 const STABLE_UPDATE_ENDPOINT: &str =
     "https://github.com/vamptux/Velocity-Download-Manager/releases/latest/download/latest.json";
-const PREVIEW_UPDATE_ENDPOINT: &str =
-    "https://github.com/vamptux/Velocity-Download-Manager/releases/latest/download/latest-preview.json";
 const GITHUB_RELEASES_PAGE: &str =
     "https://github.com/vamptux/Velocity-Download-Manager/releases";
 const GITHUB_RELEASES_API_LATEST: &str =
     "https://api.github.com/repos/vamptux/Velocity-Download-Manager/releases/latest";
-const GITHUB_RELEASES_API_LIST: &str =
-    "https://api.github.com/repos/vamptux/Velocity-Download-Manager/releases?per_page=12";
 const GITHUB_TAGS_API_LIST: &str =
     "https://api.github.com/repos/vamptux/Velocity-Download-Manager/tags?per_page=32";
 const STABLE_UPDATE_MANIFEST_NAME: &str = "latest.json";
-const PREVIEW_UPDATE_MANIFEST_NAME: &str = "latest-preview.json";
 const UPDATER_TEMP_ARTIFACT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 3);
 const LEGACY_UPDATES_DIR_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+const GITHUB_FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const GITHUB_FALLBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const APP_PRODUCT_NAME: &str = "Velocity Download Manager";
 
 #[derive(Debug, Deserialize)]
@@ -44,10 +41,6 @@ struct GithubReleaseAsset {
 struct GithubRelease {
     #[serde(alias = "tagName")]
     tag_name: String,
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    prerelease: bool,
     #[serde(default)]
     body: Option<String>,
     #[serde(default, alias = "htmlUrl")]
@@ -186,13 +179,14 @@ fn should_try_release_fallback(error: &UpdaterError) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("valid release json")
         || message.contains("latest.json")
-        || message.contains("latest-preview.json")
         || message.contains("404")
         || message.contains("not found")
 }
 
 fn github_client(current_version: &str) -> Result<Client, String> {
     Client::builder()
+        .connect_timeout(GITHUB_FALLBACK_CONNECT_TIMEOUT)
+        .timeout(GITHUB_FALLBACK_REQUEST_TIMEOUT)
         .user_agent(format!(
             "Velocity Download Manager/{current_version} (+{GITHUB_RELEASES_PAGE})"
         ))
@@ -206,10 +200,22 @@ async fn fetch_json_or_404<T: DeserializeOwned>(client: &Client, url: &str) -> R
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .await
-        .map_err(|error| format!("Failed requesting GitHub release metadata: {error}"))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                format!(
+                    "GitHub release fallback timed out while requesting {url}. Try again shortly or install manually from {GITHUB_RELEASES_PAGE}."
+                )
+            } else {
+                format!("Failed requesting GitHub release metadata: {error}")
+            }
+        })?;
 
     if response.status() == StatusCode::NOT_FOUND {
         return Ok(None);
+    }
+
+    if github_rate_limited(&response) {
+        return Err(github_rate_limit_message(&response));
     }
 
     if !response.status().is_success() {
@@ -222,25 +228,78 @@ async fn fetch_json_or_404<T: DeserializeOwned>(client: &Client, url: &str) -> R
     let raw = response
         .text()
         .await
-        .map_err(|error| format!("Failed reading GitHub release metadata: {error}"))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                format!(
+                    "GitHub release fallback timed out while reading {url}. Try again shortly or install manually from {GITHUB_RELEASES_PAGE}."
+                )
+            } else {
+                format!("Failed reading GitHub release metadata: {error}")
+            }
+        })?;
 
     serde_json::from_str::<T>(&raw)
         .map(Some)
         .map_err(|error| format!("Failed parsing GitHub release metadata: {error}"))
 }
 
-async fn fetch_latest_stable_release(client: &Client) -> Result<Option<GithubRelease>, String> {
-    fetch_json_or_404(client, GITHUB_RELEASES_API_LATEST).await
+fn github_rate_limited(response: &reqwest::Response) -> bool {
+    response.status() == StatusCode::TOO_MANY_REQUESTS
+        || (response.status() == StatusCode::FORBIDDEN
+            && response
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok())
+                == Some("0"))
 }
 
-async fn fetch_latest_preview_release(client: &Client) -> Result<Option<GithubRelease>, String> {
-    let Some(releases) = fetch_json_or_404::<Vec<GithubRelease>>(client, GITHUB_RELEASES_API_LIST).await? else {
-        return Ok(None);
-    };
+fn github_rate_limit_message(response: &reqwest::Response) -> String {
+    let retry_hint = github_retry_hint(response)
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
+    format!(
+        "GitHub temporarily rate-limited updater fallback requests. Try again shortly or install manually from {GITHUB_RELEASES_PAGE}.{retry_hint}"
+    )
+}
 
-    Ok(releases
-        .into_iter()
-        .find(|release| !release.draft && release.prerelease))
+fn github_retry_hint(response: &reqwest::Response) -> Option<String> {
+    let retry_after_seconds = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .or_else(|| {
+            response
+                .headers()
+                .get("x-ratelimit-reset")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .and_then(|reset_at| {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+                    Some(reset_at.saturating_sub(now))
+                })
+        })?;
+
+    Some(format!(
+        "Estimated wait: {}.",
+        format_wait_duration(retry_after_seconds)
+    ))
+}
+
+fn format_wait_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{}s", seconds.max(1));
+    }
+
+    if seconds < 60 * 60 {
+        return format!("{}m", seconds.div_ceil(60));
+    }
+
+    format!("{}h", seconds.div_ceil(60 * 60))
+}
+
+async fn fetch_latest_stable_release(client: &Client) -> Result<Option<GithubRelease>, String> {
+    fetch_json_or_404(client, GITHUB_RELEASES_API_LATEST).await
 }
 
 async fn fetch_latest_stable_tag(client: &Client) -> Result<Option<String>, String> {
@@ -297,15 +356,6 @@ async fn try_updater_check(
         .map_err(UpdaterCheckFailure::Prepare)?
         .check()
         .await
-        .or_else(|error| {
-            if matches!(channel, AppUpdateChannel::Preview)
-                && matches!(error, UpdaterError::ReleaseNotFound)
-            {
-                Ok(None)
-            } else {
-                Err(error)
-            }
-        })
         .map_err(UpdaterCheckFailure::Check)
 }
 
@@ -313,29 +363,13 @@ async fn fetch_release_candidate(
     client: &Client,
     channel: &AppUpdateChannel,
 ) -> Result<Option<GithubReleaseCandidate>, String> {
-    match channel {
-        AppUpdateChannel::Stable => Ok(fetch_latest_stable_release(client)
-            .await?
-            .map(|release| GithubReleaseCandidate {
-                release,
-                manifest_name: STABLE_UPDATE_MANIFEST_NAME,
-            })),
-        AppUpdateChannel::Preview => {
-            if let Some(release) = fetch_latest_preview_release(client).await? {
-                return Ok(Some(GithubReleaseCandidate {
-                    release,
-                    manifest_name: PREVIEW_UPDATE_MANIFEST_NAME,
-                }));
-            }
-
-            Ok(fetch_latest_stable_release(client)
-                .await?
-                .map(|release| GithubReleaseCandidate {
-                    release,
-                    manifest_name: STABLE_UPDATE_MANIFEST_NAME,
-                }))
-        }
-    }
+    let _ = channel;
+    Ok(fetch_latest_stable_release(client)
+        .await?
+        .map(|release| GithubReleaseCandidate {
+            release,
+            manifest_name: STABLE_UPDATE_MANIFEST_NAME,
+        }))
 }
 
 async fn fallback_update_resolution(
@@ -447,11 +481,8 @@ async fn fallback_update_resolution(
 }
 
 fn updater_endpoints(channel: &AppUpdateChannel) -> Result<Vec<Url>, String> {
-    let raw = match channel {
-        AppUpdateChannel::Stable => vec![STABLE_UPDATE_ENDPOINT],
-        // Preview first, then stable as a safe fallback when no preview manifest is published.
-        AppUpdateChannel::Preview => vec![PREVIEW_UPDATE_ENDPOINT, STABLE_UPDATE_ENDPOINT],
-    };
+    let _ = channel;
+    let raw = vec![STABLE_UPDATE_ENDPOINT];
 
     raw.into_iter()
         .map(|value| {
@@ -469,21 +500,32 @@ fn updater_for_channel(
     updater_for_endpoints(app, updater_endpoints(channel)?)
 }
 
+pub fn skipped_version_for_channel<'a>(
+    settings: &'a EngineSettings,
+    channel: &AppUpdateChannel,
+) -> Option<&'a str> {
+    let _ = channel;
+    settings.skipped_update_version.as_deref()
+}
+
+fn set_skipped_version_for_channel(
+    settings: &mut EngineSettings,
+    channel: &AppUpdateChannel,
+    version: Option<String>,
+) {
+    let _ = channel;
+    settings.skipped_update_version = version;
+}
+
 fn apply_failed_update_guardrails(
     settings: &mut EngineSettings,
     pending: &PendingAppUpdateTransition,
 ) -> String {
-    settings.skipped_update_version = Some(pending.target_version.clone());
-
-    if pending.channel == AppUpdateChannel::Preview
-        && settings.update_channel == AppUpdateChannel::Preview
-    {
-        settings.update_channel = AppUpdateChannel::Stable;
-        return format!(
-            "The first restart after updating to {} on the preview channel failed. VDM will skip that build on future checks and has switched the updater back to the stable channel.",
-            pending.target_version
-        );
-    }
+    set_skipped_version_for_channel(
+        settings,
+        &pending.channel,
+        Some(pending.target_version.clone()),
+    );
 
     format!(
         "The first restart after updating to {} failed. VDM will skip that build on future checks until a newer release is available.",

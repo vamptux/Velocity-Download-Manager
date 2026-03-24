@@ -10,7 +10,11 @@ import {
   type BatchImportDraftRow,
   validateBatchImportRows,
 } from "@/lib/batchImport";
-import { describeDuplicateMatch, findDuplicateDownload } from "@/lib/downloadDuplicates";
+import {
+  buildDuplicateLookupInput,
+  describeDuplicateMatch,
+  findDuplicateDownload,
+} from "@/lib/downloadDuplicates";
 import type { Download, DownloadContentCategory } from "@/types/download";
 
 interface BatchDownloadDialogProps {
@@ -64,10 +68,10 @@ export function BatchDownloadDialog({
   const preview = useMemo(() => {
     const base = validateBatchImportRows(draftRows, parsedDraftPreview.format, defaultSavePath);
     const rows = base.rows.map((row) => {
-      const duplicateMatch = findDuplicateDownload(existingDownloads, {
+      const duplicateMatch = findDuplicateDownload(existingDownloads, buildDuplicateLookupInput({
         url: row.url,
         targetPath: row.targetPath,
-      });
+      }));
 
       if (!duplicateMatch) {
         return row;
