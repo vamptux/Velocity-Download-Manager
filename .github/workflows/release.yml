@@ -83,3 +83,23 @@ jobs:
           if (-not ($assetNames | Where-Object { $_ -like "*.sig" })) {
             throw "The release is missing updater signature assets, so in-app update verification would fail."
           }
+
+      - name: Verify latest.json download endpoint
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $headers = @{
+            Accept = "application/json"
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            "User-Agent" = "velocity-download-manager-release-check"
+          }
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/latest.json"
+          try {
+            $response = Invoke-RestMethod -Uri $url -Headers $headers
+          } catch {
+            throw "The public latest.json download endpoint is not readable yet: $url`n$($_.Exception.Message)"
+          }
+          if (-not $response.version) {
+            throw "The latest.json endpoint responded, but it did not include a version field."
+          }

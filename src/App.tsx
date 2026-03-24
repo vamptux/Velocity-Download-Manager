@@ -73,7 +73,6 @@ const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
 
 const LIVE_PROGRESS_HEARTBEAT_MS = 1200;
 const LIVE_PROGRESS_STALL_MS = 2500;
-const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 type AppUpdateStage = "idle" | "available" | "downloading" | "downloaded" | "failed" | "up-to-date";
 
 type AppUpdateState = {
@@ -137,14 +136,6 @@ function getErrorMessage(error: unknown): string {
   return getActionErrorMessage(error, "Velocity Download Manager could not save the updated settings.");
 }
 
-function readStoredString(key: string): string | null {
-  try {
-    return window.localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
 function writeStoredString(key: string, value: string | null): void {
   try {
     if (value == null) {
@@ -155,11 +146,6 @@ function writeStoredString(key: string, value: string | null): void {
   } catch {
     // Ignore storage failures on locked-down systems.
   }
-}
-
-function readStoredNumber(key: string): number {
-  const raw = Number(readStoredString(key));
-  return Number.isFinite(raw) && raw > 0 ? raw : 0;
 }
 
 function appUpdateProgressMessage(downloadedBytes: number, totalBytes: number | null): string {
@@ -190,7 +176,7 @@ function updateFeedbackFromResult(result: AppUpdateCheckResult): AppUpdateFeedba
   if (result.status === "unavailable") {
     return {
       tone: "warning",
-      title: "Update not ready yet",
+      title: result.info ? `Update ${result.info.version} is not ready yet` : "Update not ready yet",
       message:
         result.message ??
         "A newer release is published, but its in-app update package is not ready yet.",
@@ -752,10 +738,6 @@ export function App() {
 
   useEffect(() => {
     if (import.meta.env.DEV) {
-      return;
-    }
-
-    if (Date.now() - readStoredNumber(updateLastCheckKey) < UPDATE_CHECK_INTERVAL_MS) {
       return;
     }
 

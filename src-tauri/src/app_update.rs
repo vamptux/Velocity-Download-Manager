@@ -26,6 +26,8 @@ const GITHUB_RELEASES_API_LATEST: &str =
     "https://api.github.com/repos/vamptux/Velocity-Download-Manager/releases/latest";
 const GITHUB_RELEASES_API_LIST: &str =
     "https://api.github.com/repos/vamptux/Velocity-Download-Manager/releases?per_page=12";
+const GITHUB_TAGS_API_LIST: &str =
+    "https://api.github.com/repos/vamptux/Velocity-Download-Manager/tags?per_page=32";
 const STABLE_UPDATE_MANIFEST_NAME: &str = "latest.json";
 const PREVIEW_UPDATE_MANIFEST_NAME: &str = "latest-preview.json";
 const UPDATER_TEMP_ARTIFACT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 3);
@@ -58,6 +60,30 @@ struct GithubRelease {
 struct GithubReleaseCandidate {
     release: GithubRelease,
     manifest_name: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubTag {
+    name: String,
+}
+
+enum ResolvedAppUpdate {
+    Available {
+        update: Box<Update>,
+        info: AppUpdateInfo,
+    },
+    UpToDate {
+        message: String,
+    },
+    Unavailable {
+        info: Option<AppUpdateInfo>,
+        message: String,
+    },
+}
+
+enum UpdaterCheckFailure {
+    Prepare(String),
+    Check(UpdaterError),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -144,6 +170,14 @@ fn release_has_manifest(release: &GithubRelease, manifest_name: &str) -> bool {
         .any(|asset| asset.name.eq_ignore_ascii_case(manifest_name))
 }
 
+fn highest_version_tag_name(tags: Vec<GithubTag>) -> Option<String> {
+    tags.into_iter()
+        .filter_map(|tag| parse_version(&tag.name).map(|version| (version, tag.name)))
+        .filter(|(version, _)| version.pre.is_empty())
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, name)| name)
+}
+
 fn should_try_release_fallback(error: &UpdaterError) -> bool {
     if matches!(error, UpdaterError::ReleaseNotFound) {
         return true;
@@ -209,6 +243,72 @@ async fn fetch_latest_preview_release(client: &Client) -> Result<Option<GithubRe
         .find(|release| !release.draft && release.prerelease))
 }
 
+async fn fetch_latest_stable_tag(client: &Client) -> Result<Option<String>, String> {
+    let Some(tags) = fetch_json_or_404::<Vec<GithubTag>>(client, GITHUB_TAGS_API_LIST).await? else {
+        return Ok(None);
+    };
+
+    Ok(highest_version_tag_name(tags))
+}
+
+fn release_manifest_endpoint(tag_name: &str, manifest_name: &str) -> Result<Url, String> {
+    Url::parse(&format!(
+        "https://github.com/vamptux/Velocity-Download-Manager/releases/download/{tag_name}/{manifest_name}"
+    ))
+    .map_err(|error| {
+        format!(
+            "Failed parsing updater manifest URL for tag '{tag_name}' and asset '{manifest_name}': {error}"
+        )
+    })
+}
+
+fn updater_for_endpoints(
+    app: &AppHandle,
+    endpoints: Vec<Url>,
+) -> Result<tauri_plugin_updater::Updater, String> {
+    let builder = app
+        .updater_builder()
+        .endpoints(endpoints)
+        .map_err(|error| format!("Failed preparing updater endpoints: {error}"))?;
+
+    builder
+        .build()
+        .map_err(|error| format!("Failed preparing the updater: {error}"))
+}
+
+fn updater_for_release_candidate(
+    app: &AppHandle,
+    candidate: &GithubReleaseCandidate,
+) -> Result<tauri_plugin_updater::Updater, String> {
+    updater_for_endpoints(
+        app,
+        vec![release_manifest_endpoint(
+            &candidate.release.tag_name,
+            candidate.manifest_name,
+        )?],
+    )
+}
+
+async fn try_updater_check(
+    app: &AppHandle,
+    channel: &AppUpdateChannel,
+) -> Result<Option<Update>, UpdaterCheckFailure> {
+    updater_for_channel(app, channel)
+        .map_err(UpdaterCheckFailure::Prepare)?
+        .check()
+        .await
+        .or_else(|error| {
+            if matches!(channel, AppUpdateChannel::Preview)
+                && matches!(error, UpdaterError::ReleaseNotFound)
+            {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(UpdaterCheckFailure::Check)
+}
+
 async fn fetch_release_candidate(
     client: &Client,
     channel: &AppUpdateChannel,
@@ -238,24 +338,53 @@ async fn fetch_release_candidate(
     }
 }
 
-async fn fallback_update_result(
+async fn fallback_update_resolution(
     app: &AppHandle,
     channel: &AppUpdateChannel,
     skipped_version: Option<&str>,
-    updater_error: &UpdaterError,
-) -> Result<Option<AppUpdateCheckResult>, String> {
-    if !should_try_release_fallback(updater_error) {
+    updater_error: Option<&UpdaterError>,
+) -> Result<Option<ResolvedAppUpdate>, String> {
+    if updater_error.is_some_and(|error| !should_try_release_fallback(error)) {
         return Ok(None);
     }
 
     let current_version = app_version(app);
     let client = github_client(&current_version)?;
     let Some(candidate) = fetch_release_candidate(&client, channel).await? else {
-        return Ok(Some(update_check_result(
-            AppUpdateCheckStatus::UpToDate,
-            None,
-            Some("No published release is available for this channel yet.".to_string()),
-        )));
+        if let Some(tag_name) = fetch_latest_stable_tag(&client).await? {
+            let version = normalize_release_version(&tag_name);
+            if is_newer_version(&version, &current_version) {
+                if skipped_version.is_some_and(|skipped| skipped == version) {
+                    return Ok(Some(ResolvedAppUpdate::UpToDate {
+                        message: format!(
+                            "Version {} is currently skipped on this device until a newer release appears.",
+                            version
+                        ),
+                    }));
+                }
+
+                return Ok(Some(ResolvedAppUpdate::Unavailable {
+                    info: Some(AppUpdateInfo {
+                        version: version.clone(),
+                        current_version: current_version.clone(),
+                        channel: channel.clone(),
+                        notes: None,
+                    }),
+                    message: format!(
+                        "Version {} is tagged on GitHub, but no GitHub Release with updater assets is published yet. Run the release workflow or attach the updater artifacts before expecting in-app updates to install.",
+                        version
+                    ),
+                }));
+            }
+        }
+
+        if updater_error.is_some() {
+            return Ok(Some(ResolvedAppUpdate::UpToDate {
+                message: "No published release is available for this channel yet.".to_string(),
+            }));
+        }
+
+        return Ok(None);
     };
 
     let info = update_info_from_release(&candidate.release, channel, &current_version);
@@ -267,22 +396,16 @@ async fn fallback_update_result(
                 .to_string()
         };
 
-        return Ok(Some(update_check_result(
-            AppUpdateCheckStatus::UpToDate,
-            None,
-            Some(message),
-        )));
+        return Ok(Some(ResolvedAppUpdate::UpToDate { message }));
     }
 
     if skipped_version.is_some_and(|skipped| skipped == info.version) {
-        return Ok(Some(update_check_result(
-            AppUpdateCheckStatus::UpToDate,
-            None,
-            Some(format!(
+        return Ok(Some(ResolvedAppUpdate::UpToDate {
+            message: format!(
                 "Version {} is currently skipped on this device until a newer release appears.",
                 info.version
-            )),
-        )));
+            ),
+        }));
     }
 
     let release_url = candidate
@@ -291,23 +414,36 @@ async fn fallback_update_result(
         .clone()
         .unwrap_or_else(|| GITHUB_RELEASES_PAGE.to_string());
     let manifest_available = release_has_manifest(&candidate.release, candidate.manifest_name);
-    let message = if manifest_available {
-        format!(
-            "Version {} is published, but its in-app updater metadata could not be read cleanly yet. Try again shortly or install it from {}.",
-            info.version, release_url
-        )
-    } else {
-        format!(
-            "Version {} is published on GitHub, but the updater manifest '{}' is not attached yet. Try again shortly or install it from {}.",
-            info.version, candidate.manifest_name, release_url
-        )
-    };
+    if !manifest_available {
+        return Ok(Some(ResolvedAppUpdate::Unavailable {
+            info: Some(info),
+            message: format!(
+                "Version {} is published on GitHub, but the updater manifest '{}' is not attached yet. Try again shortly or install it from {}.",
+                candidate.release.tag_name,
+                candidate.manifest_name,
+                release_url
+            ),
+        }));
+    }
 
-    Ok(Some(update_check_result(
-        AppUpdateCheckStatus::Unavailable,
-        Some(info),
-        Some(message),
-    )))
+    match updater_for_release_candidate(app, &candidate)?
+        .check()
+        .await
+        .map_err(|error| format!("Failed validating the tagged updater manifest: {error}"))?
+    {
+        Some(update) => Ok(Some(ResolvedAppUpdate::Available {
+            info: to_update_info(&update, channel),
+            update: Box::new(update),
+        })),
+        None => Ok(Some(ResolvedAppUpdate::Unavailable {
+            info: Some(info.clone()),
+            message: format!(
+                "Version {} is published and its updater manifest is attached, but GitHub is still serving updater metadata that resolves to the current build. Try again shortly or install it from {}.",
+                info.version,
+                release_url
+            ),
+        })),
+    }
 }
 
 fn updater_endpoints(channel: &AppUpdateChannel) -> Result<Vec<Url>, String> {
@@ -330,14 +466,7 @@ fn updater_for_channel(
     app: &AppHandle,
     channel: &AppUpdateChannel,
 ) -> Result<tauri_plugin_updater::Updater, String> {
-    let builder = app
-        .updater_builder()
-        .endpoints(updater_endpoints(channel)?)
-        .map_err(|error| format!("Failed preparing updater endpoints: {error}"))?;
-
-    builder
-        .build()
-        .map_err(|error| format!("Failed preparing the updater: {error}"))
+    updater_for_endpoints(app, updater_endpoints(channel)?)
 }
 
 fn apply_failed_update_guardrails(
@@ -652,22 +781,22 @@ pub async fn check_for_update(
     channel: &AppUpdateChannel,
     skipped_version: Option<&str>,
 ) -> Result<AppUpdateCheckResult, String> {
-    let update = match updater_for_channel(app, channel)?
-        .check()
-        .await
-        .or_else(|error| {
-            if matches!(channel, AppUpdateChannel::Preview)
-                && matches!(error, UpdaterError::ReleaseNotFound)
-            {
-                Ok(None)
-            } else {
-                Err(error)
-            }
-        }) {
+    let update = match try_updater_check(app, channel).await {
         Ok(update) => update,
-        Err(error) => {
-            if let Some(result) = fallback_update_result(app, channel, skipped_version, &error).await? {
-                return Ok(result);
+        Err(UpdaterCheckFailure::Prepare(error)) => return Err(error),
+        Err(UpdaterCheckFailure::Check(error)) => {
+            if let Some(result) = fallback_update_resolution(app, channel, skipped_version, Some(&error)).await? {
+                return Ok(match result {
+                    ResolvedAppUpdate::Available { info, .. } => {
+                        update_check_result(AppUpdateCheckStatus::Available, Some(info), None)
+                    }
+                    ResolvedAppUpdate::UpToDate { message } => {
+                        update_check_result(AppUpdateCheckStatus::UpToDate, None, Some(message))
+                    }
+                    ResolvedAppUpdate::Unavailable { info, message } => {
+                        update_check_result(AppUpdateCheckStatus::Unavailable, info, Some(message))
+                    }
+                });
             }
 
             return Err(format!("Failed checking for updates: {error}"));
@@ -675,6 +804,20 @@ pub async fn check_for_update(
     };
 
     let Some(candidate) = update else {
+        if let Some(result) = fallback_update_resolution(app, channel, skipped_version, None).await? {
+            return Ok(match result {
+                ResolvedAppUpdate::Available { info, .. } => {
+                    update_check_result(AppUpdateCheckStatus::Available, Some(info), None)
+                }
+                ResolvedAppUpdate::UpToDate { message } => {
+                    update_check_result(AppUpdateCheckStatus::UpToDate, None, Some(message))
+                }
+                ResolvedAppUpdate::Unavailable { info, message } => {
+                    update_check_result(AppUpdateCheckStatus::Unavailable, info, Some(message))
+                }
+            });
+        }
+
         return Ok(update_check_result(
             AppUpdateCheckStatus::UpToDate,
             None,
@@ -706,15 +849,33 @@ pub async fn install_update(
     settings: &EngineSettings,
 ) -> Result<AppUpdateInfo, String> {
     let channel = settings.update_channel.clone();
-    let Some(update) = updater_for_channel(app, &channel)?
-        .check()
-        .await
-        .map_err(|error| format!("Failed checking for updates: {error}"))?
-    else {
-        return Err("Velocity Download Manager is already up to date.".to_string());
+    let resolved = match try_updater_check(app, &channel).await {
+        Ok(Some(update)) => {
+            let info = to_update_info(&update, &channel);
+            ResolvedAppUpdate::Available {
+                update: Box::new(update),
+                info,
+            }
+        }
+        Ok(None) => fallback_update_resolution(app, &channel, None, None)
+            .await?
+            .unwrap_or(ResolvedAppUpdate::UpToDate {
+                message: "Velocity Download Manager is already up to date.".to_string(),
+            }),
+        Err(UpdaterCheckFailure::Prepare(error)) => return Err(error),
+        Err(UpdaterCheckFailure::Check(error)) => fallback_update_resolution(app, &channel, None, Some(&error))
+            .await?
+            .unwrap_or(ResolvedAppUpdate::Unavailable {
+                info: None,
+                message: format!("Failed checking for updates: {error}"),
+            }),
     };
 
-    let info = to_update_info(&update, &channel);
+    let (update, info) = match resolved {
+        ResolvedAppUpdate::Available { update, info } => (*update, info),
+        ResolvedAppUpdate::UpToDate { message } => return Err(message),
+        ResolvedAppUpdate::Unavailable { message, .. } => return Err(message),
+    };
     let mut started = false;
     let started_app = app.clone();
     let progress_app = app.clone();
