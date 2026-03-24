@@ -35,14 +35,14 @@ const LEGACY_UPDATES_DIR_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 
 const APP_PRODUCT_NAME: &str = "Velocity Download Manager";
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct GithubReleaseAsset {
+    #[serde(alias = "tagName")]
     name: String,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct GithubRelease {
+    #[serde(alias = "tagName")]
     tag_name: String,
     #[serde(default)]
     draft: bool,
@@ -50,7 +50,7 @@ struct GithubRelease {
     prerelease: bool,
     #[serde(default)]
     body: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "htmlUrl")]
     html_url: Option<String>,
     #[serde(default)]
     assets: Vec<GithubReleaseAsset>,
